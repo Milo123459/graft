@@ -244,6 +244,21 @@ pub fn scenarios() -> Vec<(String, String)> {
     app.test_keys("w");
     add("view-panes-panel", screen(&app, 150, 45));
     add("phone-panes-panel", screen(&app, 46, 40));
+    let app = viewer(&[
+        month,
+        "-F",
+        FMT,
+        "--target",
+        "node1=50GB,node2=200GB",
+        "--pane",
+        "* kind=stat",
+        "--pane",
+        "*",
+        "--layout",
+        "1 /30% 2",
+    ]);
+    add("view-stat-dashboard", screen(&app, 150, 45));
+    add("phone-stat-dashboard", screen(&app, 46, 40));
     let app = viewer(&[month, "-F", FMT, "--side-by-side", "-k", "bar"]);
     add("view-side-by-side-bar", screen(&app, 150, 30));
     add("phone-timeframe-menu", screen(&app, 46, 34));

@@ -684,6 +684,8 @@ pub enum ChartKind {
     Histogram,
     /// One compact sparkline per series.
     Sparkline,
+    /// A tile per series: the current value in big digits, its change, a sparkline.
+    Stat,
 }
 
 impl ChartKind {
@@ -693,7 +695,8 @@ impl ChartKind {
             Self::Scatter => Self::Bar,
             Self::Bar => Self::Histogram,
             Self::Histogram => Self::Sparkline,
-            Self::Sparkline => Self::Line,
+            Self::Sparkline => Self::Stat,
+            Self::Stat => Self::Line,
         }
     }
 
@@ -704,6 +707,7 @@ impl ChartKind {
             Self::Bar => "bar",
             Self::Histogram => "histogram",
             Self::Sparkline => "sparkline",
+            Self::Stat => "stat",
         }
     }
 }

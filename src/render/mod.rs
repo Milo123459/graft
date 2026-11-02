@@ -1605,6 +1605,226 @@ impl<'a> ChartWidget<'a> {
     }
 }
 
+/// 3×5 pixel digits, drawn 3 rows tall with half blocks.
+fn glyph(c: char) -> Option<&'static [&'static str; 5]> {
+    Some(match c {
+        '0' => &["###", "#.#", "#.#", "#.#", "###"],
+        '1' => &[".#.", "##.", ".#.", ".#.", "###"],
+        '2' => &["###", "..#", "###", "#..", "###"],
+        '3' => &["###", "..#", "###", "..#", "###"],
+        '4' => &["#.#", "#.#", "###", "..#", "..#"],
+        '5' => &["###", "#..", "###", "..#", "###"],
+        '6' => &["###", "#..", "###", "#.#", "###"],
+        '7' => &["###", "..#", "..#", "..#", "..#"],
+        '8' => &["###", "#.#", "###", "#.#", "###"],
+        '9' => &["###", "#.#", "###", "..#", "###"],
+        '.' => &[".", ".", ".", ".", "#"],
+        ',' => &[".", ".", ".", "#", "#"],
+        '-' | '−' => &["...", "...", "###", "...", "..."],
+        ':' => &[".", "#", ".", "#", "."],
+        _ => return None,
+    })
+}
+
+/// A number in big digits: three rows of text, or `None` if it has other characters.
+pub fn big_text(s: &str) -> Option<[String; 3]> {
+    let glyphs: Vec<_> = s.chars().map(glyph).collect::<Option<_>>()?;
+    let mut rows: [String; 3] = Default::default();
+    for (i, g) in glyphs.iter().enumerate() {
+        for (r, row) in rows.iter_mut().enumerate() {
+            if i > 0 {
+                row.push(' ');
+            }
+            let top = g[r * 2].as_bytes();
+            let bottom = g.get(r * 2 + 1).map(|b| b.as_bytes());
+            for c in 0..top.len() {
+                let t = top[c] == b'#';
+                let b = bottom.is_some_and(|b| b[c] == b'#');
+                row.push(match (t, b) {
+                    (true, true) => '█',
+                    (true, false) => '▀',
+                    (false, true) => '▄',
+                    (false, false) => ' ',
+                });
+            }
+        }
+    }
+    Some(rows)
+}
+
+/// "58.8 GB" → ("58.8", " GB"): the number part and the rest.
+fn split_number(s: &str) -> (&str, &str) {
+    let end = s
+        .char_indices()
+        .find(|(_, c)| !(c.is_ascii_digit() || matches!(c, '.' | ',' | '-' | '−')))
+        .map_or(s.len(), |(i, _)| i);
+    s.split_at(end)
+}
+
+impl ChartWidget<'_> {
+    /// A tile per series: name, the latest value in big digits, its change over the
+    /// view, a sparkline and (with a target) when it gets there.
+    fn render_stat_tiles(self, area: Rect, buf: &mut Buffer) {
+        let visible = self.visible();
+        if visible.is_empty() {
+            return self.render_empty(area, buf, "waiting for data…");
+        }
+        let n = visible.len();
+        let cols = ((area.width / 26).max(1) as usize).min(n);
+        let rows = n.div_ceil(cols);
+        let row_areas = Layout::vertical(vec![Constraint::Ratio(1, rows as u32); rows]).split(area);
+        for (k, &(i, s)) in visible.iter().enumerate() {
+            let (r, c) = (k / cols, k % cols);
+            let in_row = if r + 1 == rows { n - r * cols } else { cols };
+            let cells = Layout::horizontal(vec![Constraint::Ratio(1, in_row as u32); in_row])
+                .split(row_areas[r]);
+            self.render_stat_tile(cells[c], buf, i, s);
+        }
+    }
+
+    fn render_stat_tile(&self, area: Rect, buf: &mut Buffer, i: usize, s: &Series) {
+        let color = self.opts.color(i);
+        let block = Block::bordered()
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(
+                format!(" {} ", s.name),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(area);
+        block.render(area, buf);
+        if inner.width < 4 || inner.height < 1 {
+            return;
+        }
+        let pts = s.in_view(self.overlay.view);
+        let Some(&(x_last, last)) = pts.last() else {
+            return;
+        };
+        let mut y = inner.y;
+        let put = |buf: &mut Buffer, y: u16, line: Line| {
+            if y < inner.bottom() {
+                line.render(
+                    Rect {
+                        x: inner.x + 1,
+                        y,
+                        width: inner.width.saturating_sub(2),
+                        height: 1,
+                    },
+                    buf,
+                );
+            }
+        };
+        // The value: big when there's room.
+        let text = s.unit.format(last);
+        let (num, rest) = split_number(&text);
+        let big = big_text(num).filter(|b| {
+            inner.height >= 5
+                && b[0].chars().count() + rest.chars().count() + 2 <= inner.width as usize
+        });
+        let value_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+        match big {
+            Some(rows) => {
+                for (r, row) in rows.iter().enumerate() {
+                    let mut spans = vec![Span::styled(row.clone(), Style::default().fg(color))];
+                    if r == 2 {
+                        spans.push(Span::styled(rest.to_string(), value_style));
+                    }
+                    put(buf, y, Line::from(spans));
+                    y += 1;
+                }
+            }
+            None => {
+                put(buf, y, Line::styled(text.clone(), value_style));
+                y += 1;
+            }
+        }
+        // Change over what's shown.
+        let dim = Style::default().fg(Color::Gray);
+        if let Some(&(x0, first)) = pts.first()
+            && pts.len() > 1
+        {
+            let d = last - first;
+            let arrow = if d > 0.0 {
+                "▲"
+            } else if d < 0.0 {
+                "▼"
+            } else {
+                "■"
+            };
+            let pct = if first != 0.0 {
+                format!(" ({:+.1}%)", d / first.abs() * 100.0)
+            } else {
+                String::new()
+            };
+            let over = match self.ds.x_kind {
+                XKind::Time => format!(" in {}", crate::time::fmt_duration(x_last - x0)),
+                _ => format!(" over {} points", pts.len()),
+            };
+            put(
+                buf,
+                y,
+                Line::from(vec![
+                    Span::styled(
+                        format!("{arrow} {}", s.unit.format(d.abs())),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("{pct}{over}"), dim),
+                ]),
+            );
+            y += 1;
+        }
+        // Trend and target, when known.
+        let report = self.opts.analysis.report(self.ds, s);
+        let mut facts = Vec::new();
+        if let Some(r) = &report {
+            if r.fit.is_some() {
+                facts.push(r.trend_text());
+            }
+            let f = r.forecast_cell();
+            if r.target.is_some() && !f.is_empty() {
+                facts.push(f);
+            }
+        }
+        let spark_rows = inner.bottom().saturating_sub(y);
+        if !facts.is_empty() && spark_rows >= 2 {
+            put(buf, y, Line::styled(facts.join(" · "), dim));
+            y += 1;
+        }
+        // Sparkline in what's left.
+        let h = inner.bottom().saturating_sub(y);
+        if h >= 1 && pts.len() > 1 {
+            let (lo, hi) = pts
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+                    (lo.min(p.1), hi.max(p.1))
+                });
+            let range = (hi - lo).max(f64::MIN_POSITIVE);
+            let w = inner.width.saturating_sub(2) as usize;
+            let n = pts.len();
+            let data: Vec<u64> = (0..w)
+                .map(|c| {
+                    let (a, b) = (c * n / w, ((c + 1) * n / w).max(c * n / w + 1).min(n));
+                    let chunk = &pts[a.min(n - 1)..b.max(a.min(n - 1) + 1)];
+                    chunk.iter().map(|p| p.1).sum::<f64>() / chunk.len() as f64
+                })
+                .map(|v| ((v - lo) / range * 99.0) as u64 + 1)
+                .collect();
+            Sparkline::default()
+                .data(data)
+                .max(100)
+                .style(Style::default().fg(dim_color(color)))
+                .render(
+                    Rect {
+                        x: inner.x + 1,
+                        y,
+                        width: w as u16,
+                        height: h,
+                    },
+                    buf,
+                );
+        }
+    }
+}
+
 impl ChartWidget<'_> {
     /// Live data on the left (or top, when narrow), its trends on the right.
     fn render_side_by_side(self, area: Rect, buf: &mut Buffer) {
@@ -1788,6 +2008,7 @@ impl Widget for ChartWidget<'_> {
             ChartKind::Bar => self.render_bar(area, buf),
             ChartKind::Histogram => self.render_histogram(area, buf),
             ChartKind::Sparkline => self.render_sparklines(area, buf),
+            ChartKind::Stat => self.render_stat_tiles(area, buf),
         }
     }
 }
@@ -1858,6 +2079,49 @@ mod tests {
     }
 
     #[test]
+    fn big_digits() {
+        assert_eq!(
+            big_text("-1.5").unwrap(),
+            [
+                "    ▄█    █▀▀".to_string(),
+                "▀▀▀  █    ▀▀█".to_string(),
+                "    ▀▀▀ ▀ ▀▀▀".to_string(),
+            ]
+        );
+        assert!(big_text("12a").is_none());
+        assert_eq!(split_number("58.8 GB"), ("58.8", " GB"));
+        assert_eq!(split_number("97%"), ("97", "%"));
+    }
+
+    #[test]
+    fn stat_tiles_show_value_change_and_target() {
+        let s = Series {
+            name: "node1".into(),
+            unit: Unit::new(crate::units::Dim::Bytes { binary: false }),
+            points: vec![(0.0, 60e9), (86400.0, 58e9), (172_800.0, 56e9)],
+        };
+        let ds = Dataset {
+            x_kind: XKind::Time,
+            series: vec![s],
+        };
+        let opts = ChartOpts {
+            kind: ChartKind::Stat,
+            analysis: Analysis {
+                targets: crate::stats::Targets::parse(&["node1=50GB".into()], false).unwrap(),
+                ..Analysis::default()
+            },
+            ..ChartOpts::default()
+        };
+        let text = crate::render::ansi::to_ansi(&render_to_buffer(&ds, &opts, 40, 10), false);
+        assert!(text.contains("node1") && text.contains("GB"), "{text}");
+        assert!(text.contains("▼ 4 GB (-6.7%) in 2 days"), "{text}");
+        assert!(text.contains("50 GB in 3 days"), "{text}");
+        // Too small for big digits: plain text.
+        let text = crate::render::ansi::to_ansi(&render_to_buffer(&ds, &opts, 40, 4), false);
+        assert!(text.contains("56 GB"), "{text}");
+    }
+
+    #[test]
     fn interpolates_between_points() {
         let pts = [(0.0, 10.0), (10.0, 20.0)];
         assert_eq!(interpolate(&pts, 5.0), Some(15.0));
@@ -1890,6 +2154,7 @@ mod tests {
             ChartKind::Bar,
             ChartKind::Histogram,
             ChartKind::Sparkline,
+            ChartKind::Stat,
         ] {
             let opts = ChartOpts {
                 kind,

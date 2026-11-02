@@ -167,7 +167,7 @@ was skipped.
 
 | | |
 |---|---|
-| `-k line\|scatter\|bar\|histogram\|sparkline` | chart type (bar = latest values) |
+| `-k line\|scatter\|bar\|histogram\|sparkline\|stat` | chart type (bar = latest values; stat = a tile per series with the value in big digits, its change, trend, target ETA and a sparkline — good as a pane above a chart) |
 | `--split` | one panel per series, each with its own y axis |
 | `--pane 'node1 kind=bar lines=live,avg'` | panes: several charts in one view (repeat `--pane`); each picks series (`*` = all), `kind=`, `lines=` |
 | `--layout '(1 \| 2) / 3'` | how panes are arranged: `\|` side by side, `/` stacked, `\|60%` sizes (default: two side by side, more in a grid) |
