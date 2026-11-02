@@ -420,7 +420,64 @@ enum Hit {
     MarkAction(MarkAction),
     /// Timeframe dropdown: type a range in the console.
     CustomRange,
+    /// The tutorial panel.
+    Tutorial(TutorialHit),
     MenuBackground,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TutorialHit {
+    Next,
+    Back,
+    Fold,
+    Copy,
+    End,
+}
+
+/// Greedy word wrap to `width` columns (long words are split).
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthStr;
+    let width = width.max(4);
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for word in text.split(' ').filter(|w| !w.is_empty()) {
+        let mut word = word.to_string();
+        loop {
+            let need = if line.is_empty() {
+                word.width()
+            } else {
+                line.width() + 1 + word.width()
+            };
+            if need <= width {
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(&word);
+                break;
+            }
+            if !line.is_empty() {
+                out.push(std::mem::take(&mut line));
+                continue;
+            }
+            // A word longer than the line: split it.
+            let mut cut = 0;
+            let mut w = 0;
+            for (i, c) in word.char_indices() {
+                let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+                if w + cw > width {
+                    cut = i;
+                    break;
+                }
+                w += cw;
+            }
+            out.push(word[..cut].to_string());
+            word = word[cut..].to_string();
+        }
+    }
+    if !line.is_empty() || out.is_empty() {
+        out.push(line);
+    }
+    out
 }
 
 fn arrow_dir(code: KeyCode) -> PDir {
@@ -581,6 +638,8 @@ pub struct App {
     pane_menu: bool,
     /// Text to put on the clipboard (written to the terminal by the event loop).
     clipboard: Option<String>,
+    /// `--tutorial`: the guided tour, shown above the chart.
+    tutorial: Option<crate::tutorial::Tutorial>,
     /// Sources of panes with `source=` (presets, profiles, recent charts).
     subs: Vec<crate::sources::Sub>,
     /// Their latest data, as drawn.
@@ -643,6 +702,7 @@ impl App {
             timeframe,
             ..
         } = setup;
+        let tutorial = cli.tutorial.then(crate::tutorial::Tutorial::new);
         // Re-parse history kept from a previous configuration.
         for (line, meta) in &live.raw {
             let _ = session.feed(line, meta);
@@ -691,6 +751,7 @@ impl App {
             pending: None,
             pane_menu: false,
             clipboard: None,
+            tutorial,
             subs: Vec::new(),
             mark_rules: Vec::new(),
             manual_marks: Vec::new(),
@@ -1019,6 +1080,229 @@ impl App {
         };
         crate::notify::send_in_background(targets, self.opts.title.clone(), msg.clone());
         self.say(format!("🔔 {msg}"), false);
+    }
+
+    // ───────────── tutorial ─────────────
+
+    /// Has the current step's task been done? (Read-only steps always are.)
+    fn tutorial_check(&self, c: crate::tutorial::Check) -> bool {
+        use crate::tutorial::Check as C;
+        let t = self.tutorial.as_ref();
+        match c {
+            C::Read => true,
+            C::Cursor => self.cursor.is_some(),
+            C::Zoomed => self.view.is_some(),
+            C::Selected => self.selection.is_some(),
+            C::Hidden => !self.hidden.is_empty(),
+            C::Trends => !self.opts.trends.is_empty(),
+            C::Timeframe => !self.timeframe.is_all(),
+            C::Stats => self.show_stats,
+            C::Forecast => self.opts.forecast.is_some(),
+            C::Kind => {
+                self.opts.kind != ChartKind::Line
+                    || self.opts.panes.as_ref().is_some_and(|p| {
+                        p.panes
+                            .iter()
+                            .any(|q| q.kind.is_some_and(|k| k != ChartKind::Line))
+                    })
+            }
+            C::Panes => {
+                self.opts.side_by_side || self.opts.panes.as_ref().is_some_and(|p| p.count() > 1)
+            }
+            C::HLine => !self.opts.hlines.is_empty(),
+            C::Marker => !self.mark_rules.is_empty() || !self.manual_marks.is_empty(),
+            C::Alert => !self.alerts.is_empty(),
+            C::Line => !self.session.custom.is_empty(),
+            C::Undo => t.is_some_and(|t| t.undone),
+            C::Copied => t.is_some_and(|t| t.copied),
+        }
+    }
+
+    /// Tick off the current step once its task is done.
+    fn update_tutorial(&mut self) {
+        let Some(t) = &self.tutorial else {
+            return;
+        };
+        let (step, check) = (t.step, t.current().check);
+        if !t.done[step]
+            && self.tutorial_check(check)
+            && let Some(t) = self.tutorial.as_mut()
+        {
+            t.done[step] = true;
+        }
+    }
+
+    fn tutorial_hit(&mut self, h: TutorialHit) -> Transition {
+        let Some(t) = self.tutorial.as_mut() else {
+            return Transition::None;
+        };
+        match h {
+            TutorialHit::Next => {
+                if !t.next() {
+                    return self.tutorial_hit(TutorialHit::End);
+                }
+                t.folded = false;
+            }
+            TutorialHit::Back => t.back(),
+            TutorialHit::Fold => t.folded = !t.folded,
+            TutorialHit::Copy => {
+                if let Some(c) = t.current().command {
+                    self.copy(Some(c.to_string()));
+                    self.say(format!("copied: {c}"), false);
+                }
+            }
+            TutorialHit::End => {
+                self.tutorial = None;
+                self.say("tutorial closed · graft --tutorial runs it again", false);
+            }
+        }
+        // A step whose task you did earlier (or just now) is ticked straight away.
+        self.update_tutorial();
+        Transition::None
+    }
+
+    /// The panel's text rows at this width, and its buttons.
+    fn tutorial_content(&self, width: u16) -> (Vec<Line<'static>>, Vec<Button<Hit>>) {
+        let Some(t) = &self.tutorial else {
+            return (Vec::new(), Vec::new());
+        };
+        let step = t.current();
+        let w = width.saturating_sub(2).max(10) as usize;
+        let mut lines: Vec<Line> = Vec::new();
+        let text = Style::default().fg(Color::White);
+        for (i, para) in step.text.split('\n').enumerate() {
+            if i > 0 {
+                lines.push(Line::raw(""));
+            }
+            lines.extend(wrap(para, w).into_iter().map(|l| Line::styled(l, text)));
+        }
+        if let Some(c) = step.command {
+            for l in wrap(c, w.saturating_sub(2)) {
+                lines.push(Line::styled(
+                    format!("  {l}"),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+        }
+        if let Some(task) = step.task {
+            if t.is_done() {
+                lines.push(Line::styled(
+                    "✓ done! Enter or tap next to go on",
+                    Style::default()
+                        .fg(Color::LightGreen)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                for (i, l) in wrap(task, w.saturating_sub(6)).into_iter().enumerate() {
+                    let lead = if i == 0 { "▸ try: " } else { "       " };
+                    lines.push(Line::styled(
+                        format!("{lead}{l}"),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+            }
+        }
+        let last = t.step + 1 == crate::tutorial::STEPS.len();
+        let mut buttons = Vec::new();
+        if t.step > 0 {
+            buttons.push(Button::new("◀ back", Hit::Tutorial(TutorialHit::Back)));
+        }
+        buttons.push(
+            Button::new(
+                if last { "finish ✓" } else { "next ▶" },
+                Hit::Tutorial(TutorialHit::Next),
+            )
+            .active(t.is_done()),
+        );
+        if step.command.is_some() {
+            buttons.push(Button::new("copy", Hit::Tutorial(TutorialHit::Copy)));
+        }
+        buttons.push(Button::new("hide", Hit::Tutorial(TutorialHit::Fold)));
+        if !last {
+            buttons.push(Button::new("end tour", Hit::Tutorial(TutorialHit::End)));
+        }
+        (lines, buttons)
+    }
+
+    fn tutorial_height(&self, width: u16, height: u16) -> u16 {
+        let Some(t) = &self.tutorial else {
+            return 0;
+        };
+        if t.folded {
+            return 1;
+        }
+        let (lines, buttons) = self.tutorial_content(width);
+        let want = lines.len() as u16 + flow_height(&buttons, width.saturating_sub(2)) + 2;
+        // Leave the chart most of the screen.
+        want.min(height.saturating_sub(10).max(4))
+            .min(height / 2 + 2)
+    }
+
+    fn draw_tutorial(&self, f: &mut Frame, area: Rect) {
+        let Some(t) = &self.tutorial else {
+            return;
+        };
+        let n = crate::tutorial::STEPS.len();
+        let step = t.current();
+        let progress = format!("tutorial {}/{n}", t.step + 1);
+        if t.folded {
+            let line = Line::from(vec![
+                Span::styled(
+                    format!(" {progress} · {} ", step.title),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    if t.is_done() { " ✓ " } else { "" },
+                    Style::default().fg(Color::LightGreen),
+                ),
+                Span::styled(" show ▾", Style::default().fg(Color::Gray)),
+            ]);
+            f.render_widget(line, area);
+            self.hits.push(area, Hit::Tutorial(TutorialHit::Fold));
+            return;
+        }
+        Clear.render(area, f.buffer_mut());
+        let block = Block::bordered()
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(Line::from(vec![
+                Span::styled(format!(" {progress} "), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("{} ", step.title),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        // Taps on the panel's background do nothing (not the chart under it).
+        self.hits.push(area, Hit::MenuBackground);
+        let (lines, buttons) = self.tutorial_content(area.width);
+        let bh = flow_height(&buttons, inner.width);
+        let text_h = inner.height.saturating_sub(bh);
+        let shown = lines.len().min(text_h as usize);
+        // Too little room: the task (at the end) matters most, so keep the end.
+        let skip = lines.len() - shown;
+        f.render_widget(
+            Paragraph::new(lines[skip..].to_vec()),
+            Rect {
+                height: text_h,
+                ..inner
+            },
+        );
+        render_buttons(
+            &buttons,
+            Rect {
+                y: inner.y + text_h,
+                height: bh.min(inner.height),
+                ..inner
+            },
+            f.buffer_mut(),
+            &self.hits,
+        );
     }
 
     // ───────────── alerts menu ─────────────
@@ -1761,6 +2045,9 @@ impl App {
             false,
         );
         self.clipboard = Some(text);
+        if let Some(t) = self.tutorial.as_mut() {
+            t.copied = true;
+        }
     }
 
     /// Clipboard text waiting to be sent to the terminal.
@@ -3426,6 +3713,7 @@ impl App {
             TermEvent::Mouse(m) => self.on_mouse(*m),
             _ => Transition::None,
         };
+        self.update_tutorial();
         let after_key = self.snapshot_key();
         if !std::mem::take(&mut self.stepped) && after_key != before.key {
             self.undo.push(before);
@@ -3631,6 +3919,13 @@ impl App {
     /// Undo: back to the setup before the last change.
     fn step_back(&mut self) -> Transition {
         self.stepped = true;
+        if let Some(t) = self.tutorial.as_mut() {
+            t.undone = true;
+            // (Undo keys skip the usual after-event check.)
+            if t.current().check == crate::tutorial::Check::Undo {
+                t.done[t.step] = true;
+            }
+        }
         match self.undo.pop() {
             Some(prev) => {
                 self.redo.push(self.snapshot());
@@ -3741,6 +4036,14 @@ impl App {
         }
         if self.pane_menu && self.on_pane_key(key) {
             return Transition::None;
+        }
+        // The tutorial: Enter goes on, Backspace goes back.
+        if self.tutorial.is_some() && !(self.help || self.console_help) {
+            match key.code {
+                KeyCode::Enter => return self.tutorial_hit(TutorialHit::Next),
+                KeyCode::Backspace => return self.tutorial_hit(TutorialHit::Back),
+                _ => {}
+            }
         }
         if self.help || self.console_help {
             match key.code {
@@ -3958,6 +4261,7 @@ impl App {
                             Transition::None
                         }
                         Hit::MenuBackground => Transition::None,
+                        Hit::Tutorial(h) => self.tutorial_hit(h),
                         Hit::Pane(op) => {
                             self.pane_op(op);
                             Transition::None
@@ -4343,6 +4647,13 @@ impl App {
         self.hits.clear();
         self.plots.borrow_mut().clear();
         let area = f.area();
+        // The tutorial sits above everything else.
+        let tut_h = self.tutorial_height(area.width, area.height);
+        let [tut_area, area] =
+            Layout::vertical([Constraint::Length(tut_h), Constraint::Min(0)]).areas(area);
+        if tut_h > 0 {
+            self.draw_tutorial(f, tut_area);
+        }
         let n_stats = self
             .ds
             .series
@@ -6410,5 +6721,166 @@ mod tests {
         let mut app = super::tests::app(&["graft", LOG, "--bind", "u = title(\"bound\")"]);
         key(&mut app, KeyCode::Char('u'));
         assert_eq!(app.opts.title, "bound");
+    }
+
+    fn tutorial_app() -> App {
+        let (setup, live) = crate::tutorial::start().unwrap();
+        let mut app = App::new(setup, live);
+        let t0 = Instant::now();
+        while app.ds.series.iter().map(|s| s.points.len()).sum::<usize>() < 2700
+            && t0.elapsed() < Duration::from_secs(10)
+        {
+            app.tick();
+        }
+        app.rebuild(true);
+        app
+    }
+
+    #[test]
+    #[ignore]
+    fn write_tutorial_screens() {
+        let dir = std::env::var("GRAFT_SNAPSHOTS").unwrap();
+        let mut app = tutorial_app();
+        let steps: usize = std::env::var("GRAFT_TUTORIAL_STEP").map_or(0, |s| s.parse().unwrap());
+        for _ in 0..steps {
+            key(&mut app, KeyCode::Enter);
+        }
+        if let Ok(code) = std::env::var("GRAFT_TUTORIAL_RUN") {
+            run(&mut app, &code);
+        }
+        for (w, h) in [(110, 34), (46, 40)] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| app.draw(f)).unwrap();
+            let ans = crate::render::ansi::to_ansi(term.backend().buffer(), true);
+            std::fs::write(format!("{dir}/tutorial-{steps}-{w}.ans"), ans).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_tutorial_walks_through_everything() {
+        use crate::tutorial::{Check, STEPS};
+        let mut app = tutorial_app();
+        assert!(screen(&app).contains("tutorial 1/"));
+        let done = |app: &App| app.tutorial.as_ref().unwrap().is_done();
+        let at = |app: &App| STEPS[app.tutorial.as_ref().unwrap().step].check;
+        // Each task, done the way the step says.
+        let mut tried = Vec::new();
+        while let Some(t) = &app.tutorial {
+            let step = t.current();
+            let check = step.check;
+            if check != Check::Read {
+                assert!(!done(&app), "{check:?} done before trying it");
+            }
+            match check {
+                Check::Read => {
+                    if step.command.is_some() {
+                        app.tutorial_hit(TutorialHit::Copy);
+                        assert_eq!(app.take_clipboard().as_deref(), step.command);
+                    }
+                }
+                Check::Cursor => {
+                    key(&mut app, KeyCode::Char('c'));
+                }
+                Check::Zoomed => {
+                    key(&mut app, KeyCode::Char('+'));
+                }
+                Check::Selected => {
+                    key(&mut app, KeyCode::Char('v'));
+                    (0..6).for_each(|_| {
+                        key(&mut app, KeyCode::Char(','));
+                    });
+                    key(&mut app, KeyCode::Char('v'));
+                }
+                Check::Hidden => {
+                    key(&mut app, KeyCode::Char('3'));
+                }
+                Check::Trends => {
+                    key(&mut app, KeyCode::Char('T'));
+                    key(&mut app, KeyCode::Char('a'));
+                    key(&mut app, KeyCode::Esc);
+                }
+                Check::Timeframe => {
+                    key(&mut app, KeyCode::Char('R'));
+                    key(&mut app, KeyCode::Esc);
+                    run(&mut app, r#"range("5m")"#);
+                }
+                Check::Stats => {
+                    key(&mut app, KeyCode::Char('s'));
+                }
+                Check::Forecast => {
+                    key(&mut app, KeyCode::Char('f'));
+                }
+                Check::Kind => {
+                    key(&mut app, KeyCode::Char('t'));
+                }
+                Check::Panes => {
+                    key(&mut app, KeyCode::Char('w'));
+                    key(&mut app, KeyCode::Char('|'));
+                    key(&mut app, KeyCode::Char('w'));
+                }
+                Check::HLine => run(&mut app, r#"hline(50ms, "slow")"#),
+                Check::Marker => {
+                    run(&mut app, r#"mark_when("value > 60ms", "spike")"#);
+                    assert!(
+                        app.opts
+                            .marks
+                            .iter()
+                            .any(|m| m.series.as_deref() == Some("db")),
+                        "the db spikes are marked"
+                    );
+                }
+                Check::Alert => run(&mut app, r#"alert("api > 45ms")"#),
+                Check::Line => {
+                    run(&mut app, r#"add_line("smooth", "ema(values(`api`), 30)")"#);
+                    assert!(app.ds.series.iter().any(|s| s.name == "smooth"));
+                }
+                Check::Undo => {
+                    app.on_event(&TermEvent::Key(KeyEvent::new(
+                        KeyCode::Char('z'),
+                        KeyModifiers::CONTROL,
+                    )));
+                }
+                Check::Copied => {
+                    key(&mut app, KeyCode::Char('C'));
+                }
+            };
+            assert!(done(&app), "{check:?} not ticked off");
+            assert!(
+                app.message.as_ref().is_none_or(|m| !m.error),
+                "{check:?}: {}",
+                app.message.as_ref().map_or("", |m| m.text.as_str())
+            );
+            tried.push(at(&app));
+            // Every step fits a phone screen, buttons included.
+            let phone = screen_sized(&app, 46, 40);
+            assert!(
+                phone.contains("next ▶") || phone.contains("finish ✓"),
+                "{phone}"
+            );
+            key(&mut app, KeyCode::Enter);
+        }
+        assert_eq!(tried.len(), STEPS.len());
+        // Going back keeps what's done; hide folds the panel to a line.
+        let mut app = tutorial_app();
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Char('c'));
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Backspace);
+        assert!(done(&app));
+        app.tutorial_hit(TutorialHit::Fold);
+        let s = screen(&app);
+        assert!(s.lines().next().unwrap().contains("tutorial 2/"), "{s}");
+        app.tutorial_hit(TutorialHit::Fold);
+        // Tapping next ▶ moves on, like Enter.
+        let (col, row) = find(&app, "next ▶");
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            col + 1,
+            row,
+        );
+        assert_eq!(app.tutorial.as_ref().unwrap().step, 2);
+        app.tutorial_hit(TutorialHit::End);
+        assert!(app.tutorial.is_none() && !screen(&app).contains("tutorial 3/"));
     }
 }

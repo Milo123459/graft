@@ -56,7 +56,16 @@ cargo install --path . --features png  # also PNG export (pulls in resvg)
 
 ## Quick tour
 
+New to graft? `graft --tutorial` walks you through every feature on a live demo chart
+(a made-up service log): reading values, zooming, measuring, trend lines, timeframes,
+stats, forecasts, chart types, panes, the console, markers, alerts, custom Rhai lines,
+undo and saving — each step asks you to try it and ticks itself off — then finishes
+with recipes for real use, each with a copy button. Enter (or next ▶) moves on,
+Backspace goes back, *hide* folds the panel to one line. It's also first in the quick
+start list when you run `graft` on its own.
+
 ```sh
+graft --tutorial                       # the guided tour
 graft                                  # open the builder: pick a source, get format suggestions
 graft app.log                          # no format given: opens the builder with suggestions
 graft app.log -F '{time} {_} took {ms}' # graph it with an explicit format template

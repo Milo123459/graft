@@ -27,6 +27,7 @@ mod template;
 mod time;
 mod transform;
 mod tui;
+mod tutorial;
 mod ui;
 mod units;
 
@@ -93,6 +94,13 @@ fn run() -> Result<ExitCode> {
     }
 
     let stdout_tty = std::io::stdout().is_terminal();
+    if cli.tutorial {
+        if !stdout_tty {
+            anyhow::bail!("--tutorial needs a terminal");
+        }
+        let (setup, live) = tutorial::start()?;
+        return interactive::run(interactive::Start::Viewer(Box::new(setup), live));
+    }
     let color = stdout_tty && !cli.no_color;
     let interactive =
         !cli.once && !cli.no_chart && cli.explain.is_none() && cli.export.is_empty() && stdout_tty;

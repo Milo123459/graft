@@ -499,6 +499,10 @@ pub struct Cli {
     /// Print a man page (roff).
     #[arg(long, help_heading = "Misc")]
     pub man: bool,
+
+    /// A guided tour of graft on a live demo chart: every feature, then recipes.
+    #[arg(long, help_heading = "Misc")]
+    pub tutorial: bool,
 }
 
 impl Cli {

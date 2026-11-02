@@ -213,6 +213,14 @@ impl Gallery {
                 args: r.args,
             })
             .collect();
+        // New to graft? First in the quick start list.
+        items.push(Item {
+            title: "Tutorial".into(),
+            description: "a guided tour of everything graft does, on a live demo chart".into(),
+            args: vec!["--tutorial".into()],
+            kind: ItemKind::Preset,
+            cwd: None,
+        });
         items.extend(
             crate::profile::presets()
                 .into_iter()
@@ -610,6 +618,10 @@ impl Builder {
 
     /// Validate and build the viewer.
     pub fn launch(&mut self) -> Result<App> {
+        if self.cli.tutorial {
+            let (setup, live) = crate::tutorial::start()?;
+            return Ok(App::new(setup, live));
+        }
         self.apply()?;
         if self.cli.input.is_none() && self.cli.cmd.is_none() {
             bail!("choose a source first");
@@ -1871,8 +1883,15 @@ mod tests {
         assert_eq!(tap(&mut b, "Memory"), Transition::Start);
         let app = b.launch().expect("preset launches");
         assert_eq!(app.current_cli().title.as_deref(), Some("Memory"));
+        // The tutorial is there too, and starts the tour.
+        let mut b = builder(&["graft"]);
+        assert_eq!(tap(&mut b, "Tutorial"), Transition::Start);
+        let app = b.launch().expect("tutorial launches");
+        assert!(app.current_cli().tutorial);
         // "edit" opens it in the builder with its explicit format, and back returns.
         let mut b = builder(&["graft"]);
+        // (Down past the tutorial and CPU usage.)
+        key(&mut b, KeyCode::Down);
         key(&mut b, KeyCode::Down);
         assert_eq!(key(&mut b, KeyCode::Char('e')), Transition::None);
         assert!(b.gallery.is_none());
