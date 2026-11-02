@@ -20,6 +20,11 @@ pub struct Session {
     pub matched: u64,
     /// --grep: lines with no timestamp at all are counted when they arrive.
     arrival_time: bool,
+    /// Custom lines (`--line`), worked out after everything else.
+    pub custom: Vec<crate::lines::CustomLine>,
+    /// Why custom lines failed, last time they were worked out.
+    pub line_errors: std::cell::RefCell<Vec<String>>,
+    binary: bool,
 }
 
 impl Session {
@@ -35,6 +40,13 @@ impl Session {
             lines: 0,
             matched: 0,
             arrival_time: !cli.grep.is_empty() && cli.x == crate::cli::XMode::Auto,
+            custom: cli
+                .line
+                .iter()
+                .map(|l| crate::lines::CustomLine::parse(l).map_err(anyhow::Error::msg))
+                .collect::<Result<_>>()?,
+            line_errors: Default::default(),
+            binary: cli.binary_units,
         })
     }
 
@@ -52,11 +64,24 @@ impl Session {
 
     /// Every series after derived series and transforms (what scripts and alerts see).
     pub fn full_dataset(&self) -> Dataset {
-        self.pipeline.apply(self.store.dataset(), &self.script)
+        let mut ds = self.pipeline.apply(self.store.dataset(), &self.script);
+        if !self.custom.is_empty() {
+            *self.line_errors.borrow_mut() =
+                crate::lines::apply(&self.script, &self.custom, &mut ds, self.binary);
+        }
+        ds
     }
 
-    /// The series selected for display.
+    /// The series selected for display (custom lines always are).
     pub fn select(&self, full: &Dataset) -> Dataset {
-        self.pipeline.select(full)
+        let mut out = self.pipeline.select(full);
+        for l in &self.custom {
+            if !out.series.iter().any(|s| s.name == l.name)
+                && let Some(s) = full.series.iter().find(|s| s.name == l.name)
+            {
+                out.series.push(s.clone());
+            }
+        }
+        out
     }
 }

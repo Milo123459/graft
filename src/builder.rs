@@ -712,7 +712,12 @@ impl Builder {
                 self.gallery = Some(Gallery::new());
                 self.message = None;
             }
-            KeyCode::Esc => return Transition::Back,
+            // Back to the chart it came from; Esc never quits (q does, from the gallery).
+            KeyCode::Esc if self.previous.is_some() => return Transition::Back,
+            KeyCode::Esc => {
+                self.gallery = Some(Gallery::new());
+                self.message = None;
+            }
             KeyCode::Tab | KeyCode::BackTab => {
                 let fields = self.fields();
                 let i = self.focus.and_then(|f| fields.iter().position(|x| *x == f));
@@ -1449,7 +1454,7 @@ impl Builder {
                     KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                         return Transition::Quit;
                     }
-                    KeyCode::Esc | KeyCode::Char('q') => return Transition::Back,
+                    KeyCode::Char('q') => return Transition::Back,
                     KeyCode::Up | KeyCode::Char('k') if n > 0 => {
                         self.gallery.as_mut().expect("gallery").selected = (sel + n - 1) % n
                     }

@@ -6,6 +6,7 @@ mod data;
 mod explain;
 mod export;
 mod interactive;
+mod lines;
 mod marks;
 mod notify;
 mod parse;

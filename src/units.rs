@@ -18,6 +18,8 @@ pub enum Dim {
     Seconds,
     /// Any other suffix, kept verbatim (`%`, `°C`, `req`, ...).
     Other(String),
+    /// Money: the symbol goes in front, with cents (`$3,456.78`).
+    Money(String),
 }
 
 /// The unit of a series: a dimension, optionally per second (after `--rate`).
@@ -43,6 +45,7 @@ impl Unit {
             Dim::Bytes { binary } => fmt_bytes(v, *binary),
             Dim::Seconds => fmt_seconds(v),
             Dim::Other(s) => format!("{}{}", fmt_compact(v), s),
+            Dim::Money(sym) => fmt_money(v, sym),
         };
         if self.rate { format!("{base}/s") } else { base }
     }
@@ -82,7 +85,7 @@ impl Unit {
             Dim::None => String::new(),
             Dim::Bytes { .. } => "bytes".into(),
             Dim::Seconds => "seconds".into(),
-            Dim::Other(s) => s.clone(),
+            Dim::Other(s) | Dim::Money(s) => s.clone(),
         };
         match (base.is_empty(), self.rate) {
             (true, true) => "per second".into(),
@@ -131,8 +134,46 @@ pub fn lookup_unit(s: &str, binary: bool) -> Option<(Dim, f64)> {
         "min" | "mins" => Some((Dim::Seconds, 60.0)),
         "h" | "hr" | "hrs" => Some((Dim::Seconds, 3600.0)),
         "%" => Some((Dim::Other("%".into()), 1.0)),
+        "$" | "USD" | "usd" | "USDT" | "USDC" => Some((Dim::Money("$".into()), 1.0)),
+        "€" | "EUR" | "eur" => Some((Dim::Money("€".into()), 1.0)),
+        "£" | "GBP" | "gbp" => Some((Dim::Money("£".into()), 1.0)),
         _ => None,
     }
+}
+
+/// `$3,456.78`; small amounts keep more digits (`$0.01234`), big ones are compact
+/// (`$1.23M`).
+pub fn fmt_money(v: f64, sym: &str) -> String {
+    let sign = if v < 0.0 { "-" } else { "" };
+    let a = v.abs();
+    if a >= 1e6 {
+        let (d, s) = if a >= 1e12 {
+            (1e12, "T")
+        } else if a >= 1e9 {
+            (1e9, "B")
+        } else {
+            (1e6, "M")
+        };
+        return format!(
+            "{sign}{sym}{}{s}",
+            fmt_sig(((a / d) * 100.0).round() / 100.0)
+        );
+    }
+    if a > 0.0 && a < 1.0 {
+        // Four significant digits.
+        let decimals = (3 - a.log10().floor() as i32).max(2) as usize;
+        return format!("{sign}{sym}{a:.decimals$}");
+    }
+    let cents = format!("{a:.2}");
+    let (int, frac) = cents.split_once('.').unwrap_or((&cents, "00"));
+    let mut grouped = String::new();
+    for (i, c) in int.chars().enumerate() {
+        if i > 0 && (int.len() - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(c);
+    }
+    format!("{sign}{sym}{grouped}.{frac}")
 }
 
 /// Split a leading number off `s`, returning the number and the remaining text.
@@ -290,6 +331,20 @@ fn fmt_seconds(v: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn money() {
+        let usd = Unit::new(lookup_unit("USD", false).unwrap().0);
+        assert_eq!(usd.format(3456.781), "$3,456.78");
+        assert_eq!(usd.format(-12.5), "-$12.50");
+        assert_eq!(usd.format(0.01234), "$0.01234");
+        assert_eq!(usd.format(0.5), "$0.5000");
+        assert_eq!(usd.format(1_234_567.0), "$1.23M");
+        assert_eq!(
+            Unit::new(lookup_unit("EUR", false).unwrap().0).format(1000.0),
+            "€1,000.00"
+        );
+    }
 
     #[test]
     fn parses_values_with_units() {

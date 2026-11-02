@@ -114,7 +114,7 @@ const HELP: &[(&str, &str)] = &[
     ),
     ("M", "mouse on/off (off = select text in your terminal)"),
     (":", "Rhai console, e.g. :slope(\"node1\", \"1d\")"),
-    ("q / Esc", "quit (Esc first clears a measurement)"),
+    ("q", "quit (Esc only clears a measurement or the cursor)"),
 ];
 
 /// `:help` — the console's commands. Series names go in quotes.
@@ -228,6 +228,14 @@ const CONSOLE_HELP: &[(&str, &str)] = &[
         "export / change the format / quit",
     ),
     ("undo()  redo()", "step back / forward through your changes"),
+    (
+        "add_line(\"ema30\", \"ema(values(\\\"ETH\\\"), 30)\")",
+        "a custom line from Rhai (same name replaces it)",
+    ),
+    (
+        "remove_line(\"ema30\")",
+        "helpers: ema sma values xs values_at(name, xs) mean…",
+    ),
     (
         "copy()  copy(text)",
         "copy this view's command (or any text) to your clipboard",
@@ -357,6 +365,9 @@ enum Hit {
     Pane(PaneOp),
     /// Source picker: use item `n`.
     PickSource(usize),
+    /// Lines menu: edit custom line `n` (`None`: add one), or delete it.
+    LineAction(Option<usize>),
+    DeleteLine(usize),
     /// Markers menu.
     EditRule(usize),
     DeleteRule(usize),
@@ -395,6 +406,7 @@ struct Snapshot {
     show_stats: bool,
     mark_rules: Vec<crate::marks::MarkRule>,
     manual_marks: Vec<crate::render::Mark>,
+    custom: Vec<crate::lines::CustomLine>,
     /// For comparing setups (computed markers left out).
     key: String,
 }
@@ -520,6 +532,8 @@ pub struct App {
     panes_before_side_by_side: Option<Panes>,
     /// This event was an undo or redo (not a step of its own).
     stepped: bool,
+    /// Custom line errors already reported.
+    shown_line_errors: Vec<String>,
     /// The source picker for the focused pane: (label, source name).
     source_menu: Option<(Vec<SourceChoice>, usize)>,
     /// Where the chart area was last drawn (for pane taps and border drags).
@@ -598,6 +612,7 @@ impl App {
             redo: Vec::new(),
             panes_before_side_by_side: None,
             stepped: false,
+            shown_line_errors: Vec::new(),
             sub_views: Vec::new(),
             source_menu: None,
             chart_rect: std::cell::Cell::new(Rect::default()),
@@ -638,6 +653,7 @@ impl App {
             .collect();
         c.layout = self.opts.panes.as_ref().map(Panes::layout_expr);
         c.mark = self.mark_rules.iter().map(|r| r.to_spec()).collect();
+        c.line = self.session.custom.iter().map(|l| l.to_spec()).collect();
         c.side_by_side = self.opts.side_by_side;
         c.no_targets = !self.opts.show_targets;
         c.last = self.timeframe.last;
@@ -729,6 +745,13 @@ impl App {
         }
         self.check_alerts();
         self.update_marks();
+        let errors = self.session.line_errors.borrow().clone();
+        if errors != self.shown_line_errors {
+            if let Some(e) = errors.first() {
+                self.say(e.clone(), true);
+            }
+            self.shown_line_errors = errors;
+        }
     }
 
     /// Place markers from the rules (and those set by hand) on the current data.
@@ -861,6 +884,13 @@ impl App {
             return;
         }
         let (x0, x1) = self.bounds();
+        // Already at the newest data: moving on means back to everything ("live").
+        let (_, end) = self.full_bounds();
+        if frac > 0.0 && x1 >= end - (x1 - x0) * 0.01 {
+            self.view = None;
+            self.say("showing everything", false);
+            return;
+        }
         let d = (x1 - x0) * frac;
         self.set_view(x0 + d, x1 + d);
     }
@@ -960,6 +990,34 @@ impl App {
         let n = options.len() as isize;
         let next = options[((i + dir as isize) % n + n) as usize % options.len()];
         self.set_timeframe(next.map_or_else(Timeframe::default, Timeframe::last));
+    }
+
+    /// Open the console to add a custom line, or edit line `i` (same name replaces it).
+    fn edit_custom_line(&mut self, i: Option<usize>) {
+        let q = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+        let code = match i.and_then(|i| self.session.custom.get(i)) {
+            Some(l) => {
+                let name = match &l.unit {
+                    Some(u) => format!("{}:{u}", l.name),
+                    None => l.name.clone(),
+                };
+                format!("add_line({}, {})", q(&name), q(&l.expr))
+            }
+            None => {
+                let first = self
+                    .ds
+                    .series
+                    .first()
+                    .map_or("name".to_string(), |s| s.name.clone());
+                format!("add_line(\"ema30\", \"ema(values(\\\"{first}\\\"), 30)\")")
+            }
+        };
+        self.lines_menu = false;
+        self.console = Some(TextInput::new(code));
+        self.say(
+            "a Rhai expression returning an array (one value per point), [x, y] pairs or a number · Enter saves",
+            false,
+        );
     }
 
     // ───────────── markers menu ─────────────
@@ -1980,7 +2038,9 @@ impl App {
                 "straight fit (as used by forecast)",
             ));
         }
-        let h = (rows.len() as u16 + 7 + u16::from(self.opts.side_by_side)).min(area.height);
+        let custom_rows = self.session.custom.len() as u16 + 2;
+        let h = (rows.len() as u16 + 7 + custom_rows + u16::from(self.opts.side_by_side))
+            .min(area.height);
         let rect = Rect {
             x: (area.width - w) / 2,
             y: (area.height.saturating_sub(h)) / 2,
@@ -2100,6 +2160,64 @@ impl App {
                     Style::default().fg(Color::Gray),
                 );
             }
+            y += 1;
+        }
+        // Custom lines (Rhai), with edit and delete.
+        y += 1;
+        if y < inner.bottom() {
+            let x = inner.x;
+            f.buffer_mut().set_stringn(
+                x,
+                y,
+                "custom lines (Rhai):",
+                inner.width as usize,
+                Style::default().fg(Color::Gray),
+            );
+            let label_w = 21;
+            if inner.width > label_w + 16 {
+                render_buttons(
+                    &[Button::new("+ custom line", Hit::LineAction(None))],
+                    Rect {
+                        x: x + label_w,
+                        y,
+                        width: 16,
+                        height: 1,
+                    },
+                    f.buffer_mut(),
+                    &self.hits,
+                );
+            }
+            y += 1;
+        }
+        for (i, l) in self.session.custom.iter().enumerate() {
+            if y >= inner.bottom() {
+                break;
+            }
+            let r = Rect {
+                y,
+                height: 1,
+                width: inner.width.saturating_sub(4),
+                ..inner
+            };
+            f.render_widget(
+                Line::from(vec![
+                    Span::styled(" ✎ ", Style::default().fg(Color::Yellow)),
+                    Span::raw(l.to_spec()),
+                ]),
+                r,
+            );
+            self.hits.push(r, Hit::LineAction(Some(i)));
+            let del = Rect {
+                x: inner.right().saturating_sub(3),
+                y,
+                width: 3,
+                height: 1,
+            };
+            f.render_widget(
+                Span::styled(" ✕ ", Style::default().fg(Color::White).bg(Color::DarkGray)),
+                del,
+            );
+            self.hits.push(del, Hit::DeleteLine(i));
             y += 1;
         }
         y += 1;
@@ -2317,6 +2435,10 @@ impl App {
                 self.range_menu = false;
             }
             Cmd::SideBySide => self.toggle_side_by_side(),
+            Cmd::Targets if !self.has_targets() => self.say(
+                "no targets set: add one with :target(\"name\", 50GB) or --target name=50GB",
+                false,
+            ),
             Cmd::Targets => self.opts.show_targets = !self.opts.show_targets,
             Cmd::RangeStep(dir) => self.step_timeframe(dir),
             Cmd::Copy => self.copy(None),
@@ -2488,6 +2610,30 @@ impl App {
             Action::Svg(path) => self.export_view(path),
             Action::Pane(a) => self.apply_pane_action(a),
             Action::Copy(text) => self.copy(text),
+            Action::AddLine(name, expr) => {
+                match crate::lines::CustomLine::parse(&format!("{name} = {expr}")) {
+                    Ok(line) => {
+                        match self.session.custom.iter().position(|l| l.name == line.name) {
+                            Some(i) => self.session.custom[i] = line,
+                            None => self.session.custom.push(line),
+                        }
+                        self.rebuild(true);
+                        let first = self.session.line_errors.borrow().first().cloned();
+                        if let Some(e) = first {
+                            return self.say(e, true);
+                        }
+                    }
+                    Err(e) => self.say(format!("add_line: {e}"), true),
+                }
+            }
+            Action::RemoveLine(name) => {
+                let before = self.session.custom.len();
+                self.session.custom.retain(|l| l.name != name);
+                if self.session.custom.len() == before {
+                    self.say(format!("remove_line: no custom line called '{name}'"), true);
+                }
+                self.rebuild(true);
+            }
             Action::Undo => {
                 self.step_back();
             }
@@ -2618,6 +2764,17 @@ impl App {
         }
     }
 
+    /// Whether any series has a target line to draw (set, or the automatic 0 for a
+    /// clearly falling series).
+    fn has_targets(&self) -> bool {
+        self.ds.series.iter().any(|s| {
+            self.opts
+                .analysis
+                .report(&self.ds, s)
+                .is_some_and(|r| r.target.is_some())
+        })
+    }
+
     fn no_menu_open(&self) -> bool {
         !(self.lines_menu
             || self.range_menu
@@ -2636,8 +2793,12 @@ impl App {
         let mut hidden: Vec<&String> = self.hidden.iter().collect();
         hidden.sort();
         format!(
-            "{opts:?}|{:?}|{hidden:?}|{}|{:?}|{:?}",
-            self.timeframe, self.show_stats, self.mark_rules, self.manual_marks
+            "{opts:?}|{:?}|{hidden:?}|{}|{:?}|{:?}|{:?}",
+            self.timeframe,
+            self.show_stats,
+            self.mark_rules,
+            self.manual_marks,
+            self.session.custom
         )
     }
 
@@ -2651,6 +2812,7 @@ impl App {
             show_stats: self.show_stats,
             mark_rules: self.mark_rules.clone(),
             manual_marks: self.manual_marks.clone(),
+            custom: self.session.custom.clone(),
             key: self.snapshot_key(),
         }
     }
@@ -2662,6 +2824,7 @@ impl App {
         self.show_stats = s.show_stats;
         self.mark_rules = s.mark_rules;
         self.manual_marks = s.manual_marks;
+        self.session.custom = s.custom;
         self.selection = None;
         self.rebuild(true);
         self.tick_sources(true);
@@ -2812,7 +2975,13 @@ impl App {
                 self.measuring = false;
                 return Transition::None;
             }
-            KeyCode::Esc => Cmd::Quit,
+            // Esc never quits (that's q): it lets go of the cursor, or says how to quit.
+            KeyCode::Esc => {
+                if self.cursor.take().is_none() {
+                    self.say("q quits", false);
+                }
+                return Transition::None;
+            }
             KeyCode::Char('?') => Cmd::Help,
             KeyCode::Char(':') => Cmd::Console,
             KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => Cmd::CursorPrev,
@@ -2973,6 +3142,17 @@ impl App {
                             self.pane_op(op);
                             Transition::None
                         }
+                        Hit::LineAction(i) => {
+                            self.edit_custom_line(i);
+                            Transition::None
+                        }
+                        Hit::DeleteLine(i) => {
+                            if i < self.session.custom.len() {
+                                self.session.custom.remove(i);
+                                self.rebuild(true);
+                            }
+                            Transition::None
+                        }
                         Hit::EditRule(i) => {
                             self.edit_rule(i);
                             Transition::None
@@ -3130,7 +3310,7 @@ impl App {
             b("▶", Cmd::PanRight),
             b("+", Cmd::ZoomIn),
             b("−", Cmd::ZoomOut),
-            b("reset", Cmd::Reset).active(self.view.is_some()),
+            b("show all", Cmd::Reset).active(self.view.is_some()),
             b("cursor", Cmd::Cursor).active(self.cursor.is_some()),
             b(
                 if self.selection.is_some() {
@@ -3188,7 +3368,7 @@ impl App {
         );
         if self.toolbar_more {
             v.extend([
-                b("targets", Cmd::Targets).active(self.opts.show_targets),
+                b("targets", Cmd::Targets).active(self.opts.show_targets && self.has_targets()),
                 // With panes, the chart type button belongs to the picked pane.
                 b(
                     self.focused_pane()
@@ -3882,7 +4062,7 @@ mod tests {
         mouse(&mut app, MouseEventKind::ScrollUp, mid, row);
         assert!(app.view.is_some());
         // Toolbar buttons and series chips are tappable.
-        let (x, y) = find(&app, " reset ");
+        let (x, y) = find(&app, " show all ");
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
         assert!(app.view.is_none());
         let (x, y) = find(&app, "● node2");
@@ -4052,10 +4232,17 @@ mod tests {
             key(&mut app, KeyCode::Left);
         }
         assert_eq!(app.view.unwrap().0, a);
+        // Right stops at the newest data; one more goes back to everything.
+        let mut last_end = None;
         for _ in 0..50 {
+            if let Some(v) = app.view {
+                last_end = Some(v.1);
+            }
             key(&mut app, KeyCode::Right);
         }
-        assert!((app.view.unwrap().1 - b).abs() < 1e-6);
+        assert!((last_end.unwrap() - b).abs() < 1e-6);
+        assert_eq!(app.view, None);
+        key(&mut app, KeyCode::Up);
         key(&mut app, KeyCode::Down);
         key(&mut app, KeyCode::Down);
         assert_eq!(app.view, None);
@@ -4781,6 +4968,49 @@ mod tests {
         }
         assert!(!app.opts.log && !app.opts.side_by_side);
         assert_eq!(app.opts.panes, panes);
+    }
+
+    #[test]
+    fn show_all_and_play_forward_back_to_everything() {
+        let mut app = app(&["graft", LOG]);
+        screen(&app);
+        key(&mut app, KeyCode::Up);
+        key(&mut app, KeyCode::Up);
+        assert!(app.view.is_some());
+        let (x, y) = find(&app, "show all");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert!(app.view.is_none());
+        // ▶ moves right; at the newest data it goes back to everything.
+        key(&mut app, KeyCode::Up);
+        for _ in 0..20 {
+            key(&mut app, KeyCode::Right);
+        }
+        assert!(app.view.is_none());
+    }
+
+    #[test]
+    fn targets_button_is_off_without_targets() {
+        let more = |app: &mut App| {
+            if !screen(app).contains(" targets ") {
+                let (x, y) = find(app, " ⋯ ");
+                mouse(app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+            }
+        };
+        // Rising data, no targets: nothing to show, so the button isn't lit.
+        let mut app = app(&["graft", LOG, "-s", "node1", "--target", "none"]);
+        more(&mut app);
+        assert!(!app.has_targets());
+        key(&mut app, KeyCode::Char('G'));
+        assert!(
+            app.message
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("no targets set")
+        );
+        let mut app = super::tests::app(&["graft", LOG, "--target", "node1=50GB"]);
+        more(&mut app);
+        assert!(app.has_targets());
     }
 
     #[test]

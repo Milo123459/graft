@@ -396,6 +396,13 @@ pub struct Cli {
     #[arg(long, value_name = "EXPR", action = ArgAction::Append, help_heading = "Analysis")]
     pub alert: Vec<String>,
 
+    /// A custom line worked out with Rhai over the whole series, e.g. an EMA:
+    /// `'ema30 = ema(values("ETH"), 30)'`. Returns an array (one value per point of the
+    /// series it names), [x, y] pairs, or a number (a flat line). Helpers: ema, sma,
+    /// values, xs, values_at(name, xs), and your --script functions. Repeatable.
+    #[arg(long, value_name = "NAME[:UNIT] = EXPR", value_parser = parse_line, help_heading = "Series")]
+    pub line: Vec<String>,
+
     /// Put a marker on the chart wherever a condition holds, e.g. a drop of more than
     /// 1 GB between two samples: `'delta < -1GB => dropped {delta}'`. Variables:
     /// value, prev, delta, pct, rate (per second), time, i, name. Repeatable.
@@ -568,6 +575,9 @@ impl Cli {
         for e in &self.alert {
             opt("--alert", Some(e.clone()));
         }
+        for l in &self.line {
+            opt("--line", Some(l.clone()));
+        }
         for m in &self.mark {
             opt("--mark", Some(m.clone()));
         }
@@ -680,6 +690,10 @@ impl Cli {
     pub fn grep_bucket(&self) -> f64 {
         self.grep_every.unwrap_or(60.0)
     }
+}
+
+fn parse_line(s: &str) -> Result<String, String> {
+    crate::lines::CustomLine::parse(s).map(|l| l.to_spec())
 }
 
 fn parse_mark(s: &str) -> Result<String, String> {

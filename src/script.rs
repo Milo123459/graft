@@ -74,6 +74,9 @@ pub enum Action {
     ClearMarks,
     Undo,
     Redo,
+    /// A custom line: name (optionally `name:unit`) and Rhai expression.
+    AddLine(String, String),
+    RemoveLine(String),
     /// Open the builder to change the format or source.
     Format,
 }
@@ -539,6 +542,38 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
         },
     );
 
+    // Array helpers for custom lines.
+    let floats = |a: &Array| -> Vec<f64> { a.iter().filter_map(dyn_to_f64).collect() };
+    let to_array = |v: Vec<f64>| -> Array { v.into_iter().map(Dynamic::from_float).collect() };
+    engine.register_fn("ema", move |a: Array, n: i64| -> FnResult<Array> {
+        if n < 1 {
+            return Err("ema(values, n): n must be at least 1".into());
+        }
+        Ok(to_array(crate::lines::ema(&floats(&a), n as usize)))
+    });
+    engine.register_fn("sma", move |a: Array, n: i64| -> FnResult<Array> {
+        if n < 1 {
+            return Err("sma(values, n): n must be at least 1".into());
+        }
+        Ok(to_array(crate::lines::sma(&floats(&a), n as usize)))
+    });
+    let st = state.clone();
+    engine.register_fn(
+        "values_at",
+        move |name: &str, xs: Array| -> FnResult<Array> {
+            // Another series' values at these times (interpolated; () outside its range).
+            let pts = points(&st, name)?.points;
+            Ok(xs
+                .iter()
+                .map(|x| {
+                    dyn_to_f64(x)
+                        .and_then(|x| crate::render::interpolate(&pts, x))
+                        .map_or(Dynamic::UNIT, Dynamic::from_float)
+                })
+                .collect())
+        },
+    );
+
     for (fname, take_x) in [("values", false), ("xs", true)] {
         let st = state.clone();
         engine.register_fn(fname, move |name: &str| -> FnResult<Array> {
@@ -792,6 +827,14 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
     });
     let st = state.clone();
     engine.register_fn("clear_marks", move || push(&st, Action::ClearMarks));
+    let st = state.clone();
+    engine.register_fn("add_line", move |name: &str, expr: &str| {
+        push(&st, Action::AddLine(name.into(), expr.into()))
+    });
+    let st = state.clone();
+    engine.register_fn("remove_line", move |name: &str| {
+        push(&st, Action::RemoveLine(name.into()))
+    });
     let st = state.clone();
     engine.register_fn("undo", move || push(&st, Action::Undo));
     let st = state.clone();

@@ -356,7 +356,7 @@ including over SSH from a phone.
 | drag the cursor line | scrub through the data, and past it into the forecast |
 | **measure**, then tap start and end (or drag across, or click then **shift+click**) | stats for just that stretch, including how much each series *changed*; tap again to clear |
 | scroll | zoom around the pointer (sideways or shift + scroll moves); never past your data |
-| toolbar / series chips | ◀ ▶ + − reset cursor measure stats **lines** (menu) **side by side** forecast split **all time ▾** (menu); `⋯` shows more: targets, chart type, log, follow, pause, format, console, export, mouse, help, quit |
+| toolbar / series chips | ◀ ▶ (move; ▶ at the newest data shows everything) + − **show all** cursor measure stats **lines** (menu) **side by side** forecast split **all time ▾** (menu); `⋯` shows more: targets, chart type, log, follow, pause, format, console, export, mouse, help, quit |
 
 **Timeframe** (anything on a time axis — log timestamps, or arrival times for
 live commands like `ping`): tap **all time ▾** (or press `R`) for a dropdown
