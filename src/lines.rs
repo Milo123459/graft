@@ -275,7 +275,9 @@ mod tests {
         // Interpolated onto ETH's times (inside "other"'s range only).
         let o = get("other_at");
         assert_eq!(o.points.first(), Some(&(1.0, 1.5)));
-        assert_eq!(o.points.len(), 8);
+        // …and just past its newest point, its last value holds.
+        assert_eq!(o.points.len(), 9);
+        assert_eq!(o.points.last(), Some(&(9.0, 9.0)));
         assert_eq!(
             CustomLine::parse("ema30:USD = ema(values(\"ETH\"), 30)")
                 .unwrap()

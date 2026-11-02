@@ -23,6 +23,33 @@ pub struct MarkRule {
     pub label: Option<String>,
     /// Send a notification (`--notify` targets) for each new marker it places.
     pub notify: bool,
+    /// The marker's symbol (default ▼) and colour (default: the series' colour).
+    pub symbol: Option<String>,
+    pub color: Option<String>,
+}
+
+/// Symbols the markers menu cycles through.
+pub const SYMBOLS: [&str; 8] = ["▼", "▲", "●", "◆", "★", "✕", "↑", "↓"];
+/// Colours it cycles through (`None` = the series' own).
+pub const COLORS: [Option<&str>; 7] = [
+    None,
+    Some("green"),
+    Some("red"),
+    Some("yellow"),
+    Some("cyan"),
+    Some("magenta"),
+    Some("white"),
+];
+
+impl MarkRule {
+    pub fn symbol(&self) -> &str {
+        self.symbol.as_deref().unwrap_or("▼")
+    }
+
+    /// Upward symbols sit below the point, the rest above it.
+    pub fn points_up(symbol: &str) -> bool {
+        matches!(symbol, "▲" | "↑" | "△" | "⬆")
+    }
 }
 
 impl MarkRule {
@@ -33,6 +60,23 @@ impl MarkRule {
             Some(rest) => (true, rest),
             None => (false, trimmed),
         };
+        // A style after the label: `… => label | ▲ green`.
+        let (s, style) = match s.rsplit_once(" | ") {
+            Some((rule, style)) if s.contains("=>") => (rule, Some(style)),
+            _ => (s, None),
+        };
+        let (mut symbol, mut color) = (None, None);
+        for tok in style.unwrap_or("").split_whitespace() {
+            if tok.parse::<ratatui::style::Color>().is_ok() {
+                color = Some(tok.to_string());
+            } else if unicode_width::UnicodeWidthStr::width(tok) <= 2 {
+                symbol = Some(tok.to_string());
+            } else {
+                return Err(format!(
+                    "'{tok}': a marker style is a symbol (▲ ● ★…) and/or a colour (green, #ff8800, 208)"
+                ));
+            }
+        }
         let (expr, label) = match s.split_once("=>") {
             Some((e, l)) => (
                 e.trim(),
@@ -47,14 +91,27 @@ impl MarkRule {
             expr: expr.to_string(),
             label,
             notify,
+            symbol,
+            color,
         })
     }
 
     pub fn to_spec(&self) -> String {
-        let rule = match &self.label {
+        let mut rule = match &self.label {
             Some(l) => format!("{} => {l}", self.expr),
             None => self.expr.clone(),
         };
+        let style: Vec<&str> = [self.symbol.as_deref(), self.color.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect();
+        if !style.is_empty() {
+            if self.label.is_none() {
+                rule.push_str(" => {name} {delta}");
+            }
+            rule.push_str(" | ");
+            rule.push_str(&style.join(" "));
+        }
         if self.notify {
             format!("notify {rule}")
         } else {
@@ -155,6 +212,8 @@ fn evaluate_rule(
                 y: Some(value),
                 label: fill(rule.label.as_deref().unwrap_or("{name} {delta}")),
                 rule: Some(n),
+                symbol: rule.symbol().to_string(),
+                color: rule.color.as_deref().and_then(|c| c.parse().ok()),
             });
         }
     }
@@ -219,6 +278,18 @@ mod tests {
         let (_, errors) = evaluate(&host, &[MarkRule::parse("value").unwrap()], &ds);
         assert!(errors[0].contains("expected true/false"), "{errors:?}");
         assert!(MarkRule::parse(" => x").is_err());
+        let styled =
+            MarkRule::parse("prev < ema30_prev && value >= ema30 => up | ▲ green").unwrap();
+        assert_eq!(
+            (
+                styled.symbol(),
+                styled.color.as_deref(),
+                styled.label.as_deref()
+            ),
+            ("▲", Some("green"), Some("up"))
+        );
+        assert_eq!(MarkRule::parse(&styled.to_spec()).unwrap(), styled);
+        assert!(MarkRule::parse("value > 1 => x | notacolour").is_err());
         let n = MarkRule::parse("notify value > 5 => hot").unwrap();
         assert!(n.notify && n.expr == "value > 5");
         assert_eq!(MarkRule::parse(&n.to_spec()).unwrap(), n);

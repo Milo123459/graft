@@ -278,9 +278,22 @@ literals work. The label after `=>` can use `{name} {value} {prev} {delta}
 and `--stats` lists them. In a `--script` file or the console:
 `mark_when("delta < -1GB", "dropped {delta}")`; `mark("deploy")` drops one by
 hand at the cursor (or the newest data); `clear_marks()` removes them all.
+Give a rule its own look after `|` — a symbol and/or a colour — so different
+events read differently; upward symbols sit below the point, the rest above:
+
+```sh
+--mark 'name == "eth" && prev < ema30_prev && value >= ema30 => above EMA30 | ▲ green'
+--mark 'name == "eth" && prev > ema30_prev && value <= ema30 => below EMA30 | ▼ red'
+--mark 'notify value > 4000 => over 4k | ★ yellow'     # notify: tell me about new ones
+```
+
 While it runs, press `K` (or tap **markers**) for the list of rules and
 markers: tap a rule to edit it (it opens in the console; Enter saves, Esc
-cancels), **✕** deletes one, **+ add rule** and **mark now** add more.
+cancels), tap its symbol or colour to cycle through others, **notify** to be
+told about new ones, **✕** deletes one, **+ add rule** and **mark now** add more.
+`N` (or **alerts**) lists alerts, which markers notify, and where notifications
+go (bell, desktop, ntfy on your phone, a webhook or a command), with a test
+button.
 
 ### Counting log lines
 

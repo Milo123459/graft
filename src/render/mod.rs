@@ -265,6 +265,9 @@ pub struct Mark {
     pub label: String,
     /// The rule that placed it (index), or `None` when placed by hand.
     pub rule: Option<usize>,
+    pub symbol: String,
+    /// `None`: the series' colour (or yellow for a marker placed by hand).
+    pub color: Option<Color>,
 }
 
 /// What a pane's own source has produced so far.
@@ -556,6 +559,32 @@ pub fn interpolate(pts: &[(f64, f64)], x: f64) -> Option<f64> {
         (Some(a), Some(b)) if b.0 > a.0 => Some(a.1 + (b.1 - a.1) * (x - a.0) / (b.0 - a.0)),
         _ => None,
     }
+}
+
+/// A series' value at `x` for lining sources up: interpolated between its points, and
+/// after its newest point the last value holds (until it's older than a few of its
+/// usual gaps — a source that stopped isn't carried on forever). `None` before it began.
+pub fn value_near(pts: &[(f64, f64)], x: f64) -> Option<f64> {
+    if let Some(v) = interpolate(pts, x) {
+        return Some(v);
+    }
+    let &(last_x, last_y) = pts.last()?;
+    if x < last_x {
+        return None;
+    }
+    let n = pts.len();
+    let gap = if n >= 2 {
+        let mut gaps: Vec<f64> = pts[n.saturating_sub(20)..]
+            .windows(2)
+            .map(|w| w[1].0 - w[0].0)
+            .filter(|g| *g > 0.0)
+            .collect();
+        gaps.sort_by(f64::total_cmp);
+        gaps.get(gaps.len() / 2).copied().unwrap_or(1.0)
+    } else {
+        1.0
+    };
+    (x - last_x <= gap * 4.0).then_some(last_y)
 }
 
 /// Min/max of finite values.
@@ -1374,7 +1403,13 @@ impl<'a> ChartWidget<'a> {
                     };
                     let frac = ((y1 - v) / (y1 - y0)).clamp(0.0, 1.0);
                     let point = r.y + (frac * f64::from(r.height - 1)).round() as u16;
-                    (self.opts.color(i), point.saturating_sub(1).max(r.y))
+                    // Upward symbols sit below the point, the rest above it.
+                    let row = if crate::marks::MarkRule::points_up(&m.symbol) {
+                        (point + 1).min(r.bottom() - 1)
+                    } else {
+                        point.saturating_sub(1).max(r.y)
+                    };
+                    (m.color.unwrap_or(self.opts.color(i)), row)
                 }
                 _ => {
                     for row in r.y..r.bottom() {
@@ -1382,7 +1417,7 @@ impl<'a> ChartWidget<'a> {
                             buf[(col, row)].set_symbol("┊").set_fg(Color::Yellow);
                         }
                     }
-                    (Color::Yellow, r.y)
+                    (m.color.unwrap_or(Color::Yellow), r.y)
                 }
             };
             // Never over the legend or other text (not even a gap between words).
@@ -1390,27 +1425,32 @@ impl<'a> ChartWidget<'a> {
                 .into_iter()
                 .flatten()
                 .filter(|&c| c >= r.x && c < r.right())
-                .any(|c| !free_cell(&buf[(c, row)]) && buf[(c, row)].symbol() != "▼");
+                .any(|c| {
+                    !free_cell(&buf[(c, row)]) && !placed.iter().any(|p| p.0 == c && p.1 == row)
+                });
             if !free_cell(&buf[(col, row)]) || beside_text {
                 continue;
             }
             buf[(col, row)]
-                .set_symbol("▼")
+                .set_symbol(&m.symbol)
                 .set_fg(color)
                 .set_style(Style::default().add_modifier(Modifier::BOLD));
             placed.push((col, row, color, m));
         }
-        if placed.len() > 12 {
-            return;
-        }
         let mut taken: Vec<(u16, u16, u16)> = placed.iter().map(|p| (p.1, p.0, p.0)).collect();
-        for &(col, row, color, m) in &placed {
+        // Labels where there's room — the newest first, and only a few when it's busy
+        // (the cursor readout still names every marker).
+        let budget = if placed.len() > 12 { 6 } else { placed.len() };
+        let mut newest: Vec<&(u16, u16, Color, &Mark)> = placed.iter().collect();
+        newest.sort_by(|a, b| b.3.x.total_cmp(&a.3.x));
+        for &&(col, row, color, m) in newest.iter().take(budget) {
             let w = unicode_width::UnicodeWidthStr::width(m.label.as_str()) as u16;
+            // Labels only on empty space: never over the plotted lines.
             let fits = |x: u16| {
                 !taken
                     .iter()
                     .any(|&(tr, a, b)| tr == row && x <= b && a <= x + w)
-                    && (x..x + w).all(|c| free_cell(&buf[(c, row)]))
+                    && (x..x + w).all(|c| matches!(buf[(c, row)].symbol(), " " | "┊"))
             };
             let right = (col + 2 + w <= r.right())
                 .then_some(col + 2)
@@ -1481,8 +1521,8 @@ impl<'a> ChartWidget<'a> {
             .take(4)
         {
             lines.push(Line::styled(
-                format!("▼ {}", m.label),
-                Style::default().fg(Color::Yellow),
+                format!("{} {}", m.symbol, m.label),
+                Style::default().fg(m.color.unwrap_or(Color::Yellow)),
             ));
         }
         let w = lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16 + 2;
@@ -2466,6 +2506,19 @@ mod tests {
         // Too small for big digits: plain text.
         let text = crate::render::ansi::to_ansi(&render_to_buffer(&ds, &opts, 40, 4), false);
         assert!(text.contains("56 GB"), "{text}");
+    }
+
+    #[test]
+    fn values_hold_briefly_after_the_newest_point() {
+        let pts = [(0.0, 10.0), (1.0, 20.0), (2.0, 30.0)];
+        assert_eq!(value_near(&pts, 1.5), Some(25.0));
+        assert_eq!(
+            value_near(&pts, 2.5),
+            Some(30.0),
+            "a moment later: still the last price"
+        );
+        assert_eq!(value_near(&pts, 9.0), None, "long gone: not carried on");
+        assert_eq!(value_near(&pts, -1.0), None);
     }
 
     #[test]

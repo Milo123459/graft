@@ -404,6 +404,8 @@ enum Hit {
     DeleteLine(usize),
     /// Markers menu.
     ToggleMarkNotify(usize),
+    CycleMarkSymbol(usize),
+    CycleMarkColor(usize),
     /// Alerts menu.
     EditAlert(Option<usize>),
     DeleteAlert(usize),
@@ -601,6 +603,8 @@ pub struct App {
     notified_marks: HashMap<String, f64>,
     /// When the viewer opened (markers found while catching up aren't news).
     started: Instant,
+    /// Where the console's text field was last drawn (clicks move its cursor there).
+    console_rect: std::cell::Cell<Rect>,
     /// The source picker for the focused pane: (label, source name).
     source_menu: Option<(Vec<SourceChoice>, usize)>,
     /// Where the chart area was last drawn (for pane taps and border drags).
@@ -686,6 +690,7 @@ impl App {
             editing_alert: None,
             notified_marks: HashMap::new(),
             started: Instant::now(),
+            console_rect: std::cell::Cell::new(Rect::default()),
             sub_views: Vec::new(),
             source_menu: None,
             chart_rect: std::cell::Cell::new(Rect::default()),
@@ -895,11 +900,18 @@ impl App {
     fn update_marks(&mut self) {
         let mut new = self.session.script.take_mark_rules();
         // An edit replaces the rule it started from.
-        if let Some(i) = self.editing_rule.take()
+        // (Only once the edited rule arrives: updates while you're still typing keep it.)
+        if !new.is_empty()
+            && let Some(i) = self.editing_rule.take()
             && i < self.mark_rules.len()
-            && !new.is_empty()
         {
-            self.mark_rules[i] = new.remove(0);
+            let old = self.mark_rules[i].clone();
+            let mut edited = new.remove(0);
+            // mark_when() doesn't spell out the style or notify: keep them.
+            edited.symbol = edited.symbol.or(old.symbol);
+            edited.color = edited.color.or(old.color);
+            edited.notify |= old.notify;
+            self.mark_rules[i] = edited;
         }
         self.mark_rules.extend(new);
         let (mut marks, errors) =
@@ -1495,7 +1507,7 @@ impl App {
             return;
         };
         let area = f.area();
-        let w = 80.min(area.width);
+        let w = 96.min(area.width);
         let rows = self.mark_rows().max(1) as u16;
         let h = (rows + 9).min(area.height);
         let rect = Rect {
@@ -1506,7 +1518,7 @@ impl App {
         };
         Clear.render(rect, f.buffer_mut());
         let block = Block::bordered()
-            .title(" markers · tap a rule to edit it ")
+            .title(" markers · tap a rule to edit it · its symbol and colour to change them ")
             .border_style(Style::default().fg(Color::Yellow));
         let inner = block.inner(rect);
         f.render_widget(block, rect);
@@ -1575,7 +1587,7 @@ impl App {
             let r = Rect {
                 y,
                 height: 1,
-                width: inner.width.saturating_sub(13),
+                width: inner.width.saturating_sub(25),
                 ..inner
             };
             if y < inner.bottom() {
@@ -1589,15 +1601,22 @@ impl App {
                     r,
                 );
                 self.hits.push(r, Hit::EditRule(i));
-                if inner.width > 14 {
+                if inner.width > 28 {
                     let b = Rect {
-                        x: inner.right() - 12,
+                        x: inner.right() - 24,
                         y,
-                        width: 8,
+                        width: 20,
                         height: 1,
                     };
                     render_buttons(
-                        &[Button::new("notify", Hit::ToggleMarkNotify(i)).active(rule.notify)],
+                        &[
+                            Button::new(rule.symbol(), Hit::CycleMarkSymbol(i)),
+                            Button::new(
+                                rule.color.as_deref().unwrap_or("auto"),
+                                Hit::CycleMarkColor(i),
+                            ),
+                            Button::new("notify", Hit::ToggleMarkNotify(i)).active(rule.notify),
+                        ],
                         b,
                         f.buffer_mut(),
                         &self.hits,
@@ -3197,6 +3216,8 @@ impl App {
                             y: None,
                             label,
                             rule: None,
+                            symbol: "▼".into(),
+                            color: None,
                         });
                         self.update_marks();
                     }
@@ -3678,6 +3699,16 @@ impl App {
 
     fn on_mouse(&mut self, m: MouseEvent) -> Transition {
         let (col, row) = (m.column, m.row);
+        // A click in the console line puts its cursor there.
+        if let Some(input) = self.console.as_mut()
+            && matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+        {
+            let r = self.console_rect.get();
+            if r.contains((col, row).into()) {
+                input.click(r, col);
+                return Transition::None;
+            }
+        }
         if self.help || self.console_help {
             match m.kind {
                 MouseEventKind::Down(_) => {
@@ -3740,6 +3771,30 @@ impl App {
                                 self.session.custom.remove(i);
                                 self.rebuild(true);
                             }
+                            Transition::None
+                        }
+                        Hit::CycleMarkSymbol(i) => {
+                            if let Some(r) = self.mark_rules.get_mut(i) {
+                                let syms = crate::marks::SYMBOLS;
+                                let at = syms
+                                    .iter()
+                                    .position(|s| *s == r.symbol())
+                                    .map_or(0, |p| p + 1);
+                                r.symbol = Some(syms[at % syms.len()].to_string());
+                            }
+                            self.update_marks();
+                            Transition::None
+                        }
+                        Hit::CycleMarkColor(i) => {
+                            if let Some(r) = self.mark_rules.get_mut(i) {
+                                let cs = crate::marks::COLORS;
+                                let at = cs
+                                    .iter()
+                                    .position(|c| *c == r.color.as_deref())
+                                    .map_or(0, |p| p + 1);
+                                r.color = cs[at % cs.len()].map(String::from);
+                            }
+                            self.update_marks();
                             Transition::None
                         }
                         Hit::ToggleMarkNotify(i) => {
@@ -4017,6 +4072,13 @@ impl App {
             b(if self.toolbar_more { "less" } else { "⋯" }, Cmd::More).active(self.toolbar_more),
         );
         if self.toolbar_more {
+            // Under ⋯ until there are some (then they're on the toolbar itself).
+            if self.mark_rows() == 0 {
+                v.push(b("markers", Cmd::Markers).active(self.marks_menu.is_some()));
+            }
+            if self.alerts.is_empty() {
+                v.push(b("alerts", Cmd::Alerts).active(self.alerts_menu));
+            }
             v.extend([
                 b("targets", Cmd::Targets).active(self.opts.show_targets && self.has_targets()),
                 // With panes, the chart type button belongs to the picked pane.
@@ -4033,8 +4095,6 @@ impl App {
                 b("format", Cmd::Format),
                 b("save", Cmd::Save),
                 b("copy cmd", Cmd::Copy),
-                b("markers", Cmd::Markers).active(self.marks_menu.is_some()),
-                b("alerts", Cmd::Alerts).active(self.alerts_menu || !self.firing.is_empty()),
                 b(":", Cmd::Console),
                 b("svg", Cmd::Export),
                 b("mouse", Cmd::Mouse).active(self.mouse),
@@ -4146,6 +4206,7 @@ impl App {
                 true,
                 "type help to see every command · Enter runs · Esc closes",
             );
+            self.console_rect.set(field);
         }
         if self.lines_menu {
             self.draw_lines_menu(f);
@@ -5893,6 +5954,111 @@ mod tests {
         assert!(app.current_cli().notify.contains(&"desktop".to_string()));
         assert_eq!(app.current_cli().alert, ["last(\"v\") > 100"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn marker_symbol_and_colour_from_the_menu() {
+        let mut app = app(&[
+            "graft",
+            LOG,
+            "-s",
+            "node2",
+            "--mark",
+            "delta < -1.5GB => fell",
+        ]);
+        assert!(
+            app.opts
+                .marks
+                .iter()
+                .all(|m| m.symbol == "▼" && m.color.is_none())
+        );
+        key(&mut app, KeyCode::Char('K'));
+        let row_of = |app: &App| {
+            let s = screen(app);
+            let y = s
+                .lines()
+                .position(|l| l.contains("delta < -1.5GB"))
+                .unwrap();
+            (s.lines().nth(y).unwrap().to_string(), y as u16)
+        };
+        let (line, y) = row_of(&app);
+        let col = |line: &str, pat: &str| {
+            line.chars()
+                .collect::<String>()
+                .find(pat)
+                .map(|b| line[..b].chars().count() as u16)
+                .unwrap()
+        };
+        // Tap the symbol (▼ → ▲; the last " ▼ " on the row, the first is the count) and
+        // the colour (auto → green).
+        let last_sym = line
+            .rmatch_indices(" ▼ ")
+            .next()
+            .map(|(b, _)| line[..b].chars().count() as u16)
+            .unwrap();
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            last_sym + 1,
+            y,
+        );
+        let (line, y) = row_of(&app);
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            col(&line, " auto ") + 1,
+            y,
+        );
+        assert_eq!(app.mark_rules[0].symbol(), "▲");
+        assert_eq!(app.mark_rules[0].color.as_deref(), Some("green"));
+        assert!(
+            app.opts
+                .marks
+                .iter()
+                .all(|m| m.symbol == "▲" && m.color == Some(Color::Green))
+        );
+        assert_eq!(app.current_cli().mark, ["delta < -1.5GB => fell | ▲ green"]);
+        key(&mut app, KeyCode::Esc);
+        let s = screen(&app);
+        assert!(s.contains('▲') && s.contains("fell"), "{s}");
+    }
+
+    #[test]
+    fn editing_a_rule_replaces_it_and_console_clicks_move_the_cursor() {
+        let mut app = app(&["graft", LOG, "--mark", "delta < -1.5GB => fell | ▲ green"]);
+        key(&mut app, KeyCode::Char('K'));
+        key(&mut app, KeyCode::Enter);
+        // Updates while typing (a live source) don't forget it's an edit.
+        app.rebuild(true);
+        app.rebuild(true);
+        app.console
+            .as_mut()
+            .unwrap()
+            .set(r#"mark_when("delta < -1GB", "fell more")"#);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.mark_rules.len(), 1, "{:?}", app.mark_rules);
+        let r = &app.mark_rules[0];
+        assert_eq!(
+            (r.expr.as_str(), r.label.as_deref()),
+            ("delta < -1GB", Some("fell more"))
+        );
+        assert_eq!(
+            (r.symbol(), r.color.as_deref()),
+            ("▲", Some("green")),
+            "style kept"
+        );
+        // Clicking in the console line moves its cursor.
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, "abcdef");
+        screen(&app);
+        let field = app.console_rect.get();
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            field.x + 2,
+            field.y,
+        );
+        assert_eq!(app.console.as_ref().unwrap().cursor, 2);
     }
 
     #[test]

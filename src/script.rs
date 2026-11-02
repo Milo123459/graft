@@ -716,7 +716,7 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
             .map(|&(x, _)| {
                 let vals: Vec<f64> = others
                     .iter()
-                    .filter_map(|p| crate::render::interpolate(p, x))
+                    .filter_map(|p| crate::render::value_near(p, x))
                     .collect();
                 if vals.is_empty() {
                     Dynamic::UNIT
@@ -736,7 +736,7 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
                 .iter()
                 .map(|x| {
                     dyn_to_f64(x)
-                        .and_then(|x| crate::render::interpolate(&pts, x))
+                        .and_then(|x| crate::render::value_near(&pts, x))
                         .map_or(Dynamic::UNIT, Dynamic::from_float)
                 })
                 .collect())
