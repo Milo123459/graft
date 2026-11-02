@@ -169,6 +169,8 @@ was skipped.
 |---|---|
 | `-k line\|scatter\|bar\|histogram\|sparkline` | chart type (bar = latest values) |
 | `--split` | one panel per series, each with its own y axis |
+| `--pane 'node1 kind=bar lines=live,avg'` | panes: several charts in one view (repeat `--pane`); each picks series (`*` = all), `kind=`, `lines=` |
+| `--layout '(1 \| 2) / 3'` | how panes are arranged: `\|` side by side, `/` stacked, `\|60%` sizes (default: two side by side, more in a grid) |
 | `-m braille\|dot\|block\|half-block\|bar` | marker |
 | `--log`, `--ymin 0`, `--ymax 500GB` | y axis |
 | `--hline 50GB:red:low` | reference lines (repeatable) |
@@ -313,6 +315,8 @@ mouse capture off, so your terminal's own text selection works.
 | `t` / `m` / `y` / `x` | chart type / marker / log scale / split panels |
 | `T` | lines menu (inside: `l` `a` `m` `p` toggle, `+` `-` window, Esc closes) |
 | `D` | side by side: live data next to its trends |
+| `w` | pane panel (inside: `v` / `s` split right / down, `x` close, arrows pick, shift+arrows move, ctrl+arrows or `< > + -` resize, `=` even, `t` chart type, `T` lines, `1`–`9` series, `o` one chart) |
+| `Tab` / `Alt+arrows` | pick the next pane / the pane that way |
 | `f` / `G` | forecast / target lines on or off |
 | `R` / `[` `]` | timeframe dropdown / narrower, wider timeframe |
 | `F` | change the format or source (builder) |
@@ -322,6 +326,29 @@ mouse capture off, so your terminal's own text selection works.
 | `M` | mouse capture on/off |
 | `:` | Rhai console |
 | `q` | quit |
+
+### Panes
+
+Like a terminal multiplexer, but for charts. Tap **panes** (or press `w`) and
+the panel opens under the chart:
+
+- **split right** / **split down** splits the picked pane (outlined in yellow);
+  the new pane starts as a copy, so change what it shows: its **chart** type,
+  its **lines** and its **series** chips
+- tap a pane to pick it, or use the **focus** arrows; **move** swaps it with
+  its neighbour; **size** moves its edge, or just drag the border between two
+  panes (with a finger too)
+- **even** evens the sizes out, **one chart** goes back to a single chart
+
+Zoom, the cursor and the timeframe are shared, so the panes stay lined up in
+time. Side by side is the two-pane case: splitting from it turns it into
+panes. Every layout can be written down and saved in a profile:
+
+```sh
+graft ~/reclaimable.log -F '{time} node1: {node1} node2: {node2}' \
+  --pane 'node1 lines=live,median' --pane 'node2' --pane '* kind=bar' \
+  --layout '(1 / 2) |65% 3'
+```
 
 ### The Rhai console and scripts
 
@@ -363,6 +390,10 @@ Available functions:
   - `zoom(6h)`, `zoom_in()`, `zoom_out()`, `pan("left" | "right" | -0.5)`,
     `reset()`
   - `svg()` / `svg("out.svg")`, `format()` (open the builder), `quit()`
+  - panes: `split_right()`, `split_down()`, `close_pane()`,
+    `focus_pane(2 | "left")`, `move_pane("left")`, `resize_pane("right"[, 10])`,
+    `even_panes()`, `layout("(1 | 2) / 3")`, `pane("node1 kind=bar lines=live,avg")`,
+    `single()`. With panes, `chart(…)` and `lines(…)` change the picked pane
 - Output: `print(...)`.
 
 Unit literals such as `50GB`, `200ms` and `1d` work in all expressions.

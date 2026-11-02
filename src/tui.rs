@@ -20,15 +20,18 @@ use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, Widget};
 use crate::cli::{ChartKind, Cli, TrendStyle, Window, parse_window};
 use crate::data::Dataset;
 use crate::interactive::{Live, Transition};
+use crate::render::panes::{Dir as PDir, Pane, Panes, Split as PSplit};
 use crate::render::{
     ChartOpts, ChartWidget, HLine, Horizon, Overlay, PlotArea, plot_x_bounds, value_at,
 };
-use crate::script::{Action, Flag, display};
+use crate::script::{Action, Flag, PaneAction, display};
 use crate::session::Session;
 use crate::setup::Setup;
 use crate::stats::SeriesReport;
 use crate::transform::{Timeframe, timeframe_presets};
-use crate::ui::{Button, Hits, TextInput, flow_height, render_buttons};
+use crate::ui::{
+    Button, Hits, Item, TextInput, flow_height, flow_items, render_buttons, render_items,
+};
 
 const HELP: &[(&str, &str)] = &[
     ("— moving around —", ""),
@@ -79,6 +82,12 @@ const HELP: &[(&str, &str)] = &[
         "lines / T",
         "lines menu: live, average, median, p95, window",
     ),
+    (
+        "panes / w",
+        "several charts: split, pick, move, resize (drag borders)",
+    ),
+    ("", "each pane has its own series, chart type and lines"),
+    ("Tab / Alt+arrows", "pick the next pane / the pane that way"),
     ("⋯", "more: chart type, log scale, target lines, pause,"),
     (
         "",
@@ -212,6 +221,28 @@ const CONSOLE_HELP: &[(&str, &str)] = &[
         "svg(\"out.svg\")  format()  quit()",
         "export / change the format / quit",
     ),
+    ("— panes —", ""),
+    (
+        "split_right() split_down()",
+        "split the picked pane (close_pane() closes it)",
+    ),
+    (
+        "pane(\"node1 kind=bar\")",
+        "what the picked pane shows: series, kind=…, lines=…",
+    ),
+    (
+        "layout(\"(1 | 2) / 3\")",
+        "arrange: | side by side, / stacked, |60% sizes",
+    ),
+    (
+        "focus_pane(2)",
+        "pick a pane (or \"left\" \"right\" \"up\" \"down\")",
+    ),
+    (
+        "move_pane(\"left\")",
+        "swap with the pane that way; resize_pane(\"right\", 10)",
+    ),
+    ("even_panes()  single()", "equal sizes / back to one chart"),
     ("print(x)", "show a value (several prints are joined)"),
     ("— examples —", ""),
     (
@@ -272,6 +303,7 @@ enum Cmd {
     /// Step through timeframe presets (-1 narrower, +1 wider).
     RangeStep(i8),
     RangeMenu,
+    Panes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -285,9 +317,47 @@ enum Hit {
     Layer(Option<TrendStyle>, bool),
     Window(bool),
     CloseMenu,
+    /// Pane panel buttons.
+    Pane(PaneOp),
     /// Timeframe dropdown: type a range in the console.
     CustomRange,
     MenuBackground,
+}
+
+fn arrow_dir(code: KeyCode) -> PDir {
+    match code {
+        KeyCode::Left | KeyCode::Char('h' | 'H') => PDir::Left,
+        KeyCode::Right | KeyCode::Char('l' | 'L') => PDir::Right,
+        KeyCode::Up | KeyCode::Char('k' | 'K') => PDir::Up,
+        _ => PDir::Down,
+    }
+}
+
+fn parse_dir(s: &str) -> Option<PDir> {
+    match s.trim() {
+        "left" | "l" => Some(PDir::Left),
+        "right" | "r" => Some(PDir::Right),
+        "up" | "u" => Some(PDir::Up),
+        "down" | "d" => Some(PDir::Down),
+        _ => None,
+    }
+}
+
+/// Things the pane panel (and `w` keys, and the console) do to panes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PaneOp {
+    Split(PSplit),
+    Close,
+    Focus(PDir),
+    Move(PDir),
+    Resize(PDir),
+    Even,
+    Single,
+    Kind,
+    Lines,
+    Series(usize),
+    AllSeries,
+    Done,
 }
 
 /// What a mouse press on the chart turned into.
@@ -301,6 +371,8 @@ enum Drag {
     Selecting,
     /// Dragging the cursor line.
     Scrub,
+    /// Dragging the border between panes: the split's path (bits, depth) and area.
+    Border(u32, u8, Rect),
 }
 
 struct Message {
@@ -352,6 +424,10 @@ pub struct App {
     range_menu: bool,
     /// A transition requested by the console or a key binding (quit, builder, mouse).
     pending: Option<Transition>,
+    /// The pane panel (split, close, move, resize…) is open.
+    pane_menu: bool,
+    /// Where the chart area was last drawn (for pane taps and border drags).
+    chart_rect: std::cell::Cell<Rect>,
     hits: Hits<Hit>,
     plots: RefCell<Vec<PlotArea>>,
     /// The part of the data shown and analysed.
@@ -415,6 +491,8 @@ impl App {
             lines_menu: false,
             range_menu: false,
             pending: None,
+            pane_menu: false,
+            chart_rect: std::cell::Cell::new(Rect::default()),
             hits: Hits::default(),
             plots: RefCell::new(Vec::new()),
             timeframe,
@@ -438,6 +516,13 @@ impl App {
         c.trend_only = !self.opts.trends.is_empty() && !self.opts.show_raw;
         c.trend_window = self.opts.trend_window;
         c.right_panel = self.opts.side_by_side.then(|| self.opts.right.clone());
+        c.pane = self
+            .opts
+            .panes
+            .iter()
+            .flat_map(|p| p.panes.iter().map(Pane::to_spec))
+            .collect();
+        c.layout = self.opts.panes.as_ref().map(Panes::layout_expr);
         c.side_by_side = self.opts.side_by_side;
         c.no_targets = !self.opts.show_targets;
         c.last = self.timeframe.last;
@@ -628,6 +713,9 @@ impl App {
     }
 
     fn toggle_series(&mut self, idx: usize) {
+        if self.opts.panes.is_some() {
+            return self.pane_op(PaneOp::Series(idx));
+        }
         if let Some(s) = self.ds.series.get(idx) {
             let name = s.name.clone();
             if !self.hidden.remove(&name) {
@@ -637,7 +725,11 @@ impl App {
     }
 
     fn export_view(&mut self, path: Option<String>) {
-        let mut ds = self.ds.clone();
+        // With panes, the picked pane is exported.
+        let (mut ds, opts) = match self.focused_pane() {
+            Some(p) => crate::render::pane_view(&self.ds, &self.opts, p),
+            None => (self.ds.clone(), self.opts.clone()),
+        };
         ds.series.retain(|s| !self.hidden.contains(&s.name));
         if let Some((a, b)) = self.view {
             ds.series
@@ -647,7 +739,7 @@ impl App {
         let name = path.unwrap_or_else(|| {
             format!("graft-{}.svg", chrono::Local::now().format("%Y%m%d-%H%M%S"))
         });
-        match crate::export::export(std::path::Path::new(&name), &ds, &self.opts) {
+        match crate::export::export(std::path::Path::new(&name), &ds, &opts) {
             Ok(()) => self.say(format!("saved {name}"), false),
             Err(e) => self.say(format!("export failed: {e:#}"), true),
         }
@@ -684,29 +776,393 @@ impl App {
         self.set_timeframe(next.map_or_else(Timeframe::default, Timeframe::last));
     }
 
-    /// Turn a layer on/off: `None` is the live data. At least one layer stays visible.
-    fn toggle_layer(&mut self, layer: Option<TrendStyle>) {
-        match layer {
-            None => {
-                self.opts.show_raw = !self.opts.show_raw;
-                if !self.opts.show_raw && self.opts.trends.is_empty() {
-                    self.opts.trends.push(TrendStyle::Avg);
-                }
+    // ───────────── panes ─────────────
+
+    fn focused_pane(&self) -> Option<&Pane> {
+        self.opts.panes.as_ref().map(|p| &p.panes[p.focus])
+    }
+
+    fn global_lines(&self) -> crate::cli::Lines {
+        crate::cli::Lines {
+            live: self.opts.show_raw || self.opts.trends.is_empty(),
+            trends: self.opts.trends.clone(),
+        }
+    }
+
+    /// The lines the lines menu edits: the focused pane's, or the chart's.
+    fn cur_lines(&self) -> crate::cli::Lines {
+        match self.focused_pane() {
+            Some(p) => p.lines.clone().unwrap_or_else(|| self.global_lines()),
+            None => self.global_lines(),
+        }
+    }
+
+    fn set_lines(&mut self, l: crate::cli::Lines) {
+        match self.opts.panes.as_mut() {
+            Some(p) => {
+                let f = p.focus;
+                p.panes[f].lines = Some(l);
             }
-            Some(t) => {
-                if let Some(i) = self.opts.trends.iter().position(|x| *x == t) {
-                    self.opts.trends.remove(i);
-                    if self.opts.trends.is_empty() {
-                        self.opts.show_raw = true;
-                    }
-                } else {
-                    self.opts.trends.push(t);
-                    self.opts
-                        .trends
-                        .sort_by_key(|x| TrendStyle::ALL.iter().position(|a| a == x));
-                }
+            None => {
+                self.opts.show_raw = l.live || l.trends.is_empty();
+                self.opts.trends = l.trends;
             }
         }
+    }
+
+    /// Panes to work on: side by side becomes two panes, a plain chart one.
+    fn ensure_panes(&mut self) -> &mut Panes {
+        if self.opts.panes.is_none() {
+            let here = Pane {
+                lines: Some(self.global_lines()),
+                ..Pane::default()
+            };
+            self.opts.panes = Some(if self.opts.side_by_side {
+                self.opts.side_by_side = false;
+                let right = if self.opts.right.is_empty() {
+                    crate::cli::Lines::default_right()
+                } else {
+                    self.opts.right.clone()
+                };
+                Panes::pair(
+                    here,
+                    Pane {
+                        lines: Some(right),
+                        ..Pane::default()
+                    },
+                    PSplit::Across,
+                )
+            } else {
+                Panes::single(here)
+            });
+        }
+        self.opts.panes.as_mut().expect("just made")
+    }
+
+    fn pane_op(&mut self, op: PaneOp) {
+        let area = self.chart_rect.get();
+        match op {
+            PaneOp::Done => return self.pane_menu = false,
+            PaneOp::Single => {
+                // Keep the focused pane's lines and chart type for the single chart.
+                if let Some(p) = self.focused_pane().cloned() {
+                    if let Some(k) = p.kind {
+                        self.opts.kind = k;
+                    }
+                    self.opts.panes = None;
+                    if let Some(l) = p.lines {
+                        self.set_lines(l);
+                    }
+                }
+                self.opts.panes = None;
+                self.opts.side_by_side = false;
+                self.pane_menu = false;
+                return self.say("one chart", false);
+            }
+            PaneOp::Lines => {
+                self.lines_menu = true;
+                return;
+            }
+            _ => {}
+        }
+        let names: Vec<String> = self.ds.series.iter().map(|s| s.name.clone()).collect();
+        let kind = self.opts.kind;
+        let p = self.ensure_panes();
+        let f = p.focus;
+        let complaint = match op {
+            PaneOp::Split(sp) => {
+                p.split(sp);
+                None
+            }
+            PaneOp::Close => {
+                (!p.close()).then_some("that's the last pane — \"one chart\" leaves panes")
+            }
+            PaneOp::Focus(d) => (!p.focus_dir(area, d)).then_some("no pane that way"),
+            PaneOp::Move(d) => (!p.move_dir(area, d)).then_some("no pane that way to swap with"),
+            PaneOp::Resize(d) => (!p.resize(d, 0.05)).then_some("no border to move that way"),
+            PaneOp::Even => {
+                p.equalize();
+                None
+            }
+            PaneOp::Kind => {
+                let k = p.panes[f].kind.unwrap_or(kind).next();
+                p.panes[f].kind = Some(k);
+                None
+            }
+            PaneOp::Series(i) => {
+                let pane = &mut p.panes[f];
+                match names.get(i) {
+                    None => None,
+                    Some(name) => {
+                        if pane.series.is_empty() {
+                            pane.series = names.clone();
+                        }
+                        if let Some(at) = pane.series.iter().position(|s| s == name) {
+                            if pane.series.len() > 1 {
+                                pane.series.remove(at);
+                                None
+                            } else {
+                                Some("a pane needs at least one series")
+                            }
+                        } else {
+                            pane.series.push(name.clone());
+                            pane.series
+                                .sort_by_key(|s| names.iter().position(|n| n == s));
+                            if pane.series.len() == names.len() {
+                                pane.series.clear();
+                            }
+                            None
+                        }
+                    }
+                }
+            }
+            PaneOp::AllSeries => {
+                p.panes[f].series.clear();
+                None
+            }
+            PaneOp::Done | PaneOp::Single | PaneOp::Lines => None,
+        };
+        if let Some(c) = complaint {
+            self.say(c, false);
+        }
+    }
+
+    /// Keys while the pane panel is open; false = not a pane key (falls through).
+    fn on_pane_key(&mut self, key: KeyEvent) -> bool {
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let op = match key.code {
+            KeyCode::Char('v' | '|') => PaneOp::Split(PSplit::Across),
+            KeyCode::Char('s' | '_') => PaneOp::Split(PSplit::Down),
+            KeyCode::Char('x') => PaneOp::Close,
+            KeyCode::Char('=') => PaneOp::Even,
+            KeyCode::Char('o') => PaneOp::Single,
+            KeyCode::Char('t') => PaneOp::Kind,
+            KeyCode::Char('T') => PaneOp::Lines,
+            KeyCode::Char('a') => PaneOp::AllSeries,
+            KeyCode::Char(d @ '1'..='9') => PaneOp::Series(d as usize - '1' as usize),
+            KeyCode::Char('<') => PaneOp::Resize(PDir::Left),
+            KeyCode::Char('>') => PaneOp::Resize(PDir::Right),
+            KeyCode::Char('-') => PaneOp::Resize(PDir::Up),
+            KeyCode::Char('+') => PaneOp::Resize(PDir::Down),
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down if ctrl => {
+                PaneOp::Resize(arrow_dir(key.code))
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down if shift => {
+                PaneOp::Move(arrow_dir(key.code))
+            }
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Char('h' | 'j' | 'k' | 'l') => PaneOp::Focus(arrow_dir(key.code)),
+            KeyCode::Char('H' | 'J' | 'K' | 'L') => PaneOp::Move(arrow_dir(key.code)),
+            KeyCode::Tab => {
+                if let Some(p) = self.opts.panes.as_mut() {
+                    p.focus = (p.focus + 1) % p.count();
+                }
+                return true;
+            }
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('w' | 'q') => PaneOp::Done,
+            _ => return false,
+        };
+        self.pane_op(op);
+        true
+    }
+
+    fn pane_items(&self) -> Vec<Item<Hit>> {
+        let b = |label: &str, op: PaneOp| Item::Btn(Button::new(label, Hit::Pane(op)));
+        let Some(p) = self.opts.panes.as_ref() else {
+            return Vec::new();
+        };
+        let pane = &p.panes[p.focus];
+        let mut v = vec![
+            Item::Label(format!("pane {} of {}", p.focus + 1, p.count())),
+            b("split right", PaneOp::Split(PSplit::Across)),
+            b("split down", PaneOp::Split(PSplit::Down)),
+            b("close", PaneOp::Close),
+            b("even", PaneOp::Even),
+            b("one chart", PaneOp::Single),
+            b("done", PaneOp::Done),
+            Item::Break,
+        ];
+        for (label, op) in [
+            ("focus", PaneOp::Focus as fn(PDir) -> PaneOp),
+            ("move", PaneOp::Move),
+            ("size", PaneOp::Resize),
+        ] {
+            v.push(Item::Label(label.into()));
+            for (arrow, d) in [
+                ("◀", PDir::Left),
+                ("▲", PDir::Up),
+                ("▼", PDir::Down),
+                ("▶", PDir::Right),
+            ] {
+                v.push(b(arrow, op(d)));
+            }
+        }
+        v.push(Item::Break);
+        v.push(Item::Label("chart".into()));
+        v.push(b(pane.kind.unwrap_or(self.opts.kind).name(), PaneOp::Kind));
+        v.push(Item::Label("lines".into()));
+        v.push(b(&self.cur_lines().label(), PaneOp::Lines));
+        v.push(Item::Label("series".into()));
+        for (i, s) in self.ds.series.iter().enumerate() {
+            let on = pane.shows(&s.name);
+            v.push(Item::Btn(
+                Button::new(
+                    format!("{} {}", if on { "●" } else { "○" }, s.name),
+                    Hit::Pane(PaneOp::Series(i)),
+                )
+                .active(on),
+            ));
+        }
+        v.push(b("all", PaneOp::AllSeries));
+        v
+    }
+
+    fn pane_panel_height(&self, width: u16) -> u16 {
+        if !self.pane_menu || self.opts.panes.is_none() {
+            return 0;
+        }
+        flow_items(&self.pane_items(), width.saturating_sub(2)).1 + 3
+    }
+
+    fn draw_pane_panel(&self, f: &mut Frame, area: Rect) {
+        if area.height < 3 {
+            return;
+        }
+        let block = Block::bordered()
+            .title(" panes · tap a pane to pick it · drag a border to resize ")
+            .border_style(Style::default().fg(Color::Yellow));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let items = self.pane_items();
+        let rows = inner.height.saturating_sub(1);
+        render_items(
+            &items,
+            Rect {
+                height: rows,
+                ..inner
+            },
+            f.buffer_mut(),
+            &self.hits,
+        );
+        f.render_widget(
+            Span::styled(
+                "keys: v s split · x close · ←→↑↓ pick · shift move · ctrl or < > + - size · t chart · T lines · 1-9 series · Esc",
+                Style::default().fg(Color::DarkGray),
+            ),
+            Rect { y: inner.bottom() - 1, height: 1, ..inner },
+        );
+    }
+
+    fn apply_pane_action(&mut self, a: PaneAction) {
+        let op = match a {
+            PaneAction::Split(down) => {
+                PaneOp::Split(if down { PSplit::Down } else { PSplit::Across })
+            }
+            PaneAction::Close => PaneOp::Close,
+            PaneAction::Even => PaneOp::Even,
+            PaneAction::Single => PaneOp::Single,
+            PaneAction::Focus(to) => {
+                if let Ok(n) = to.trim().parse::<usize>() {
+                    let p = self.ensure_panes();
+                    if (1..=p.count()).contains(&n) {
+                        p.focus = n - 1;
+                    } else {
+                        let c = p.count();
+                        self.say(format!("focus_pane: there are {c} panes"), true);
+                    }
+                    return;
+                }
+                match parse_dir(&to) {
+                    Some(d) => PaneOp::Focus(d),
+                    None => {
+                        return self.say(
+                            "focus_pane: \"left\", \"right\", \"up\", \"down\" or a number",
+                            true,
+                        );
+                    }
+                }
+            }
+            PaneAction::Move(d) => match parse_dir(&d) {
+                Some(d) => PaneOp::Move(d),
+                None => {
+                    return self.say("move_pane: \"left\", \"right\", \"up\" or \"down\"", true);
+                }
+            },
+            PaneAction::Resize(d, by) => {
+                match parse_dir(&d) {
+                    Some(d) => {
+                        if !self.ensure_panes().resize(d, by) {
+                            self.say("no border to move that way", false);
+                        }
+                    }
+                    None => self.say("resize_pane: \"left\", \"right\", \"up\" or \"down\"", true),
+                }
+                return;
+            }
+            PaneAction::Layout(expr) => {
+                let old = self.ensure_panes().panes.clone();
+                match crate::render::panes::Panes::from_args(
+                    &old.iter().map(Pane::to_spec).collect::<Vec<_>>(),
+                    Some(&expr),
+                ) {
+                    Ok(Some(mut p)) => {
+                        // Keep panes' settings as they were (specs round-trip them).
+                        for (i, pane) in p.panes.iter_mut().enumerate() {
+                            if let Some(o) = old.get(i) {
+                                *pane = o.clone();
+                            }
+                        }
+                        self.opts.panes = Some(p);
+                    }
+                    Ok(None) => {}
+                    Err(e) => self.say(e, true),
+                }
+                return;
+            }
+            PaneAction::Set(spec) => {
+                match Pane::parse(&spec) {
+                    Ok(new) => {
+                        let names: Vec<&str> =
+                            self.ds.series.iter().map(|s| s.name.as_str()).collect();
+                        if let Some(bad) = new.series.iter().find(|s| !names.contains(&s.as_str()))
+                        {
+                            return self.say(
+                                format!(
+                                    "pane: no series called '{bad}' (have: {})",
+                                    names.join(", ")
+                                ),
+                                true,
+                            );
+                        }
+                        let p = self.ensure_panes();
+                        let f = p.focus;
+                        p.panes[f] = new;
+                    }
+                    Err(e) => self.say(e, true),
+                }
+                return;
+            }
+        };
+        self.pane_op(op);
+    }
+
+    /// Turn a layer on/off: `None` is the live data. At least one layer stays visible.
+    fn toggle_layer(&mut self, layer: Option<TrendStyle>) {
+        let mut l = self.cur_lines();
+        l.toggle(layer);
+        if l.is_empty() {
+            match layer {
+                // Live off with nothing else: show the average instead.
+                None => l.trends.push(TrendStyle::Avg),
+                // The last trend off: the live data comes back.
+                Some(_) => l.live = true,
+            }
+        }
+        self.set_lines(l);
     }
 
     /// Turn a line on/off in the right-hand chart of side by side (one always stays).
@@ -721,6 +1177,11 @@ impl App {
     /// Side by side on: trends move to the right-hand chart, live data stays left.
     /// Off: the right-hand trends come back over the live data.
     fn toggle_side_by_side(&mut self) {
+        // From panes: back to a plain side by side.
+        if self.opts.panes.take().is_some() {
+            self.pane_menu = false;
+            self.opts.side_by_side = false;
+        }
         self.opts.side_by_side = !self.opts.side_by_side;
         if self.opts.side_by_side {
             if !self.opts.trends.is_empty() {
@@ -884,6 +1345,9 @@ impl App {
     }
 
     fn lines_label(&self) -> String {
+        if self.opts.panes.is_some() {
+            return format!("lines: {}", self.cur_lines().label());
+        }
         let mut parts: Vec<&str> = Vec::new();
         if self.opts.show_raw || self.opts.trends.is_empty() {
             parts.push("live");
@@ -951,7 +1415,8 @@ impl App {
                 "95% of values are below this line",
             ),
         ];
-        if self.opts.trends.contains(&TrendStyle::Fit) {
+        let cur = self.cur_lines();
+        if cur.trends.contains(&TrendStyle::Fit) {
             rows.push((
                 Some(TrendStyle::Fit),
                 "trend line",
@@ -967,7 +1432,12 @@ impl App {
         };
         Clear.render(rect, f.buffer_mut());
         let block = Block::bordered()
-            .title(" lines to show · tap to turn on/off ")
+            .title(match &self.opts.panes {
+                Some(p) if p.count() > 1 => {
+                    format!(" lines in pane {} · tap to turn on/off ", p.focus + 1)
+                }
+                _ => " lines to show · tap to turn on/off ".to_string(),
+            })
             .border_style(Style::default().fg(Color::Yellow));
         let inner = block.inner(rect);
         f.render_widget(block, rect);
@@ -1022,10 +1492,7 @@ impl App {
             if y >= inner.bottom() {
                 break;
             }
-            let left_on = match layer {
-                None => self.opts.show_raw || self.opts.trends.is_empty(),
-                Some(t) => self.opts.trends.contains(&t),
-            };
+            let left_on = cur.has(layer);
             let x_desc = if sides {
                 let right_on = self.opts.right.has(layer);
                 toggle(
@@ -1261,6 +1728,7 @@ impl App {
                 }
             }
             Cmd::Select => self.toggle_measure(),
+            Cmd::Kind if self.opts.panes.is_some() => self.pane_op(PaneOp::Kind),
             Cmd::Kind => self.opts.kind = self.opts.kind.next(),
             Cmd::Marker => self.opts.marker = self.opts.marker.next(),
             Cmd::Split => self.opts.split = !self.opts.split,
@@ -1289,6 +1757,12 @@ impl App {
             Cmd::SideBySide => self.toggle_side_by_side(),
             Cmd::Targets => self.opts.show_targets = !self.opts.show_targets,
             Cmd::RangeStep(dir) => self.step_timeframe(dir),
+            Cmd::Panes => {
+                self.pane_menu = !self.pane_menu;
+                if self.pane_menu {
+                    self.ensure_panes();
+                }
+            }
             Cmd::RangeMenu => {
                 self.range_menu = !self.range_menu;
                 self.lines_menu = false;
@@ -1372,7 +1846,13 @@ impl App {
                 self.hidden.insert(n);
             }
             Action::Chart(k) => match ChartKind::from_str(&k, true) {
-                Ok(kind) => self.opts.kind = kind,
+                Ok(kind) => match self.opts.panes.as_mut() {
+                    Some(p) => {
+                        let f = p.focus;
+                        p.panes[f].kind = Some(kind);
+                    }
+                    None => self.opts.kind = kind,
+                },
                 Err(_) => self.say(format!("unknown chart type '{k}'"), true),
             },
             Action::Target(name, value) => self.opts.analysis.targets.set(&name, value),
@@ -1394,8 +1874,7 @@ impl App {
                 let parse = |l: &str| crate::cli::Lines::parse(l).map_err(|e| format!("lines: {e}"));
                 match (parse(&left), right.as_deref().map(parse).transpose()) {
                     (Ok(l), Ok(r)) => {
-                        self.opts.show_raw = l.live;
-                        self.opts.trends = l.trends;
+                        self.set_lines(l);
                         if let Some(r) = r {
                             self.opts.right = r;
                             self.opts.side_by_side = true;
@@ -1427,6 +1906,7 @@ impl App {
             Action::Pan(f) => self.pan(f),
             Action::ZoomStep(zoom_in) => self.zoom_at(if zoom_in { 0.5 } else { 2.0 }, None),
             Action::Svg(path) => self.export_view(path),
+            Action::Pane(a) => self.apply_pane_action(a),
             Action::Help => {
                 self.help = true;
                 self.help_scroll = 0;
@@ -1543,6 +2023,9 @@ impl App {
             self.on_range_menu_key(key);
             return Transition::None;
         }
+        if self.pane_menu && self.on_pane_key(key) {
+            return Transition::None;
+        }
         if self.help || self.console_help {
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => self.help_scroll += 1,
@@ -1562,6 +2045,16 @@ impl App {
             && let Some(code) = self.binds.get(&c).cloned()
         {
             self.eval(&code);
+            return Transition::None;
+        }
+        // Alt+arrows pick a pane (zellij-style).
+        if matches!(
+            key.code,
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+        ) && key.modifiers.contains(KeyModifiers::ALT)
+            && self.opts.panes.is_some()
+        {
+            self.pane_op(PaneOp::Focus(arrow_dir(key.code)));
             return Transition::None;
         }
         let cmd = match key.code {
@@ -1616,9 +2109,32 @@ impl App {
                 return Transition::None;
             }
             KeyCode::Char('a') => {
-                self.hidden.clear();
+                if self.opts.panes.is_some() {
+                    self.pane_op(PaneOp::AllSeries);
+                } else {
+                    self.hidden.clear();
+                }
                 return Transition::None;
             }
+            KeyCode::Char('w') => {
+                self.pane_menu = !self.pane_menu;
+                if self.pane_menu {
+                    self.ensure_panes();
+                }
+                return Transition::None;
+            }
+            KeyCode::Tab | KeyCode::BackTab if self.opts.panes.is_some() => {
+                if let Some(p) = self.opts.panes.as_mut() {
+                    let n = p.count();
+                    p.focus = if key.code == KeyCode::Tab {
+                        (p.focus + 1) % n
+                    } else {
+                        (p.focus + n - 1) % n
+                    };
+                }
+                return Transition::None;
+            }
+
             KeyCode::Char('t') => Cmd::Kind,
             KeyCode::Char('m') => Cmd::Marker,
             KeyCode::Char('y') => Cmd::Log,
@@ -1704,6 +2220,10 @@ impl App {
                             Transition::None
                         }
                         Hit::MenuBackground => Transition::None,
+                        Hit::Pane(op) => {
+                            self.pane_op(op);
+                            Transition::None
+                        }
                     };
                 }
                 if self.lines_menu || self.range_menu {
@@ -1711,6 +2231,27 @@ impl App {
                     self.lines_menu = false;
                     self.range_menu = false;
                     return Transition::None;
+                }
+                // Panes: grab a border to resize, or tap a pane to focus it.
+                let area = self.chart_rect.get();
+                if let Some(p) = self.opts.panes.as_mut() {
+                    if p.count() > 1
+                        && let Some((path, a)) = p.border_at(area, col, row)
+                    {
+                        let bits = path
+                            .iter()
+                            .enumerate()
+                            .fold(0u32, |b, (i, &x)| b | (u32::from(x) << i));
+                        self.drag = Some(Drag::Border(bits, path.len() as u8, a));
+                        return Transition::None;
+                    }
+                    if let Some((id, _)) = p
+                        .rects(area)
+                        .into_iter()
+                        .find(|(_, r)| r.contains((col, row).into()))
+                    {
+                        p.focus = id;
+                    }
                 }
                 // Shift+click: measure from the cursor (or the previous shift+click) to here.
                 if let Some(plot) = self.plot_at(col, row)
@@ -1745,6 +2286,13 @@ impl App {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(Drag::Border(bits, len, a)) = self.drag {
+                    let path: Vec<bool> = (0..len).map(|i| bits >> i & 1 == 1).collect();
+                    if let Some(p) = self.opts.panes.as_mut() {
+                        p.drag_border(&path, a, col, row);
+                    }
+                    return Transition::None;
+                }
                 let Some(plot) = self.plot_at(col, row).or_else(|| self.any_plot()) else {
                     return Transition::None;
                 };
@@ -1817,6 +2365,14 @@ impl App {
             b(&self.lines_label(), Cmd::Trend)
                 .active(self.lines_menu || !self.opts.trends.is_empty()),
             b("side by side", Cmd::SideBySide).active(self.opts.side_by_side),
+            b(
+                &match &self.opts.panes {
+                    Some(p) if p.count() > 1 => format!("panes ({})", p.count()),
+                    _ => "panes".to_string(),
+                },
+                Cmd::Panes,
+            )
+            .active(self.pane_menu || self.opts.panes.is_some()),
             b("forecast", Cmd::Forecast).active(self.opts.forecast.is_some()),
             b("split", Cmd::Split).active(self.opts.split),
         ];
@@ -1861,7 +2417,8 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, s)| {
-                let shown = !self.hidden.contains(&s.name);
+                let shown = !self.hidden.contains(&s.name)
+                    && self.focused_pane().is_none_or(|p| p.shows(&s.name));
                 Button::new(
                     format!("{} {}", if shown { "●" } else { "○" }, s.name),
                     Hit::Series(i),
@@ -1896,8 +2453,18 @@ impl App {
             (0, 0)
         };
         let console_h = u16::from(self.console.is_some());
-        let [chart, stats, chips_area, tool_area, status, console] = Layout::vertical([
+        let pane_h = self.pane_panel_height(area.width);
+        let [
+            chart,
+            pane_area,
+            stats,
+            chips_area,
+            tool_area,
+            status,
+            console,
+        ] = Layout::vertical([
             Constraint::Min(6),
+            Constraint::Length(pane_h),
             Constraint::Length(stats_h),
             Constraint::Length(chips_h),
             Constraint::Length(tool_h),
@@ -1916,8 +2483,13 @@ impl App {
             selection,
             hidden: Some(&self.hidden),
             plots: Some(&self.plots),
+            pane_focus: self.opts.panes.as_ref().map(|p| p.focus),
         };
+        self.chart_rect.set(chart);
         f.render_widget(ChartWidget::new(&self.ds, &self.opts, overlay), chart);
+        if pane_h > 0 {
+            self.draw_pane_panel(f, pane_area);
+        }
         if self.show_stats {
             self.draw_stats(f, stats);
         }
@@ -2358,6 +2930,12 @@ mod tests {
         }
         app.rebuild(true);
         app
+    }
+
+    fn app_from(args: &[String]) -> App {
+        let mut v = vec!["graft"];
+        v.extend(args.iter().map(String::as_str));
+        app(&v)
     }
 
     fn key(app: &mut App, code: KeyCode) -> Transition {
@@ -2860,6 +3438,140 @@ mod tests {
         type_str(&mut app, "quit()");
         let t = app.on_event(&TermEvent::Key(KeyEvent::from(KeyCode::Enter)));
         assert_eq!(t, Transition::Quit);
+    }
+
+    #[test]
+    fn panes_split_pick_move_resize_and_round_trip() {
+        let mut app = app(&["graft", LOG]);
+        screen(&app);
+        // `w` opens the pane panel; split right, then down.
+        key(&mut app, KeyCode::Char('w'));
+        assert!(app.pane_menu && app.opts.panes.is_some());
+        let s = screen(&app);
+        assert!(
+            s.contains("pane 1 of 1") && s.contains("split right"),
+            "{s}"
+        );
+        let (x, y) = find(&app, " split right ");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        key(&mut app, KeyCode::Char('s'));
+        assert_eq!(
+            app.opts.panes.as_ref().unwrap().layout_expr(),
+            "1 | (2 / 3)"
+        );
+        // Pane 3 (bottom right): bar chart of node2 only.
+        key(&mut app, KeyCode::Char('t'));
+        key(&mut app, KeyCode::Char('t'));
+        key(&mut app, KeyCode::Char('1'));
+        let p = app.opts.panes.as_ref().unwrap();
+        assert_eq!((p.focus, p.panes[2].kind), (2, Some(ChartKind::Bar)));
+        assert_eq!(p.panes[2].series, ["node2"]);
+        // Lines for the focused pane only.
+        key(&mut app, KeyCode::Char('T'));
+        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Esc);
+        let p = app.opts.panes.as_ref().unwrap();
+        assert_eq!(p.panes[2].lines.as_ref().unwrap().to_arg(), "live,avg");
+        assert_eq!(p.panes[0].lines.as_ref().unwrap().to_arg(), "live");
+        let s = screen(&app);
+        assert!(
+            s.contains("node2 avg"),
+            "bar chart shows the trend as its own bar: {s}"
+        );
+        // Pick panes by direction, move one, resize.
+        key(&mut app, KeyCode::Left);
+        assert_eq!(app.opts.panes.as_ref().unwrap().focus, 0);
+        key(&mut app, KeyCode::Char('>'));
+        let w0 = app.opts.panes.as_ref().unwrap().rects(app.chart_rect.get())[0]
+            .1
+            .width;
+        assert!(w0 > app.chart_rect.get().width / 2, "{w0}");
+        key(&mut app, KeyCode::Char('='));
+        // Drag the border between the columns.
+        screen(&app);
+        let area = app.chart_rect.get();
+        let border = app.opts.panes.as_ref().unwrap().rects(area)[1].1.x;
+        let row = area.y + 3;
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            border,
+            row,
+        );
+        mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            area.x + area.width / 4,
+            row,
+        );
+        mouse(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            area.x + area.width / 4,
+            row,
+        );
+        let w0 = app.opts.panes.as_ref().unwrap().rects(area)[0].1.width;
+        assert!(w0 < area.width / 3, "{w0}");
+        // Tap a pane to focus it.
+        let r = app.opts.panes.as_ref().unwrap().rects(area)[2].1;
+        key(&mut app, KeyCode::Esc);
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            r.x + r.width / 2,
+            r.y + r.height / 2,
+        );
+        mouse(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            r.x + r.width / 2,
+            r.y + r.height / 2,
+        );
+        assert_eq!(app.opts.panes.as_ref().unwrap().focus, 2);
+        // The command line reproduces it.
+        let cli = app.current_cli();
+        assert_eq!(cli.pane.len(), 3);
+        assert_eq!(cli.pane[2], "node2 kind=bar lines=live,avg");
+        let args = cli.to_args();
+        assert!(args.contains(&"--layout".to_string()), "{args:?}");
+        let again = app_from(&args);
+        assert_eq!(
+            again.opts.panes.as_ref().unwrap().panes,
+            app.opts.panes.as_ref().unwrap().panes
+        );
+        // Console: layout, pane settings, back to one chart.
+        key(&mut app, KeyCode::Char(':'));
+        type_str(
+            &mut app,
+            "layout(\"3 / (1 | 2)\"); focus_pane(1); pane(\"node1 kind=sparkline\")",
+        );
+        key(&mut app, KeyCode::Enter);
+        let p = app.opts.panes.as_ref().unwrap();
+        assert_eq!(p.layout_expr(), "3 / (1 | 2)");
+        assert_eq!(p.panes[0].kind, Some(ChartKind::Sparkline));
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, "single()");
+        key(&mut app, KeyCode::Enter);
+        assert!(app.opts.panes.is_none());
+        assert_eq!(
+            app.opts.kind,
+            ChartKind::Sparkline,
+            "the focused pane's chart type stays"
+        );
+    }
+
+    #[test]
+    fn side_by_side_works_for_every_chart_type() {
+        for kind in ["bar", "histogram", "sparkline", "scatter"] {
+            let app = app(&["graft", LOG, "--side-by-side", "-k", kind]);
+            let s = screen(&app);
+            assert!(
+                s.contains("· live") && s.contains("· avg + median"),
+                "{kind}: {s}"
+            );
+        }
+        let app = app(&["graft", LOG, "--side-by-side", "-k", "bar"]);
+        assert!(screen(&app).contains("node1 median"));
     }
 
     #[test]

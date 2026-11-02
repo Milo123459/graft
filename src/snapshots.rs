@@ -227,6 +227,25 @@ pub fn scenarios() -> Vec<(String, String)> {
     ]);
     app.test_keys("T");
     add("view-lines-menu-side-by-side", screen(&app, 150, 45));
+    let mut app = viewer(&[
+        month,
+        "-F",
+        FMT,
+        "--pane",
+        "node1 lines=live,median",
+        "--pane",
+        "node2",
+        "--pane",
+        "* kind=bar lines=live,avg",
+        "--layout",
+        "(1 / 2) |65% 3",
+    ]);
+    add("view-panes", screen(&app, 150, 45));
+    app.test_keys("w");
+    add("view-panes-panel", screen(&app, 150, 45));
+    add("phone-panes-panel", screen(&app, 46, 40));
+    let app = viewer(&[month, "-F", FMT, "--side-by-side", "-k", "bar"]);
+    add("view-side-by-side-bar", screen(&app, 150, 30));
     add("phone-timeframe-menu", screen(&app, 46, 34));
     let app = viewer(&[cpu, "--kv", "--trend=avg"]);
     add("view-trend-avg-many", screen(&app, 150, 45));

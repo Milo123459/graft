@@ -2,6 +2,7 @@
 //! interactive viewer and, via an off-screen buffer, by `--once`.
 
 pub mod ansi;
+pub mod panes;
 pub mod svg;
 
 use std::cell::RefCell;
@@ -94,6 +95,8 @@ pub struct ChartOpts {
     pub side_by_side: bool,
     /// The right-hand chart's lines in side by side (the left uses `show_raw`/`trends`).
     pub right: crate::cli::Lines,
+    /// Several charts in one view (`None`: just this one).
+    pub panes: Option<panes::Panes>,
 
     /// Draw explicit target lines.
     pub show_targets: bool,
@@ -121,6 +124,7 @@ impl Default for ChartOpts {
             show_raw: true,
             side_by_side: false,
             right: crate::cli::Lines::default_right(),
+            panes: None,
             show_targets: true,
         }
     }
@@ -243,6 +247,8 @@ pub struct Overlay<'a> {
     pub hidden: Option<&'a HashSet<String>>,
     /// Receives the plot areas drawn (one per panel).
     pub plots: Option<&'a RefCell<Vec<PlotArea>>>,
+    /// The focused pane, outlined when there are several.
+    pub pane_focus: Option<usize>,
 }
 
 impl Overlay<'_> {
@@ -1636,14 +1642,143 @@ impl ChartWidget<'_> {
     }
 }
 
+/// The data and options one pane draws: its series (keeping their colours), chart type
+/// and lines.
+pub fn pane_view(ds: &Dataset, opts: &ChartOpts, pane: &panes::Pane) -> (Dataset, ChartOpts) {
+    let mut sub = ChartOpts {
+        panes: None,
+        side_by_side: false,
+        ..opts.clone()
+    };
+    if let Some(k) = pane.kind {
+        sub.kind = k;
+    }
+    if let Some(l) = &pane.lines {
+        sub.show_raw = l.live;
+        sub.trends = l.trends.clone();
+    }
+    let picked: Vec<usize> = if pane.series.is_empty() {
+        (0..ds.series.len()).collect()
+    } else {
+        pane.series
+            .iter()
+            .filter_map(|n| ds.series.iter().position(|s| &s.name == n))
+            .collect()
+    };
+    sub.palette = picked.iter().map(|&i| opts.color(i)).collect();
+    if sub.palette.is_empty() {
+        sub.palette = opts.palette.clone();
+    }
+    let data = Dataset {
+        x_kind: ds.x_kind,
+        series: picked.iter().map(|&i| ds.series[i].clone()).collect(),
+    };
+    let mut parts = Vec::new();
+    if !pane.series.is_empty() && pane.series.len() <= 3 {
+        parts.push(pane.series.join(", "));
+    }
+    let lines = crate::cli::Lines {
+        live: sub.show_raw || sub.trends.is_empty(),
+        trends: sub.trends.clone(),
+    };
+    if pane.lines.is_some() || !sub.trends.is_empty() {
+        parts.push(lines.label());
+    }
+    if !parts.is_empty() {
+        // What this pane shows comes first: narrow panes cut the title short.
+        sub.title = format!("{} · {}", parts.join(" · "), opts.title);
+    }
+    (data, sub)
+}
+
+/// Bar, histogram and sparkline charts have no lines to draw over the data: each trend
+/// becomes a series of its own ("node1 avg"), in a lighter shade of the series' colour.
+pub fn with_trend_series(ds: &Dataset, opts: &ChartOpts) -> (Dataset, ChartOpts) {
+    let mut out = Dataset {
+        x_kind: ds.x_kind,
+        series: Vec::new(),
+    };
+    let mut palette = Vec::new();
+    let live = opts.show_raw || opts.trends.is_empty();
+    for (i, s) in ds.series.iter().enumerate() {
+        let c = opts.color(i);
+        if live {
+            out.series.push(s.clone());
+            palette.push(c);
+        }
+        for &t in &opts.trends {
+            if let Some(points) = opts.trend_points(s, t, s.points.len().max(2)) {
+                out.series.push(Series {
+                    name: format!("{} {}", s.name, t.label()),
+                    unit: s.unit.clone(),
+                    points,
+                });
+                palette.push(if live { light_color(c) } else { c });
+            }
+        }
+    }
+    let sub = ChartOpts {
+        trends: Vec::new(),
+        show_raw: true,
+        palette: if palette.is_empty() {
+            opts.palette.clone()
+        } else {
+            palette
+        },
+        ..opts.clone()
+    };
+    (out, sub)
+}
+
+impl ChartWidget<'_> {
+    /// Several panes, each a chart of its own.
+    fn render_panes(&self, p: &panes::Panes, area: Rect, buf: &mut Buffer) {
+        for (id, rect) in p.rects(area) {
+            let (ds, opts) = pane_view(self.ds, self.opts, &p.panes[id]);
+            ChartWidget::new(&ds, &opts, self.overlay).render(rect, buf);
+            if p.count() > 1 && self.overlay.pane_focus == Some(id) {
+                outline(rect, buf, Color::Yellow);
+            }
+        }
+    }
+}
+
+/// Recolour a rectangle's border.
+fn outline(r: Rect, buf: &mut Buffer, color: Color) {
+    if r.width < 2 || r.height < 2 {
+        return;
+    }
+    let mut paint = |x: u16, y: u16| {
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.set_fg(color);
+        }
+    };
+    for x in r.x..r.right() {
+        paint(x, r.y);
+        paint(x, r.bottom() - 1);
+    }
+    for y in r.y..r.bottom() {
+        paint(r.x, y);
+        paint(r.right() - 1, y);
+    }
+}
+
 impl Widget for ChartWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         if area.width < 4 || area.height < 3 {
             return;
         }
-        if self.opts.side_by_side && matches!(self.opts.kind, ChartKind::Line | ChartKind::Scatter)
-        {
+        if let Some(p) = &self.opts.panes {
+            return self.render_panes(p, area, buf);
+        }
+        if self.opts.side_by_side {
             return self.render_side_by_side(area, buf);
+        }
+        if !matches!(self.opts.kind, ChartKind::Line | ChartKind::Scatter)
+            && !self.opts.trends.is_empty()
+        {
+            let (ds, opts) = with_trend_series(self.ds, self.opts);
+            return ChartWidget::new(&ds, &opts, self.overlay).render(area, buf);
         }
         match self.opts.kind {
             ChartKind::Line | ChartKind::Scatter if self.opts.split => self.render_split(area, buf),

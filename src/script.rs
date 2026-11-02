@@ -63,8 +63,29 @@ pub enum Action {
     Svg(Option<String>),
     Help,
     Quit,
+    Pane(PaneAction),
     /// Open the builder to change the format or source.
     Format,
+}
+
+/// Pane commands from the console / scripts.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PaneAction {
+    /// Split the focused pane: `true` = below, `false` = to the right.
+    Split(bool),
+    Close,
+    /// "left"/"right"/"up"/"down", or a pane number.
+    Focus(String),
+    Move(String),
+    /// Direction and step (a share of the split, e.g. 0.1).
+    Resize(String, f64),
+    Even,
+    /// Back to one chart.
+    Single,
+    /// Rearrange: `1 | 2 / 3`.
+    Layout(String),
+    /// Set the focused pane: `node1,node2 kind=bar lines=live,avg`.
+    Set(String),
 }
 
 /// Toolbar buttons that are on or off.
@@ -649,6 +670,53 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
         };
         push(&st, Action::Pan(f));
         Ok(())
+    });
+    let pane = |st: &State, a: PaneAction| st.borrow_mut().actions.push(Action::Pane(a));
+    let st = state.clone();
+    engine.register_fn("split_right", move || pane(&st, PaneAction::Split(false)));
+    let st = state.clone();
+    engine.register_fn("split_down", move || pane(&st, PaneAction::Split(true)));
+    let st = state.clone();
+    engine.register_fn("close_pane", move || pane(&st, PaneAction::Close));
+    let st = state.clone();
+    engine.register_fn("focus_pane", move |to: Dynamic| -> FnResult<()> {
+        let to = match to.clone().into_immutable_string() {
+            Ok(s) => s.to_string(),
+            Err(_) => to
+                .as_int()
+                .map_err(
+                    |_| "focus_pane needs \"left\", \"right\", \"up\", \"down\" or a pane number",
+                )?
+                .to_string(),
+        };
+        pane(&st, PaneAction::Focus(to));
+        Ok(())
+    });
+    let st = state.clone();
+    engine.register_fn("move_pane", move |d: &str| {
+        pane(&st, PaneAction::Move(d.into()))
+    });
+    let st = state.clone();
+    engine.register_fn("resize_pane", move |d: &str| {
+        pane(&st, PaneAction::Resize(d.into(), 0.05))
+    });
+    let st = state.clone();
+    engine.register_fn("resize_pane", move |d: &str, by: Dynamic| -> FnResult<()> {
+        let v = dyn_to_f64(&by).ok_or("resize_pane(\"right\", 10) moves the edge 10%")?;
+        pane(&st, PaneAction::Resize(d.into(), v / 100.0));
+        Ok(())
+    });
+    let st = state.clone();
+    engine.register_fn("even_panes", move || pane(&st, PaneAction::Even));
+    let st = state.clone();
+    engine.register_fn("single", move || pane(&st, PaneAction::Single));
+    let st = state.clone();
+    engine.register_fn("layout", move |l: &str| {
+        pane(&st, PaneAction::Layout(l.into()))
+    });
+    let st = state.clone();
+    engine.register_fn("pane", move |spec: &str| {
+        pane(&st, PaneAction::Set(spec.into()))
     });
     let st = state.clone();
     engine.register_fn("zoom_in", move || push(&st, Action::ZoomStep(true)));

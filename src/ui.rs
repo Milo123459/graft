@@ -127,6 +127,76 @@ pub fn render_buttons<T: Clone>(
     }
 }
 
+/// A row of labels and buttons for a panel.
+pub enum Item<T> {
+    Label(String),
+    Btn(Button<T>),
+    /// Start a new row.
+    Break,
+}
+
+impl<T> Item<T> {
+    fn width(&self) -> u16 {
+        match self {
+            Item::Label(s) => s.width() as u16,
+            Item::Btn(b) => b.width(),
+            Item::Break => 0,
+        }
+    }
+}
+
+/// Like `flow`, for labels and buttons; `Break` starts a new row.
+pub fn flow_items<T>(items: &[Item<T>], width: u16) -> (Vec<Rect>, u16) {
+    let (mut x, mut y) = (0u16, 0u16);
+    let mut rects = Vec::with_capacity(items.len());
+    for it in items {
+        if matches!(it, Item::Break) {
+            if x > 0 {
+                x = 0;
+                y += 1;
+            }
+            rects.push(Rect::default());
+            continue;
+        }
+        let w = it.width().min(width.max(1));
+        if x > 0 && x + w > width {
+            x = 0;
+            y += 1;
+        }
+        rects.push(Rect {
+            x,
+            y,
+            width: w,
+            height: 1,
+        });
+        x += w + 1;
+    }
+    (rects, if x == 0 { y } else { y + 1 })
+}
+
+/// Draw labels (dim) and buttons, registering the buttons as hit targets.
+pub fn render_items<T: Clone>(items: &[Item<T>], area: Rect, buf: &mut Buffer, hits: &Hits<T>) {
+    let (rects, _) = flow_items(items, area.width);
+    for (it, r) in items.iter().zip(rects) {
+        if r.y >= area.height || r.width == 0 {
+            continue;
+        }
+        let rect = Rect {
+            x: area.x + r.x,
+            y: area.y + r.y,
+            ..r
+        };
+        match it {
+            Item::Label(s) => {
+                Line::from(Span::styled(s.as_str(), Style::default().fg(Color::Gray)))
+                    .render(rect, buf)
+            }
+            Item::Btn(b) => render_buttons(std::slice::from_ref(b), rect, buf, hits),
+            Item::Break => {}
+        }
+    }
+}
+
 /// A single-line text field.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TextInput {

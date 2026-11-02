@@ -354,6 +354,18 @@ pub struct Cli {
     #[arg(long, value_name = "LINES", value_parser = Lines::parse, help_heading = "Chart")]
     pub right_panel: Option<Lines>,
 
+    /// A pane: several charts in one view (repeat for each). `node1,node2` picks series
+    /// (`*` = all), `kind=bar` the chart type, `lines=live,avg` the lines, e.g.
+    /// `--pane 'node1 lines=live,median' --pane 'node2 kind=bar'`.
+    #[arg(long, value_name = "SPEC", help_heading = "Chart")]
+    pub pane: Vec<String>,
+
+    /// How the panes are arranged: pane numbers, `|` side by side, `/` stacked,
+    /// parentheses, `|60%` for a 60/40 split, e.g. `'(1 | 2) / 3'`. Default: two side
+    /// by side, more in a grid. Panes are also made in the viewer: `w` or the panes button.
+    #[arg(long, value_name = "LAYOUT", help_heading = "Chart")]
+    pub layout: Option<String>,
+
     /// Don't draw target lines (targets still drive forecasts and stats).
     #[arg(long, help_heading = "Analysis")]
     pub no_targets: bool,
@@ -521,6 +533,10 @@ impl Cli {
         for e in &self.alert {
             opt("--alert", Some(e.clone()));
         }
+        for p in &self.pane {
+            opt("--pane", Some(p.clone()));
+        }
+        opt("--layout", self.layout.clone());
         for e in &self.export {
             opt("--export", Some(e.display().to_string()));
         }
@@ -1021,6 +1037,12 @@ mod tests {
                 "--trend-only",
                 "--side-by-side",
                 "--right-panel=live,p95",
+                "--pane",
+                "a kind=bar lines=live,avg",
+                "--pane",
+                "*",
+                "--layout",
+                "1 |60% 2",
                 "--trend-window",
                 "9",
             ],
