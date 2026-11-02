@@ -58,7 +58,10 @@ const HELP: &[(&str, &str)] = &[
         "measure / v",
         "tap the start, then the end: stats for just that stretch",
     ),
-    ("", "(or drag across the chart); tap again to clear"),
+    (
+        "",
+        "(or drag across, or click then shift+click); again to clear",
+    ),
     (
         "stats / s",
         "table: trend per day, forecast, last, min, max…",
@@ -885,6 +888,24 @@ impl App {
                             Transition::None
                         }
                     };
+                }
+                // Shift+click: measure from the cursor (or the previous shift+click) to here.
+                if let Some(plot) = self.plot_at(col, row)
+                    && m.modifiers.contains(KeyModifiers::SHIFT)
+                {
+                    let x = plot.x_at(col);
+                    match self.anchor.or(self.cursor) {
+                        Some(start) if (plot.col_of(start)).abs_diff(col) >= 1 => {
+                            self.cursor = Some(x);
+                            self.finish_measure(start, x);
+                        }
+                        _ => {
+                            self.anchor = Some(x);
+                            self.cursor = Some(x);
+                            self.say("shift+click where the range ends", false);
+                        }
+                    }
+                    return Transition::None;
                 }
                 if let Some(plot) = self.plot_at(col, row) {
                     let on_cursor = self
@@ -1769,6 +1790,47 @@ mod tests {
         let (x, y) = find(&app, " clear measure ");
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
         assert!(app.selection.is_none());
+    }
+
+    #[test]
+    fn shift_click_measures_from_the_cursor() {
+        let mut app = app(&["graft", LOG]);
+        screen(&app);
+        let plot = app.plots.borrow()[0];
+        let row = plot.rect.y + 2;
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            plot.rect.x + 4,
+            row,
+        );
+        mouse(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            plot.rect.x + 4,
+            row,
+        );
+        let shift_click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: plot.rect.x + 30,
+            row,
+            modifiers: KeyModifiers::SHIFT,
+        };
+        app.on_event(&TermEvent::Mouse(shift_click));
+        let (a, b) = app.selection.expect("measured");
+        assert!((plot.col_of(a) as i32 - (plot.rect.x + 4) as i32).abs() <= 1);
+        assert!((plot.col_of(b) as i32 - (plot.rect.x + 30) as i32).abs() <= 1);
+        assert!(app.show_stats);
+        // Without a cursor, the first shift+click sets the start.
+        let mut app = super::tests::app(&["graft", LOG]);
+        screen(&app);
+        app.on_event(&TermEvent::Mouse(shift_click));
+        assert!(app.selection.is_none() && app.anchor.is_some());
+        app.on_event(&TermEvent::Mouse(MouseEvent {
+            column: plot.rect.x + 10,
+            ..shift_click
+        }));
+        assert!(app.selection.is_some());
     }
 
     #[test]

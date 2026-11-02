@@ -269,7 +269,7 @@ including over SSH from a phone.
 |---|---|
 | tap | put the cursor there; a box beside it shows every series' value |
 | drag the cursor line | scrub through the data, and past it into the forecast |
-| **measure**, then tap start and end (or drag across) | stats for just that stretch, including how much each series *changed*; tap again to clear |
+| **measure**, then tap start and end (or drag across, or click then **shift+click**) | stats for just that stretch, including how much each series *changed*; tap again to clear |
 | scroll | zoom around the pointer (sideways or shift + scroll moves); never past your data |
 | toolbar / series chips | ◀ ▶ + − reset cursor measure stats forecast split **all time**; `⋯` shows more: timeframe presets, trend, targets, chart type, log, follow, pause, format, console, export, mouse, help, quit |
 
