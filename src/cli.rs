@@ -396,6 +396,12 @@ pub struct Cli {
     #[arg(long, value_name = "EXPR", action = ArgAction::Append, help_heading = "Analysis")]
     pub alert: Vec<String>,
 
+    /// When an --alert starts firing, tell you: `bell`, `desktop`, `ntfy:TOPIC` (a push
+    /// to your phone via ntfy.sh, or `ntfy:https://your-server/TOPIC`), `webhook:URL`
+    /// (Slack, Discord…) or `cmd:COMMAND` (gets $GRAFT_ALERT). Repeatable.
+    #[arg(long, value_name = "TARGET", value_parser = crate::notify::parse_target, help_heading = "Analysis")]
+    pub notify: Vec<String>,
+
     // ───────────── Output ─────────────
     /// Print the chart once and exit instead of opening the interactive viewer.
     #[arg(short = '1', long, help_heading = "Output")]
@@ -555,6 +561,9 @@ impl Cli {
         );
         for e in &self.alert {
             opt("--alert", Some(e.clone()));
+        }
+        for n in &self.notify {
+            opt("--notify", Some(n.clone()));
         }
         for c in &self.grep {
             opt("--grep", Some(c.clone()));

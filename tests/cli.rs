@@ -438,3 +438,31 @@ fn ssh_runs_commands_and_reads_files_remotely() {
         String::from_utf8_lossy(&o.stderr)
     );
 }
+
+#[test]
+fn alerts_notify_in_once_mode() {
+    let file = std::env::temp_dir().join(format!("graft-once-notify-{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&file);
+    let notify = format!(
+        "cmd:echo \"$GRAFT_TITLE | $GRAFT_ALERT\" > {}",
+        file.display()
+    );
+    let o = graft(&[
+        LOG,
+        "-F",
+        FMT,
+        "--no-chart",
+        "--alert",
+        "node1 < 59GB",
+        "--notify",
+        &notify,
+    ]);
+    assert_eq!(o.status.code(), Some(3));
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "reclaimable.log | ALERT: node1 < 59GB\n"
+    );
+    let _ = std::fs::remove_file(&file);
+    let bad = graft(&[LOG, "-F", FMT, "--notify", "email:me"]);
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("use bell, desktop, ntfy:TOPIC"));
+}

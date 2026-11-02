@@ -66,6 +66,8 @@ pub enum Action {
     Pane(PaneAction),
     /// Save the current view (source, format, panes, lines…) as a named profile.
     SaveProfile(String),
+    /// Put text (default: the view's command line) on the clipboard.
+    Copy(Option<String>),
     /// Open the builder to change the format or source.
     Format,
 }
@@ -733,6 +735,12 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
     let st = state.clone();
     engine.register_fn("save", move |name: &str| {
         push(&st, Action::SaveProfile(name.into()))
+    });
+    let st = state.clone();
+    engine.register_fn("copy", move || push(&st, Action::Copy(None)));
+    let st = state.clone();
+    engine.register_fn("copy", move |t: Dynamic| {
+        push(&st, Action::Copy(Some(t.to_string())))
     });
     let st = state.clone();
     engine.register_fn("help", move || push(&st, Action::Help));

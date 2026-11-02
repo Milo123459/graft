@@ -253,6 +253,25 @@ for unformatted numbers.
 `--alert EXPR` evaluates a Rhai condition and exits with status 3 if it holds,
 so graft works in cron jobs and scripts:
 
+`--notify` tells you when an alert starts firing — in the viewer (once per
+time it starts) and with `--once`/`--no-chart`, which makes graft a cron job:
+
+```sh
+# every hour: push to your phone (install the ntfy app, subscribe to the topic)
+graft ~/reclaimable.log -F '{time} node1: {node1} node2: {node2}' --no-chart \
+  --alert 'node1 < 55GB' --alert 'eta("node2", 200GB) < 3d' --notify ntfy:my-disks
+```
+
+Targets: `bell`, `desktop` (notify-send / macOS notifications),
+`ntfy:TOPIC` (ntfy.sh, or `ntfy:https://your-server/TOPIC`), `webhook:URL`
+(Slack/Discord-style JSON), `cmd:COMMAND` (with `$GRAFT_ALERT` and
+`$GRAFT_TITLE`). Repeat `--notify` for several.
+
+**Copy the command:** `C`, the **copy cmd** button under `⋯`, or `:copy()` puts
+the command that reproduces the current view (panes, lines, timeframe…) on your
+clipboard — via the terminal (OSC 52), so it works over SSH from a phone too
+(in tmux: `set -g set-clipboard on`). `copy(anything)` copies a value.
+
 ```sh
 graft /var/log/reclaimable.log -F '{key}: {value}' --no-chart \
   --alert 'node1 < 50GB' --alert 'slope("node2", "1d") < -10GB' || notify-send "disk"

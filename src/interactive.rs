@@ -1,7 +1,7 @@
 //! The interactive session: owns the terminal (and mouse capture) and switches
 //! between the builder and the viewer.
 
-use std::io::stdout;
+use std::io::{Write, stdout};
 use std::process::ExitCode;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
@@ -148,6 +148,13 @@ pub fn run(start: Start) -> Result<ExitCode> {
                 Screen::Builder(b) => b.on_event(&ev),
                 Screen::Viewer(a) => a.on_event(&ev),
             };
+            if let Screen::Viewer(a) = &mut screen
+                && let Some(text) = a.take_clipboard()
+            {
+                let mut out = stdout();
+                let _ = out.write_all(crate::notify::osc52(&text).as_bytes());
+                let _ = out.flush();
+            }
             screen = match (screen, t) {
                 (s, Transition::None) => s,
                 (Screen::Viewer(a), Transition::Quit) => {

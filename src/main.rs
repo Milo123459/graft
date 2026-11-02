@@ -6,6 +6,7 @@ mod data;
 mod explain;
 mod export;
 mod interactive;
+mod notify;
 mod parse;
 mod profile;
 mod recent;
@@ -278,6 +279,9 @@ fn run_once(
         {
             eprintln!("graft: ALERT: {alert}");
             alerted = true;
+            for e in notify::send(&cli.notify, &opts.title, &format!("ALERT: {alert}")) {
+                eprintln!("graft: {e}");
+            }
         }
     }
     Ok(if alerted {

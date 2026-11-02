@@ -222,6 +222,10 @@ const CONSOLE_HELP: &[(&str, &str)] = &[
         "export / change the format / quit",
     ),
     (
+        "copy()  copy(text)",
+        "copy this view's command (or any text) to your clipboard",
+    ),
+    (
         "save(\"disks\")",
         "save this view (source, format, panes…): graft -p disks",
     ),
@@ -309,6 +313,7 @@ enum Cmd {
     RangeMenu,
     Panes,
     Save,
+    Copy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -431,6 +436,8 @@ pub struct App {
     pending: Option<Transition>,
     /// The pane panel (split, close, move, resize…) is open.
     pane_menu: bool,
+    /// Text to put on the clipboard (written to the terminal by the event loop).
+    clipboard: Option<String>,
     /// Where the chart area was last drawn (for pane taps and border drags).
     chart_rect: std::cell::Cell<Rect>,
     hits: Hits<Hit>,
@@ -497,6 +504,7 @@ impl App {
             range_menu: false,
             pending: None,
             pane_menu: false,
+            clipboard: None,
             chart_rect: std::cell::Cell::new(Rect::default()),
             hits: Hits::default(),
             plots: RefCell::new(Vec::new()),
@@ -605,16 +613,40 @@ impl App {
         if self.alerts.is_empty() {
             return;
         }
+        // Before any data arrives every alert would just say "variable not found".
+        if self.full.series.iter().all(|s| s.points.is_empty()) {
+            self.firing.clear();
+            return;
+        }
         self.session.script.set_data(self.full.clone(), None);
-        self.firing = self
-            .alerts
-            .iter()
-            .filter_map(|a| match self.session.script.eval_bool(a) {
-                Ok(true) => Some(a.clone()),
-                Ok(false) => None,
-                Err(e) => Some(format!("{a}: {e}")),
-            })
-            .collect();
+        let before = std::mem::take(&mut self.firing);
+        let mut newly = Vec::new();
+        for a in &self.alerts {
+            match self.session.script.eval_bool(a) {
+                Ok(true) => {
+                    if !before.contains(a) {
+                        newly.push(a.clone());
+                    }
+                    self.firing.push(a.clone());
+                }
+                Ok(false) => {}
+                // Shown, but not worth a notification.
+                Err(e) => self.firing.push(format!("{a}: {e}")),
+            }
+        }
+        // Notify once each time an alert starts firing.
+        if !newly.is_empty() && !self.cli.notify.is_empty() {
+            let msg = newly
+                .iter()
+                .map(|a| format!("ALERT: {a}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            crate::notify::send_in_background(
+                self.cli.notify.clone(),
+                self.opts.title.clone(),
+                msg,
+            );
+        }
     }
 
     // ───────────── view helpers ─────────────
@@ -779,6 +811,27 @@ impl App {
         let n = options.len() as isize;
         let next = options[((i + dir as isize) % n + n) as usize % options.len()];
         self.set_timeframe(next.map_or_else(Timeframe::default, Timeframe::last));
+    }
+
+    /// Copy `text`, or the command that reproduces this view.
+    fn copy(&mut self, text: Option<String>) {
+        let what = text.is_none();
+        let text =
+            text.unwrap_or_else(|| crate::recent::portable(&self.current_cli()).command_line());
+        self.say(
+            if what {
+                format!("copied: {text}")
+            } else {
+                "copied".into()
+            },
+            false,
+        );
+        self.clipboard = Some(text);
+    }
+
+    /// Clipboard text waiting to be sent to the terminal.
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        self.clipboard.take()
     }
 
     // ───────────── panes ─────────────
@@ -1762,6 +1815,7 @@ impl App {
             Cmd::SideBySide => self.toggle_side_by_side(),
             Cmd::Targets => self.opts.show_targets = !self.opts.show_targets,
             Cmd::RangeStep(dir) => self.step_timeframe(dir),
+            Cmd::Copy => self.copy(None),
             Cmd::Save => {
                 self.console = Some(TextInput::new("save(\""));
                 self.say(
@@ -1919,6 +1973,7 @@ impl App {
             Action::ZoomStep(zoom_in) => self.zoom_at(if zoom_in { 0.5 } else { 2.0 }, None),
             Action::Svg(path) => self.export_view(path),
             Action::Pane(a) => self.apply_pane_action(a),
+            Action::Copy(text) => self.copy(text),
             Action::SaveProfile(name) => {
                 let name = name.trim().to_string();
                 if name.is_empty() || name.contains(char::is_whitespace) {
@@ -2176,6 +2231,7 @@ impl App {
             KeyCode::Char('D') => Cmd::SideBySide,
             KeyCode::Char('G') => Cmd::Targets,
             KeyCode::Char('R') => Cmd::RangeMenu,
+            KeyCode::Char('C') => Cmd::Copy,
             KeyCode::Char('[') => Cmd::RangeStep(-1),
             KeyCode::Char(']') => Cmd::RangeStep(1),
             KeyCode::Char(' ' | 'p') => Cmd::Pause,
@@ -2431,6 +2487,7 @@ impl App {
                 b(if self.paused { "resume" } else { "pause" }, Cmd::Pause).active(self.paused),
                 b("format", Cmd::Format),
                 b("save", Cmd::Save),
+                b("copy cmd", Cmd::Copy),
                 b(":", Cmd::Console),
                 b("svg", Cmd::Export),
                 b("mouse", Cmd::Mouse).active(self.mouse),
@@ -3626,6 +3683,40 @@ mod tests {
                 .as_ref()
                 .is_some_and(|m| m.text.contains("graft -p nodes"))
         );
+    }
+
+    #[test]
+    fn copy_and_alert_notifications() {
+        let file = std::env::temp_dir().join(format!("graft-alert-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let notify = format!("cmd:echo \"$GRAFT_ALERT\" >> {}", file.display());
+        let mut app = app(&["graft", LOG, "--alert", "node1 < 59GB", "--notify", &notify]);
+        // Fired once when it started firing (in the background).
+        let mut text = String::new();
+        for _ in 0..100 {
+            text = std::fs::read_to_string(&file).unwrap_or_default();
+            if !text.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(text, "ALERT: node1 < 59GB\n");
+        // Still firing on the next check: no repeat.
+        app.check_alerts();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+        let _ = std::fs::remove_file(&file);
+        // Copy: the command line, with the path made absolute.
+        key(&mut app, KeyCode::Char('C'));
+        let copied = app.take_clipboard().unwrap();
+        assert!(
+            copied.starts_with("graft --alert") && copied.contains("/examples/reclaimable.log"),
+            "{copied}"
+        );
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, "copy(fmt(\"node1\", last(\"node1\")))");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.take_clipboard().as_deref(), Some("58.8 GB"));
     }
 
     #[test]
