@@ -1925,7 +1925,7 @@ impl App {
                     return self.say("save: give a one-word name, e.g. save(\"disks\")", true);
                 }
                 let args: Vec<std::ffi::OsString> = std::iter::once("graft".to_string())
-                    .chain(self.current_cli().to_args())
+                    .chain(crate::recent::portable(&self.current_cli()).to_args())
                     .map(Into::into)
                     .collect();
                 match crate::profile::save(&name, &args) {

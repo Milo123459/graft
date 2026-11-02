@@ -297,6 +297,31 @@ pub fn scenarios() -> Vec<(String, String)> {
     let b = Builder::new(cli(&[]), None, None);
     add("gallery", draw(120, 32, |f| b.draw(f)));
     add("phone-gallery", draw(46, 30, |f| b.draw(f)));
+    // With recent charts.
+    let file = std::env::temp_dir().join(format!("graft-snap-recent-{}.toml", std::process::id()));
+    let _ = std::fs::remove_file(&file);
+    crate::recent::TEST_PATH.with(|t| *t.borrow_mut() = Some(file.clone()));
+    crate::recent::remember(&cli(&[
+        LOG,
+        "-F",
+        FMT,
+        "--pane",
+        "node1",
+        "--pane",
+        "node2 kind=bar",
+    ]));
+    crate::recent::remember(&cli(&[
+        "-c",
+        "ping -c 100 1.1.1.1",
+        "-F",
+        "time={ping}",
+        "--trend=median",
+    ]));
+    let b = Builder::new(cli(&[]), None, None);
+    add("gallery-recent", draw(120, 36, |f| b.draw(f)));
+    add("phone-gallery-recent", draw(46, 34, |f| b.draw(f)));
+    crate::recent::TEST_PATH.with(|t| *t.borrow_mut() = None);
+    let _ = std::fs::remove_file(&file);
     v
 }
 

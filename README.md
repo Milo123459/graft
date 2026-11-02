@@ -425,6 +425,23 @@ graft --list-profiles            # saved profiles + built-in presets
 Profiles are stored in `~/.config/graft/profiles.toml`, or wherever
 `$GRAFT_PROFILES` points.
 
+### Recent charts
+
+You don't have to name anything: every chart you view is remembered as you
+left it (format, panes, lines, timeframe…), one entry per file or command, and
+`graft` on its own lists the latest at the top of the start screen — tap one to
+pick up where you left off, **edit** to change it first, **✕** (or `x`) to
+forget it.
+
+```sh
+graft -p @          # reopen the most recent chart
+graft -p @2         # the one before
+graft --list-profiles   # also lists recent charts as @1, @2, …
+```
+
+They're kept in `~/.local/state/graft/recent.toml` (`$XDG_STATE_HOME`, or
+`$GRAFT_RECENT`). Charts of piped input aren't kept, since they can't be reopened.
+
 ## Development
 
 ```sh

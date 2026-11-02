@@ -112,6 +112,8 @@ enum Hit {
     /// Gallery: start item `n` / open it in the builder.
     StartItem(usize),
     EditItem(usize),
+    /// Remove a chart from the recent list.
+    ForgetRecent(usize),
     NewSource(Src),
     Field(Field),
     Src(Src),
@@ -167,8 +169,21 @@ struct Item {
     title: String,
     description: String,
     args: Vec<String>,
-    saved: bool,
+    kind: ItemKind,
+    /// Where a recent command ran.
+    cwd: Option<String>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ItemKind {
+    /// Recently viewed: the number in the recent list.
+    Recent(usize),
+    Preset,
+    Saved,
+}
+
+/// Recent charts shown on the start screen (all of them: `graft --list-profiles`).
+const RECENT_SHOWN: usize = 5;
 
 #[derive(Debug, Clone)]
 struct Gallery {
@@ -178,16 +193,31 @@ struct Gallery {
 
 impl Gallery {
     fn new() -> Self {
-        let mut items: Vec<Item> = crate::profile::presets()
+        let now = chrono::Local::now().timestamp();
+        let mut items: Vec<Item> = crate::recent::list()
             .into_iter()
-            .filter(|p| p.available())
-            .map(|p| Item {
-                title: p.title.into(),
-                description: p.description.into(),
-                args: p.args.iter().map(|s| s.to_string()).collect(),
-                saved: false,
+            .take(RECENT_SHOWN)
+            .enumerate()
+            .map(|(i, r)| Item {
+                title: r.title(),
+                description: r.summary(now),
+                kind: ItemKind::Recent(i),
+                cwd: r.cwd.clone(),
+                args: r.args,
             })
             .collect();
+        items.extend(
+            crate::profile::presets()
+                .into_iter()
+                .filter(|p| p.available())
+                .map(|p| Item {
+                    title: p.title.into(),
+                    description: p.description.into(),
+                    args: p.args.iter().map(|s| s.to_string()).collect(),
+                    kind: ItemKind::Preset,
+                    cwd: None,
+                }),
+        );
         items.extend(crate::profile::saved().into_iter().map(|(name, p)| Item {
             description: p.description.clone().unwrap_or_else(|| {
                 p.args
@@ -198,7 +228,8 @@ impl Gallery {
             }),
             title: name,
             args: p.args,
-            saved: true,
+            kind: ItemKind::Saved,
+            cwd: None,
         }));
         Self { items, selected: 0 }
     }
@@ -854,7 +885,7 @@ impl Builder {
                 self.message = None;
             }
             Hit::Back => return Transition::Back,
-            Hit::StartItem(_) | Hit::EditItem(_) | Hit::NewSource(_) => {}
+            Hit::StartItem(_) | Hit::EditItem(_) | Hit::ForgetRecent(_) | Hit::NewSource(_) => {}
             Hit::Preview => self.focus = None,
         }
         Transition::None
@@ -1334,6 +1365,11 @@ impl Builder {
                 return Transition::None;
             }
         };
+        if let Some(d) = &item.cwd
+            && std::path::Path::new(d).is_dir()
+        {
+            let _ = std::env::set_current_dir(d);
+        }
         let live = self.live.take();
         *self = Builder::new(cli, live, None);
         self.from_gallery = true;
@@ -1342,6 +1378,17 @@ impl Builder {
         } else {
             Transition::None
         }
+    }
+
+    fn forget_recent(&mut self, n: usize) {
+        let _ = crate::recent::forget(n);
+        let mut g = Gallery::new();
+        g.selected = self
+            .gallery
+            .as_ref()
+            .map_or(0, |o| o.selected)
+            .min(g.items.len().saturating_sub(1));
+        self.gallery = Some(g);
     }
 
     fn new_source(&mut self, src: Src) {
@@ -1378,6 +1425,16 @@ impl Builder {
                     }
                     KeyCode::Enter if n > 0 => return self.open_item(sel, true),
                     KeyCode::Char('e') if n > 0 => return self.open_item(sel, false),
+                    KeyCode::Char('x') | KeyCode::Delete if n > 0 => {
+                        if let Some(ItemKind::Recent(r)) = self
+                            .gallery
+                            .as_ref()
+                            .and_then(|g| g.items.get(sel))
+                            .map(|i| i.kind)
+                        {
+                            self.forget_recent(r);
+                        }
+                    }
                     KeyCode::Char('f') => self.new_source(Src::File),
                     KeyCode::Char('c') => self.new_source(Src::Command),
                     _ => {}
@@ -1387,6 +1444,7 @@ impl Builder {
                 match self.hits.at(m.column, m.row).map(|h| h.1) {
                     Some(Hit::StartItem(i)) => return self.open_item(i, true),
                     Some(Hit::EditItem(i)) => return self.open_item(i, false),
+                    Some(Hit::ForgetRecent(n)) => self.forget_recent(n),
                     Some(Hit::NewSource(src)) => self.new_source(src),
                     Some(Hit::Back) => return Transition::Back,
                     _ => {}
@@ -1445,24 +1503,34 @@ impl Builder {
             + 2;
         let mut section = None;
         for (idx, item) in g.items.iter().enumerate() {
-            let this = if item.saved {
-                "your saved profiles"
-            } else {
-                "quick start — tap to start (edit to adjust first)"
+            let this = match item.kind {
+                ItemKind::Recent(_) => "recent — pick up where you left off",
+                ItemKind::Saved => "your saved profiles",
+                ItemKind::Preset => "quick start — tap to start (edit to adjust first)",
             };
-            if section != Some(item.saved) {
+            let group = std::mem::discriminant(&item.kind);
+            if section != Some(group) {
                 if section.is_some() {
                     y += 1;
                 }
                 line(f, Line::styled(this, heading), &mut y);
-                section = Some(item.saved);
+                section = Some(group);
             }
             if y >= area.bottom() {
                 break;
             }
             let selected = idx == g.selected;
             // Keep "edit" near the text on wide screens.
-            let right = area.right().min(area.x + title_w + 70);
+            // Recent rows also need room for ✕ after "edit".
+            let reserve = if matches!(item.kind, ItemKind::Recent(_)) {
+                4
+            } else {
+                0
+            };
+            let right = area
+                .right()
+                .saturating_sub(reserve)
+                .min(area.x + title_w + 70);
             let row = Rect {
                 x: area.x,
                 y,
@@ -1497,6 +1565,21 @@ impl Builder {
                 edit,
             );
             self.hits.push(edit, Hit::EditItem(idx));
+            if let ItemKind::Recent(n) = item.kind
+                && right < area.right().saturating_sub(3)
+            {
+                let x = Rect {
+                    x: right + 1,
+                    y,
+                    width: 3,
+                    height: 1,
+                };
+                f.render_widget(
+                    Span::styled(" ✕ ", Style::default().fg(Color::White).bg(Color::DarkGray)),
+                    x,
+                );
+                self.hits.push(x, Hit::ForgetRecent(n));
+            }
             y += 1;
         }
         y += 1;
@@ -1524,7 +1607,7 @@ impl Builder {
         line(
             f,
             Line::styled(
-                "keys: ↑/↓ choose · enter start · e edit · f file · c command · q quit",
+                "keys: ↑/↓ choose · enter start · e edit · x forget · f file · c command · q quit",
                 dim,
             ),
             &mut y,
@@ -1532,7 +1615,7 @@ impl Builder {
         line(
             f,
             Line::styled(
-                "next time: graft -p NAME runs a preset or saved profile directly",
+                "next time: graft -p NAME runs a preset or saved profile; graft -p @ the latest chart",
                 dim,
             ),
             &mut y,
@@ -1674,8 +1757,66 @@ mod tests {
         }))
     }
 
+    fn mouse_tap(b: &mut Builder, column: u16, row: u16) -> Transition {
+        b.on_event(&TermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+    }
+
     fn key(b: &mut Builder, code: KeyCode) -> Transition {
         b.on_event(&TermEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+    }
+
+    #[test]
+    fn gallery_shows_recent_charts_first() {
+        let file =
+            std::env::temp_dir().join(format!("graft-gallery-recent-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        crate::recent::TEST_PATH.with(|t| *t.borrow_mut() = Some(file.clone()));
+        let parse = |a: &[&str]| <Cli as clap::Parser>::parse_from(a);
+        crate::recent::remember(&parse(&[
+            "graft",
+            "examples/reclaimable.log",
+            "-F",
+            "{time} node1: {node1} node2: {node2}",
+            "--pane",
+            "node1",
+            "--pane",
+            "node2",
+        ]));
+        crate::recent::remember(&parse(&["graft", "-c", "uptime", "--kv"]));
+        let mut b = builder(&["graft"]);
+        let s = screen(&b, 100, 40);
+        let at = |t: &str| s.find(t).unwrap_or_else(|| panic!("{t} missing: {s}"));
+        assert!(
+            at("recent — pick up where you left off") < at("quick start"),
+            "{s}"
+        );
+        assert!(
+            at("▸ uptime") < at("▸ reclaimable.log"),
+            "newest first: {s}"
+        );
+        assert!(s.contains("2 panes"), "{s}");
+        // ✕ forgets one.
+        let row = s.lines().position(|l| l.contains("▸ uptime")).unwrap() as u16;
+        let col = s
+            .lines()
+            .nth(row as usize)
+            .unwrap()
+            .chars()
+            .position(|c| c == '✕')
+            .unwrap() as u16;
+        mouse_tap(&mut b, col, row);
+        assert!(!screen(&b, 100, 40).contains("▸ uptime"));
+        // Tapping a recent chart starts it as it was left.
+        assert_eq!(tap(&mut b, "reclaimable.log"), Transition::Start);
+        let app = b.launch().expect("recent chart launches");
+        assert_eq!(app.current_cli().pane, ["node1", "node2"]);
+        crate::recent::TEST_PATH.with(|t| *t.borrow_mut() = None);
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]

@@ -115,6 +115,10 @@ pub fn run(start: Start) -> Result<ExitCode> {
         Start::Builder(cli, live) => Screen::Builder(Box::new(Builder::new(*cli, live, None))),
         Start::Viewer(setup, live) => Screen::Viewer(Box::new(App::new(*setup, live))),
     };
+    // Remembered when it opens (in case it's killed) and again, as left, when it closes.
+    if let Screen::Viewer(a) = &screen {
+        crate::recent::remember(&a.current_cli());
+    }
 
     let mut terminal = ratatui::init();
     let previous_hook = std::panic::take_hook();
@@ -147,7 +151,9 @@ pub fn run(start: Start) -> Result<ExitCode> {
             screen = match (screen, t) {
                 (s, Transition::None) => s,
                 (Screen::Viewer(a), Transition::Quit) => {
-                    return Ok(from_builder.then_some(a.current_cli()));
+                    let cli = a.current_cli();
+                    crate::recent::remember(&cli);
+                    return Ok(from_builder.then_some(cli));
                 }
                 (Screen::Builder(b), Transition::Quit) => return Ok(b.previous_cli()),
                 (s, Transition::Mouse(on)) => {
@@ -161,6 +167,7 @@ pub fn run(start: Start) -> Result<ExitCode> {
                 }
                 (Screen::Viewer(a), Transition::OpenBuilder) => {
                     let cli = a.current_cli();
+                    crate::recent::remember(&cli);
                     Screen::Builder(Box::new(Builder::new(cli, None, Some(a))))
                 }
                 (Screen::Builder(mut b), Transition::Back) => match b.take_previous() {
@@ -169,6 +176,7 @@ pub fn run(start: Start) -> Result<ExitCode> {
                 },
                 (Screen::Builder(mut b), Transition::Start) => match b.launch() {
                     Ok(app) => {
+                        crate::recent::remember(&app.current_cli());
                         from_builder = true;
                         Screen::Viewer(Box::new(app))
                     }

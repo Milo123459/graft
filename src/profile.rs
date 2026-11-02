@@ -292,7 +292,14 @@ pub fn expand(args: Vec<OsString>) -> Result<Vec<OsString>> {
     }
     let mut out = vec![argv0];
     if let Some(name) = profile {
-        out.extend(find(&name)?.args.into_iter().map(OsString::from));
+        // `@`, `@2`: a recent chart.
+        if let Some(recent) = crate::recent::find(&name) {
+            let recent = recent?;
+            recent.enter_dir();
+            out.extend(recent.args.into_iter().map(OsString::from));
+        } else {
+            out.extend(find(&name)?.args.into_iter().map(OsString::from));
+        }
     }
     out.extend(rest);
     Ok(out)
@@ -385,6 +392,17 @@ pub fn list() -> Result<String> {
         .filter(|(k, _)| !saved.contains_key(k))
         .collect();
     section("built-in", &builtins, &mut out);
+    let recent = crate::recent::list();
+    if !recent.is_empty() {
+        let now = chrono::Local::now().timestamp();
+        let _ = writeln!(
+            out,
+            "recent (graft -p @ opens the latest, -p @2 the one before…):"
+        );
+        for (i, r) in recent.iter().enumerate() {
+            let _ = writeln!(out, "  @{} {} — {}", i + 1, r.title(), r.summary(now));
+        }
+    }
     Ok(out)
 }
 

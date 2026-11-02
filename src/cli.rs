@@ -655,7 +655,7 @@ fn fmt_secs(s: f64) -> String {
     crate::time::fmt_duration_compact(s)
 }
 
-fn fmt_window(w: Window) -> String {
+pub fn fmt_window(w: Window) -> String {
     match w {
         Window::Points(n) => n.to_string(),
         Window::Span(s) => fmt_secs(s),

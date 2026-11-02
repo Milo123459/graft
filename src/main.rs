@@ -8,6 +8,7 @@ mod export;
 mod interactive;
 mod parse;
 mod profile;
+mod recent;
 mod render;
 mod script;
 mod session;
