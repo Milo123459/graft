@@ -230,6 +230,7 @@ pub fn chart_opts(cli: &Cli, spec: &SourceSpec, analysis: Analysis) -> Result<Ch
         show_raw,
         side_by_side: cli.side_by_side || cli.right_panel.is_some(),
         right,
+        marks: Vec::new(),
         panes: crate::render::panes::Panes::from_args(&cli.pane, cli.layout.as_deref())
             .map_err(anyhow::Error::msg)?,
         show_targets: !cli.no_targets,

@@ -1,0 +1,187 @@
+//! Markers on the chart where a condition holds: `--mark 'delta < -1GB => dropped {delta}'`.
+//!
+//! A rule is a Rhai condition evaluated at every point of every series, with:
+//! `value`, `prev` (the point before), `delta` (value − prev), `pct` (delta as % of
+//! prev), `rate` (delta per second), `time`/`x`, `i` (point index) and `name` (the
+//! series). Unit literals work (`1GB`, `5%`). Restrict a rule to one series with
+//! `name == "node2" && …`. The label after `=>` may use `{name} {value} {prev}
+//! {delta} {pct} {time}`.
+
+use anyhow::{Context, Result};
+use rhai::{Dynamic, Scope};
+
+use crate::data::Dataset;
+use crate::render::Mark;
+use crate::script::ScriptHost;
+
+/// Most markers one rule may place (a rule that matches everything isn't useful).
+const MAX_PER_RULE: usize = 300;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarkRule {
+    pub expr: String,
+    pub label: Option<String>,
+}
+
+impl MarkRule {
+    /// `EXPR` or `EXPR => LABEL`.
+    pub fn parse(s: &str) -> Result<MarkRule, String> {
+        let (expr, label) = match s.split_once("=>") {
+            Some((e, l)) => (
+                e.trim(),
+                Some(l.trim().to_string()).filter(|l| !l.is_empty()),
+            ),
+            None => (s.trim(), None),
+        };
+        if expr.is_empty() {
+            return Err("give a condition, e.g. 'delta < -1GB => dropped {delta}'".into());
+        }
+        Ok(MarkRule {
+            expr: expr.to_string(),
+            label,
+        })
+    }
+
+    pub fn to_spec(&self) -> String {
+        match &self.label {
+            Some(l) => format!("{} => {l}", self.expr),
+            None => self.expr.clone(),
+        }
+    }
+}
+
+/// Place markers for every rule. An error stops that rule (reported, the rest go on).
+pub fn evaluate(host: &ScriptHost, rules: &[MarkRule], ds: &Dataset) -> (Vec<Mark>, Vec<String>) {
+    let mut marks = Vec::new();
+    let mut errors = Vec::new();
+    for rule in rules {
+        if let Err(e) = evaluate_rule(host, rule, ds, &mut marks) {
+            errors.push(format!("mark '{}': {e:#}", rule.expr));
+        }
+    }
+    marks.sort_by(|a, b| a.x.total_cmp(&b.x));
+    (marks, errors)
+}
+
+fn evaluate_rule(
+    host: &ScriptHost,
+    rule: &MarkRule,
+    ds: &Dataset,
+    out: &mut Vec<Mark>,
+) -> Result<()> {
+    let ast = host.compile_expr(&rule.expr)?;
+    let mut placed = 0;
+    for s in &ds.series {
+        for (i, &(x, value)) in s.points.iter().enumerate() {
+            let (px, prev) = if i > 0 { s.points[i - 1] } else { (x, value) };
+            let delta = value - prev;
+            let pct = if prev != 0.0 {
+                delta / prev.abs() * 100.0
+            } else {
+                0.0
+            };
+            let rate = if x > px { delta / (x - px) } else { 0.0 };
+            let mut scope = Scope::new();
+            scope.push("value", value);
+            scope.push("prev", prev);
+            scope.push("delta", delta);
+            scope.push("pct", pct);
+            scope.push("rate", rate);
+            scope.push("x", x);
+            scope.push("time", x);
+            scope.push("i", i as i64);
+            scope.push("name", s.name.clone());
+            let hit: Dynamic = host
+                .eval_ast_with_scope(&mut scope, &ast)
+                .with_context(|| format!("at {} point {i}", s.name))?;
+            let hit = hit
+                .as_bool()
+                .map_err(|t| anyhow::anyhow!("returned {t}, expected true/false"))?;
+            if !hit {
+                continue;
+            }
+            placed += 1;
+            if placed > MAX_PER_RULE {
+                return Err(anyhow::anyhow!(
+                    "matched more than {MAX_PER_RULE} points; make the condition stricter"
+                ));
+            }
+            let fill = |t: &str| {
+                t.replace("{name}", &s.name)
+                    .replace("{value}", &s.unit.format(value))
+                    .replace("{prev}", &s.unit.format(prev))
+                    .replace("{delta}", &signed(&s.unit, delta))
+                    .replace("{pct}", &format!("{pct:+.1}%"))
+                    .replace("{time}", &ds.fmt_x_full(x))
+            };
+            out.push(Mark {
+                series: Some(s.name.clone()),
+                x,
+                y: Some(value),
+                label: fill(rule.label.as_deref().unwrap_or("{name} {delta}")),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn signed(unit: &crate::units::Unit, v: f64) -> String {
+    if v < 0.0 {
+        format!("−{}", unit.format(-v))
+    } else {
+        format!("+{}", unit.format(v))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::{Series, XKind};
+    use crate::units::{Dim, Unit};
+
+    #[test]
+    fn rules_place_labelled_marks() {
+        let host = ScriptHost::new(None, false).unwrap();
+        let ds = Dataset {
+            x_kind: XKind::Time,
+            series: vec![
+                Series {
+                    name: "node1".into(),
+                    unit: Unit::new(Dim::Bytes { binary: false }),
+                    points: vec![
+                        (0.0, 60e9),
+                        (3600.0, 58.5e9),
+                        (7200.0, 58.4e9),
+                        (10800.0, 56e9),
+                    ],
+                },
+                Series {
+                    name: "node2".into(),
+                    unit: Unit::new(Dim::Bytes { binary: false }),
+                    points: vec![(0.0, 400e9), (3600.0, 390e9)],
+                },
+            ],
+        };
+        let rule = MarkRule::parse("name == \"node1\" && delta < -1GB => dropped {delta} ({pct})")
+            .unwrap();
+        let (marks, errors) = evaluate(&host, std::slice::from_ref(&rule), &ds);
+        assert!(errors.is_empty(), "{errors:?}");
+        let labels: Vec<_> = marks.iter().map(|m| (m.x, m.label.as_str())).collect();
+        assert_eq!(
+            labels,
+            [
+                (3600.0, "dropped −1.5 GB (-2.5%)"),
+                (10800.0, "dropped −2.4 GB (-4.1%)")
+            ]
+        );
+        assert_eq!(MarkRule::parse(&rule.to_spec()).unwrap(), rule);
+        // Default label, and every series.
+        let (marks, _) = evaluate(&host, &[MarkRule::parse("delta < -5GB").unwrap()], &ds);
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].label, "node2 −10 GB");
+        // Errors are reported per rule.
+        let (_, errors) = evaluate(&host, &[MarkRule::parse("value").unwrap()], &ds);
+        assert!(errors[0].contains("expected true/false"), "{errors:?}");
+        assert!(MarkRule::parse(" => x").is_err());
+    }
+}

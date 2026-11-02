@@ -396,6 +396,12 @@ pub struct Cli {
     #[arg(long, value_name = "EXPR", action = ArgAction::Append, help_heading = "Analysis")]
     pub alert: Vec<String>,
 
+    /// Put a marker on the chart wherever a condition holds, e.g. a drop of more than
+    /// 1 GB between two samples: `'delta < -1GB => dropped {delta}'`. Variables:
+    /// value, prev, delta, pct, rate (per second), time, i, name. Repeatable.
+    #[arg(long, value_name = "EXPR[ => LABEL]", value_parser = parse_mark, help_heading = "Analysis")]
+    pub mark: Vec<String>,
+
     /// When an --alert starts firing, tell you: `bell`, `desktop`, `ntfy:TOPIC` (a push
     /// to your phone via ntfy.sh, or `ntfy:https://your-server/TOPIC`), `webhook:URL`
     /// (Slack, Discord…) or `cmd:COMMAND` (gets $GRAFT_ALERT). Repeatable.
@@ -562,6 +568,9 @@ impl Cli {
         for e in &self.alert {
             opt("--alert", Some(e.clone()));
         }
+        for m in &self.mark {
+            opt("--mark", Some(m.clone()));
+        }
         for n in &self.notify {
             opt("--notify", Some(n.clone()));
         }
@@ -671,6 +680,10 @@ impl Cli {
     pub fn grep_bucket(&self) -> f64 {
         self.grep_every.unwrap_or(60.0)
     }
+}
+
+fn parse_mark(s: &str) -> Result<String, String> {
+    crate::marks::MarkRule::parse(s).map(|r| r.to_spec())
 }
 
 fn parse_secs_arg(s: &str) -> Result<f64, String> {

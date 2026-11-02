@@ -68,6 +68,10 @@ pub enum Action {
     SaveProfile(String),
     /// Put text (default: the view's command line) on the clipboard.
     Copy(Option<String>),
+    /// A marker here (at the cursor, or the newest data) with this label.
+    MarkHere(String),
+    /// Remove every marker and marker rule.
+    ClearMarks,
     /// Open the builder to change the format or source.
     Format,
 }
@@ -135,6 +139,8 @@ pub struct ScriptState {
     pub actions: Vec<Action>,
     pub binds: Vec<(String, String)>,
     pub output: Vec<String>,
+    /// Marker rules added with `mark_when` (picked up by the viewer).
+    pub mark_rules: Vec<crate::marks::MarkRule>,
 }
 
 pub struct ScriptHost {
@@ -296,6 +302,23 @@ impl ScriptHost {
 
     pub fn take_output(&self) -> Vec<String> {
         std::mem::take(&mut self.state.borrow_mut().output)
+    }
+
+    /// Marker rules added since last asked (`mark_when` in the script or console).
+    pub fn take_mark_rules(&self) -> Vec<crate::marks::MarkRule> {
+        std::mem::take(&mut self.state.borrow_mut().mark_rules)
+    }
+
+    /// Whether `mark_when` added rules that haven't been picked up yet.
+    pub fn has_new_mark_rules(&self) -> bool {
+        !self.state.borrow().mark_rules.is_empty()
+    }
+
+    /// Evaluate a compiled expression with variables already in `scope`.
+    pub fn eval_ast_with_scope(&self, scope: &mut Scope, ast: &AST) -> Result<Dynamic> {
+        self.engine
+            .eval_ast_with_scope(scope, ast)
+            .map_err(|e| anyhow!("{e}"))
     }
 
     pub fn binds(&self) -> Vec<(String, String)> {
@@ -743,6 +766,30 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
     engine.register_fn("save", move |name: &str| {
         push(&st, Action::SaveProfile(name.into()))
     });
+    for with_label in [false, true] {
+        let st = state.clone();
+        let f = move |expr: &str, label: &str| -> FnResult<()> {
+            let spec = if with_label {
+                format!("{expr} => {label}")
+            } else {
+                expr.to_string()
+            };
+            let rule = crate::marks::MarkRule::parse(&spec)?;
+            st.borrow_mut().mark_rules.push(rule);
+            Ok(())
+        };
+        if with_label {
+            engine.register_fn("mark_when", f);
+        } else {
+            engine.register_fn("mark_when", move |expr: &str| f(expr, ""));
+        }
+    }
+    let st = state.clone();
+    engine.register_fn("mark", move |label: &str| {
+        push(&st, Action::MarkHere(label.into()))
+    });
+    let st = state.clone();
+    engine.register_fn("clear_marks", move || push(&st, Action::ClearMarks));
     let st = state.clone();
     engine.register_fn("copy", move || push(&st, Action::Copy(None)));
     let st = state.clone();

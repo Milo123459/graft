@@ -229,6 +229,15 @@ const CONSOLE_HELP: &[(&str, &str)] = &[
         "save(\"disks\")",
         "save this view (source, format, panes…): graft -p disks",
     ),
+    ("— markers —", ""),
+    (
+        "mark_when(\"delta < -1GB\", \"drop {delta}\")",
+        "▼ wherever it holds: value prev delta pct rate time name",
+    ),
+    (
+        "mark(\"deploy\")  clear_marks()",
+        "a marker at the cursor (or newest data) / remove all",
+    ),
     ("— panes —", ""),
     (
         "split_right() split_down()",
@@ -453,6 +462,10 @@ pub struct App {
     subs: Vec<crate::sources::Sub>,
     /// Their latest data, as drawn.
     sub_views: Vec<crate::render::SourceView>,
+    /// Marker rules (`--mark`, `mark_when`).
+    mark_rules: Vec<crate::marks::MarkRule>,
+    /// Markers placed by hand with `mark("…")`.
+    manual_marks: Vec<crate::render::Mark>,
     /// The source picker for the focused pane: (label, source name).
     source_menu: Option<(Vec<SourceChoice>, usize)>,
     /// Where the chart area was last drawn (for pane taps and border drags).
@@ -523,6 +536,8 @@ impl App {
             pane_menu: false,
             clipboard: None,
             subs: Vec::new(),
+            mark_rules: Vec::new(),
+            manual_marks: Vec::new(),
             sub_views: Vec::new(),
             source_menu: None,
             chart_rect: std::cell::Cell::new(Rect::default()),
@@ -531,6 +546,12 @@ impl App {
             timeframe,
             presets: Vec::new(),
         };
+        app.mark_rules = app
+            .cli
+            .mark
+            .iter()
+            .filter_map(|m| crate::marks::MarkRule::parse(m).ok())
+            .collect();
         app.rebuild(true);
         app
     }
@@ -556,6 +577,7 @@ impl App {
             .flat_map(|p| p.panes.iter().map(Pane::to_spec))
             .collect();
         c.layout = self.opts.panes.as_ref().map(Panes::layout_expr);
+        c.mark = self.mark_rules.iter().map(|r| r.to_spec()).collect();
         c.side_by_side = self.opts.side_by_side;
         c.no_targets = !self.opts.show_targets;
         c.last = self.timeframe.last;
@@ -646,6 +668,23 @@ impl App {
             self.view = Some((a + new - b, new));
         }
         self.check_alerts();
+        self.update_marks();
+    }
+
+    /// Place markers from the rules (and those set by hand) on the current data.
+    fn update_marks(&mut self) {
+        self.mark_rules
+            .extend(self.session.script.take_mark_rules());
+        let (mut marks, errors) =
+            crate::marks::evaluate(&self.session.script, &self.mark_rules, &self.ds);
+        if let Some(e) = errors.into_iter().next() {
+            // Each failing rule is dropped so the message isn't repeated on every update.
+            self.mark_rules
+                .retain(|r| !e.contains(&format!("mark '{}'", r.expr)));
+            self.say(e, true);
+        }
+        marks.extend(self.manual_marks.iter().cloned());
+        self.opts.marks = marks;
     }
 
     fn check_alerts(&mut self) {
@@ -2039,6 +2078,9 @@ impl App {
         for action in script.take_actions() {
             self.apply(action);
         }
+        if self.session.script.has_new_mark_rules() {
+            self.update_marks();
+        }
         // A command that complained (e.g. an unknown line name) keeps its message.
         if self.message.as_ref().is_some_and(|m| m.error) {
             return;
@@ -2148,6 +2190,26 @@ impl App {
             Action::Svg(path) => self.export_view(path),
             Action::Pane(a) => self.apply_pane_action(a),
             Action::Copy(text) => self.copy(text),
+            Action::MarkHere(label) => {
+                let x = self.cursor.or_else(|| self.ds.x_range().map(|r| r.1));
+                match x {
+                    Some(x) => {
+                        self.manual_marks.push(crate::render::Mark {
+                            series: None,
+                            x,
+                            y: None,
+                            label,
+                        });
+                        self.update_marks();
+                    }
+                    None => self.say("mark: no data yet", true),
+                }
+            }
+            Action::ClearMarks => {
+                self.mark_rules.clear();
+                self.manual_marks.clear();
+                self.update_marks();
+            }
             Action::SaveProfile(name) => {
                 let name = name.trim().to_string();
                 if name.is_empty() || name.contains(char::is_whitespace) {
@@ -2669,7 +2731,14 @@ impl App {
         if self.toolbar_more {
             v.extend([
                 b("targets", Cmd::Targets).active(self.opts.show_targets),
-                b(self.opts.kind.name(), Cmd::Kind),
+                // With panes, the chart type button belongs to the picked pane.
+                b(
+                    self.focused_pane()
+                        .and_then(|p| p.kind)
+                        .unwrap_or(self.opts.kind)
+                        .name(),
+                    Cmd::Kind,
+                ),
                 b("log", Cmd::Log).active(self.opts.log),
                 b("follow", Cmd::Follow).active(self.follow_pointer),
                 b(if self.paused { "resume" } else { "pause" }, Cmd::Pause).active(self.paused),
@@ -3997,6 +4066,82 @@ mod tests {
         assert_eq!(
             (p.panes[0].source.as_deref(), p.panes[1].source.as_deref()),
             (None, Some("processes"))
+        );
+    }
+
+    #[test]
+    fn markers_from_rules_scripts_and_by_hand() {
+        let mut app = app(&[
+            "graft",
+            LOG,
+            "-s",
+            "node2",
+            "--mark",
+            "delta < -1.5GB => fell {delta}",
+        ]);
+        assert_eq!(app.opts.marks.len(), 3, "{:?}", app.opts.marks);
+        let s = screen(&app);
+        assert!(s.contains("▼") && s.contains("fell −1.6 GB"), "{s}");
+        // From the console: another rule, then a marker by hand at the cursor.
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, "mark_when(\"pct > 0.3\", \"up {pct}\")");
+        key(&mut app, KeyCode::Enter);
+        let rises = app
+            .opts
+            .marks
+            .iter()
+            .filter(|m| m.label.starts_with("up +"))
+            .count();
+        assert!(rises > 0, "{:?}", app.opts.marks);
+        let x = app.ds.series[0].points[5].0;
+        app.cursor = Some(x);
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, "mark(\"reboot\")");
+        key(&mut app, KeyCode::Enter);
+        assert!(
+            app.opts
+                .marks
+                .iter()
+                .any(|m| m.label == "reboot" && m.x == x && m.series.is_none())
+        );
+        // The readout lists markers under the cursor; rules are kept in the command line.
+        assert!(screen(&app).contains("▼ reboot"));
+        assert_eq!(
+            app.current_cli().mark,
+            ["delta < -1.5GB => fell {delta}", "pct > 0.3 => up {pct}"]
+        );
+        // Bad rules are reported and dropped; clear_marks() removes everything.
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, "mark_when(\"value\")");
+        key(&mut app, KeyCode::Enter);
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|m| m.error && m.text.contains("expected true/false"))
+        );
+        assert_eq!(app.current_cli().mark.len(), 2);
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, "clear_marks()");
+        key(&mut app, KeyCode::Enter);
+        assert!(app.opts.marks.is_empty() && app.current_cli().mark.is_empty());
+    }
+
+    #[test]
+    fn scripts_can_add_marker_rules() {
+        let path = std::env::temp_dir().join(format!("graft-marks-{}.rhai", std::process::id()));
+        std::fs::write(
+            &path,
+            "mark_when(\"name == `node1` && delta < -500MB\", \"drop\");\n",
+        )
+        .unwrap();
+        let app = app(&["graft", LOG, "--script", path.to_str().unwrap()]);
+        let _ = std::fs::remove_file(&path);
+        assert!(!app.opts.marks.is_empty());
+        assert!(
+            app.opts
+                .marks
+                .iter()
+                .all(|m| m.label == "drop" && m.series.as_deref() == Some("node1"))
         );
     }
 

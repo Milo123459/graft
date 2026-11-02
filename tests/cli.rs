@@ -466,3 +466,28 @@ fn alerts_notify_in_once_mode() {
     let bad = graft(&[LOG, "-F", FMT, "--notify", "email:me"]);
     assert!(String::from_utf8_lossy(&bad.stderr).contains("use bell, desktop, ntfy:TOPIC"));
 }
+
+#[test]
+fn markers_are_drawn_and_listed() {
+    let o = graft(&[
+        LOG,
+        "-F",
+        FMT,
+        "--once",
+        "--stats",
+        "--width",
+        "100",
+        "--height",
+        "14",
+        "--mark",
+        "name == \"node2\" && delta < -1.5GB => fell {delta}",
+    ]);
+    let out = stdout(&o);
+    assert!(out.contains("▼") && out.contains("fell −1.6 GB"), "{out}");
+    assert!(
+        out.contains("markers:\n  2026-11-01 09:00  fell −1.6 GB"),
+        "{out}"
+    );
+    let bad = graft(&[LOG, "-F", FMT, "--once", "--mark", "=> x"]);
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("give a condition"));
+}

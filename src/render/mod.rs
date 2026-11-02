@@ -97,6 +97,8 @@ pub struct ChartOpts {
     pub right: crate::cli::Lines,
     /// Several charts in one view (`None`: just this one).
     pub panes: Option<panes::Panes>,
+    /// Markers (from `--mark` rules or `mark()`).
+    pub marks: Vec<Mark>,
 
     /// Draw explicit target lines.
     pub show_targets: bool,
@@ -125,6 +127,7 @@ impl Default for ChartOpts {
             side_by_side: false,
             right: crate::cli::Lines::default_right(),
             panes: None,
+            marks: Vec::new(),
             show_targets: true,
         }
     }
@@ -251,6 +254,15 @@ pub struct Overlay<'a> {
     pub pane_focus: Option<usize>,
     /// Data for panes with a `source=` of their own.
     pub sources: Option<&'a [SourceView]>,
+}
+
+/// A marker on the chart: at a point of a series, or (no series) a whole moment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Mark {
+    pub series: Option<String>,
+    pub x: f64,
+    pub y: Option<f64>,
+    pub label: String,
 }
 
 /// What a pane's own source has produced so far.
@@ -1303,6 +1315,7 @@ impl<'a> ChartWidget<'a> {
         if let Some(plots) = self.overlay.plots {
             plots.borrow_mut().push(plot);
         }
+        self.draw_marks(buf, &plot, (y0, y1), &visible);
         if let Some(c) = self.overlay.cursor
             && (x0..=x1).contains(&c)
         {
@@ -1312,6 +1325,90 @@ impl<'a> ChartWidget<'a> {
                 c,
                 &lines.iter().map(|l| (l.0, l.1)).collect::<Vec<_>>(),
             );
+        }
+    }
+
+    /// Markers: ▼ just above the point (in its series' colour) with its label beside it,
+    /// or for a moment marked by hand, a dotted line down the plot. Labels are left out
+    /// when there are too many to read; the cursor readout still shows them.
+    fn draw_marks(
+        &self,
+        buf: &mut Buffer,
+        plot: &PlotArea,
+        (y0, y1): (f64, f64),
+        visible: &[(usize, &Series)],
+    ) {
+        let in_view: Vec<&Mark> = self
+            .opts
+            .marks
+            .iter()
+            .filter(|m| m.x >= plot.x0 && m.x <= plot.x1)
+            .filter(|m| {
+                m.series
+                    .as_ref()
+                    .is_none_or(|n| visible.iter().any(|(_, s)| &s.name == n))
+            })
+            .collect();
+        let r = plot.rect;
+        if r.height == 0 || r.width == 0 || y1 <= y0 {
+            return;
+        }
+        // First every ▼ (and where it is), then labels in the space left.
+        let mut placed: Vec<(u16, u16, Color, &Mark)> = Vec::new();
+        for m in in_view {
+            let col = plot.col_of(m.x);
+            let (color, row) = match (&m.series, m.y) {
+                (Some(name), Some(y)) => {
+                    let Some(&(i, _)) = visible.iter().find(|(_, s)| &s.name == name) else {
+                        continue;
+                    };
+                    let v = if self.opts.log {
+                        if y <= 0.0 {
+                            continue;
+                        }
+                        y.log10()
+                    } else {
+                        y
+                    };
+                    let frac = ((y1 - v) / (y1 - y0)).clamp(0.0, 1.0);
+                    let point = r.y + (frac * f64::from(r.height - 1)).round() as u16;
+                    (self.opts.color(i), point.saturating_sub(1).max(r.y))
+                }
+                _ => {
+                    for row in r.y..r.bottom() {
+                        if buf[(col, row)].symbol() == " " {
+                            buf[(col, row)].set_symbol("┊").set_fg(Color::Yellow);
+                        }
+                    }
+                    (Color::Yellow, r.y)
+                }
+            };
+            buf[(col, row)]
+                .set_symbol("▼")
+                .set_fg(color)
+                .set_style(Style::default().add_modifier(Modifier::BOLD));
+            placed.push((col, row, color, m));
+        }
+        if placed.len() > 12 {
+            return;
+        }
+        let mut taken: Vec<(u16, u16, u16)> = placed.iter().map(|p| (p.1, p.0, p.0)).collect();
+        for &(col, row, color, m) in &placed {
+            let w = unicode_width::UnicodeWidthStr::width(m.label.as_str()) as u16;
+            let fits = |x: u16| {
+                !taken
+                    .iter()
+                    .any(|&(tr, a, b)| tr == row && x <= b && a <= x + w)
+            };
+            let right = (col + 2 + w <= r.right())
+                .then_some(col + 2)
+                .filter(|&x| fits(x));
+            let left = (col > r.x + w).then(|| col - w - 1).filter(|&x| fits(x));
+            let Some(x) = right.or(left) else {
+                continue;
+            };
+            buf.set_stringn(x, row, &m.label, w as usize, Style::default().fg(color));
+            taken.push((row, x, x + w));
         }
     }
 
@@ -1356,6 +1453,25 @@ impl<'a> ChartWidget<'a> {
                     Span::raw(text),
                 ]));
             }
+        }
+        // Markers under the cursor.
+        let col = plot.col_of(x);
+        for m in self
+            .opts
+            .marks
+            .iter()
+            .filter(|m| m.x >= plot.x0 && m.x <= plot.x1 && plot.col_of(m.x).abs_diff(col) <= 1)
+            .filter(|m| {
+                m.series
+                    .as_ref()
+                    .is_none_or(|n| series.iter().any(|(_, s)| &s.name == n))
+            })
+            .take(4)
+        {
+            lines.push(Line::styled(
+                format!("▼ {}", m.label),
+                Style::default().fg(Color::Yellow),
+            ));
         }
         let w = lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16 + 2;
         let h = lines.len() as u16;
@@ -1902,6 +2018,10 @@ pub fn pane_view(ds: &Dataset, opts: &ChartOpts, pane: &panes::Pane) -> (Dataset
             .collect()
     };
     sub.palette = picked.iter().map(|&i| opts.color(i)).collect();
+    if !pane.series.is_empty() {
+        sub.marks
+            .retain(|m| m.series.as_ref().is_none_or(|n| pane.series.contains(n)));
+    }
     if sub.palette.is_empty() {
         sub.palette = opts.palette.clone();
     }

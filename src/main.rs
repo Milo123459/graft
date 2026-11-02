@@ -6,6 +6,7 @@ mod data;
 mod explain;
 mod export;
 mod interactive;
+mod marks;
 mod notify;
 mod parse;
 mod profile;
@@ -254,6 +255,21 @@ fn run_once(
         );
         return Ok(ExitCode::FAILURE);
     }
+    // Markers from --mark and the script's mark_when().
+    let rules: Vec<marks::MarkRule> = cli
+        .mark
+        .iter()
+        .filter_map(|m| marks::MarkRule::parse(m).ok())
+        .chain(session.script.take_mark_rules())
+        .collect();
+    let (placed, errors) = marks::evaluate(&session.script, &rules, &ds);
+    for e in errors {
+        eprintln!("graft: {e}");
+    }
+    let opts = &ChartOpts {
+        marks: placed,
+        ..opts.clone()
+    };
 
     let mut out = std::io::stdout().lock();
     if !cli.no_chart {
@@ -291,6 +307,12 @@ fn run_once(
             ..report.clone()
         };
         out.write_all(stats::report(&ds, &report)?.as_bytes())?;
+        if cli.stats_format == cli::StatsFormat::Text && !opts.marks.is_empty() {
+            writeln!(out, "\nmarkers:")?;
+            for m in &opts.marks {
+                writeln!(out, "  {}  {}", ds.fmt_x_full(m.x), m.label)?;
+            }
+        }
     }
     out.flush()?;
     for path in &cli.export {

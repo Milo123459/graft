@@ -171,6 +171,28 @@ type passwords for you: use key login (`ssh-copy-id HOST`) or `ssh-add`; if it
 can't log in, it says how to fix it. Remote charts show up in your recent list
 as `HOST: …`.
 
+### Markers
+
+Put a ▼ on the chart wherever something happens — a condition checked at every
+point of every series:
+
+```sh
+# reclaimable space dropped by more than 1 GB between two samples
+graft ~/reclaimable.log -F '{time} node1: {node1} node2: {node2}' \
+  --mark 'delta < -1GB => dropped {delta}'
+# only node2, and big percentage jumps
+--mark 'name == "node2" && pct < -0.5 => {name} {pct}'
+--mark 'value > 90% => hot'                     # e.g. on the cpu preset
+```
+
+Variables: `value`, `prev` (the point before), `delta` (value − prev), `pct`
+(that as a % of prev), `rate` (delta per second), `time`, `i`, `name`. Unit
+literals work. The label after `=>` can use `{name} {value} {prev} {delta}
+{pct} {time}` (default `{name} {delta}`). Markers show in the cursor readout,
+and `--stats` lists them. In a `--script` file or the console:
+`mark_when("delta < -1GB", "dropped {delta}")`; `mark("deploy")` drops one by
+hand at the cursor (or the newest data); `clear_marks()` removes them all.
+
 ### Counting log lines
 
 Some logs don't have numbers worth charting, but *how often* something happens
