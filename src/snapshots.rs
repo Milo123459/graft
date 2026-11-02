@@ -448,6 +448,8 @@ fn write_custom_snapshot() {
         .chain(args.lines().map(String::from))
         .collect();
     let c = <Cli as clap::Parser>::parse_from(&args);
+    let args = crate::sources::promote(&c, &args).unwrap().unwrap_or(args);
+    let c = <Cli as clap::Parser>::parse_from(&args);
     let spec = crate::setup::source_spec(&c, true).unwrap();
     let setup = crate::setup::build(c, spec.clone(), false).unwrap();
     let mut app = App::new(setup, Live::new(spec));

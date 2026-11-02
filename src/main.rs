@@ -245,9 +245,39 @@ fn run_once(
             Event::Eof => break,
         }
     }
-    let mut full = session.full_dataset();
+    let mut full = session.base_dataset();
+    if let Some(name) = &cli.as_name {
+        sources::rename(name, &mut full);
+    }
+    // --merge sources: read each to the end and add its series.
+    let mut merged: Vec<String> = Vec::new();
+    for spec in &cli.merge {
+        let m = sources::Merge::parse(spec)?;
+        let mut sub = sources::Sub::open_merge(&m, false);
+        sub.load_to_end(&transform::Timeframe::default());
+        if let Some(e) = &sub.view.error {
+            eprintln!("graft: {}: {e}", m.name);
+        }
+        let mut d = sub.merged();
+        if full.series.is_empty() {
+            full.x_kind = d.x_kind;
+        }
+        merged.extend(d.series.iter().map(|s| s.name.clone()));
+        full.series.append(&mut d.series);
+    }
+    session.add_custom_lines(&mut full);
+    for e in session.line_errors.borrow().iter() {
+        eprintln!("graft: {e}");
+    }
     timeframe.apply(&mut full);
-    let ds = session.select(&full);
+    let mut ds = session.select(&full);
+    for name in merged {
+        if !ds.series.iter().any(|s| s.name == name)
+            && let Some(s) = full.get(&name)
+        {
+            ds.series.push(s.clone());
+        }
+    }
     if ds.is_empty() {
         eprintln!(
             "graft: no data parsed from {} ({} lines read); try --explain to see how lines are parsed",

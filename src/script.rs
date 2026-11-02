@@ -74,6 +74,11 @@ pub enum Action {
     ClearMarks,
     Undo,
     Redo,
+    /// Add (or replace) a merged source: `name = args…` or a profile name.
+    Merge(String),
+    Unmerge(String),
+    /// Load a Rhai script file while running.
+    Load(String),
     /// The chart title.
     Title(String),
     /// The unit for values that don't carry one (`USD`, `ms`, `%`…); "" for none.
@@ -155,7 +160,7 @@ pub struct ScriptState {
 pub struct ScriptHost {
     engine: Engine,
     /// The user's --script (empty if none).
-    ast: AST,
+    ast: RefCell<AST>,
     state: Rc<RefCell<ScriptState>>,
     binary: bool,
 }
@@ -290,14 +295,36 @@ impl ScriptHost {
         };
         Ok(Self {
             engine,
-            ast,
+            ast: RefCell::new(ast),
             state,
             binary,
         })
     }
 
+    /// Load another script while running: its functions join the ones already
+    /// loaded, and its top-level code runs (key bindings, `mark_when` rules…).
+    pub fn load(&self, path: &Path) -> Result<usize> {
+        let src = std::fs::read_to_string(path)
+            .with_context(|| format!("reading script {}", path.display()))?;
+        let ast = self
+            .engine
+            .compile(preprocess(&src, self.binary))
+            .map_err(|e| anyhow!("{}: {e}", path.display()))?;
+        // Named functions (closures are compiled to anonymous ones).
+        let functions = ast
+            .iter_functions()
+            .filter(|f| !f.name.starts_with("anon$"))
+            .count();
+        let merged = self.ast.borrow().merge(&ast);
+        self.engine
+            .run_ast(&merged.clone_functions_only().merge(&ast))
+            .map_err(|e| anyhow!("{}: {e}", path.display()))?;
+        *self.ast.borrow_mut() = merged.clone_functions_only();
+        Ok(functions)
+    }
+
     pub fn has_fn(&self, name: &str) -> bool {
-        self.ast.iter_functions().any(|f| f.name == name)
+        self.ast.borrow().iter_functions().any(|f| f.name == name)
     }
 
     /// Replace the data the API functions see.
@@ -342,7 +369,7 @@ impl ScriptHost {
             .engine
             .compile(preprocess(src, self.binary))
             .map_err(|e| anyhow!("{e}"))?;
-        Ok(self.ast.clone_functions_only().merge(&ast))
+        Ok(self.ast.borrow().clone_functions_only().merge(&ast))
     }
 
     /// Evaluate a compiled expression with the given variables, expecting a number.
@@ -395,7 +422,7 @@ impl ScriptHost {
             .call_fn_with_options(
                 opts,
                 &mut Scope::new(),
-                &self.ast,
+                &self.ast.borrow(),
                 "parse",
                 (line.to_string(),),
             )
@@ -562,6 +589,33 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
             return Err("sma(values, n): n must be at least 1".into());
         }
         Ok(to_array(crate::lines::sma(&floats(&a), n as usize)))
+    });
+    let st = state.clone();
+    engine.register_fn("mean_of", move |names: Array| -> FnResult<Array> {
+        // The average of several series, on the first one's times (each where it has data).
+        let names: Vec<String> = names.iter().map(|d| d.to_string()).collect();
+        let first = names
+            .first()
+            .ok_or("mean_of([\"a\", \"b\"]) needs at least one series")?;
+        let base = points(&st, first)?.points;
+        let others: Vec<Vec<(f64, f64)>> = names
+            .iter()
+            .map(|n| points(&st, n).map(|p| p.points))
+            .collect::<Result<_, _>>()?;
+        Ok(base
+            .iter()
+            .map(|&(x, _)| {
+                let vals: Vec<f64> = others
+                    .iter()
+                    .filter_map(|p| crate::render::interpolate(p, x))
+                    .collect();
+                if vals.is_empty() {
+                    Dynamic::UNIT
+                } else {
+                    Dynamic::from_float(vals.iter().sum::<f64>() / vals.len() as f64)
+                }
+            })
+            .collect())
     });
     let st = state.clone();
     engine.register_fn(
@@ -833,6 +887,18 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
     });
     let st = state.clone();
     engine.register_fn("clear_marks", move || push(&st, Action::ClearMarks));
+    let st = state.clone();
+    engine.register_fn("merge", move |spec: &str| {
+        push(&st, Action::Merge(spec.into()))
+    });
+    let st = state.clone();
+    engine.register_fn("unmerge", move |name: &str| {
+        push(&st, Action::Unmerge(name.into()))
+    });
+    let st = state.clone();
+    engine.register_fn("load", move |path: &str| {
+        push(&st, Action::Load(path.into()))
+    });
     let st = state.clone();
     engine.register_fn("title", move |t: &str| push(&st, Action::Title(t.into())));
     let st = state.clone();

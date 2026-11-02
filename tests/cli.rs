@@ -528,3 +528,42 @@ fn custom_lines_written_in_rhai() {
     assert!(get("gap").ends_with(" 29"), "{out}");
     assert!((last("gap") - (415.7e9 - 58.8e9)).abs() < 1e6, "{out}");
 }
+
+#[test]
+fn merge_sources_into_one_chart() {
+    let dir = std::env::temp_dir().join(format!("graft-merge-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (a, b) = (dir.join("a.log"), dir.join("b.log"));
+    std::fs::write(&a, "2026-11-02 10:00:00 price=100\n2026-11-02 10:01:00 price=102\n2026-11-02 10:02:00 price=104\n").unwrap();
+    std::fs::write(
+        &b,
+        "2026-11-02 10:00:00 px=110\n2026-11-02 10:01:00 px=112\n2026-11-02 10:02:00 px=108\n",
+    )
+    .unwrap();
+    let spec = |name: &str, p: &std::path::Path| format!("{name} = {} --kv -u USD", p.display());
+    let o = graft(&[
+        "--merge",
+        &spec("coinbase", &a),
+        "--merge",
+        &spec("hyperliquid", &b),
+        "--line",
+        "eth = mean_of([\"coinbase\", \"hyperliquid\"])",
+        "--mark",
+        "name == \"eth\" && value < prev => dip",
+        "--no-chart",
+        "--stats",
+        "--stats-template",
+        "{name} {last} {n}",
+    ]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let out = stdout(&o);
+    assert!(
+        out.contains("coinbase $104.00 3"),
+        "{out}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(out.contains("hyperliquid $108.00 3"), "{out}");
+    assert!(out.contains("eth $106.00 3"), "{out}");
+    let bad = graft(&["--merge", "x = -c 'echo 1'"]);
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("say how to read it"));
+}

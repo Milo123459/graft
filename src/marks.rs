@@ -71,6 +71,19 @@ fn evaluate_rule(
     out: &mut Vec<Mark>,
 ) -> Result<()> {
     let ast = host.compile_expr(&rule.expr)?;
+    // Every series is also a variable: its value at this point (`ema30`) and at the
+    // previous one (`ema30_prev`), so rules can compare series — e.g. crossings.
+    let named: Vec<(String, &[(f64, f64)])> = ds
+        .series
+        .iter()
+        .map(|s| (crate::script::ident(&s.name), s.points.as_slice()))
+        .filter(|(id, _)| {
+            !matches!(
+                id.as_str(),
+                "value" | "prev" | "delta" | "pct" | "rate" | "x" | "time" | "i" | "name"
+            )
+        })
+        .collect();
     let mut placed = 0;
     for s in &ds.series {
         for (i, &(x, value)) in s.points.iter().enumerate() {
@@ -92,6 +105,14 @@ fn evaluate_rule(
             scope.push("time", x);
             scope.push("i", i as i64);
             scope.push("name", s.name.clone());
+            scope.push("prev_time", px);
+            for (id, pts) in &named {
+                let at = |x: f64| {
+                    crate::render::interpolate(pts, x).map_or(Dynamic::UNIT, Dynamic::from_float)
+                };
+                scope.push_dynamic(id.as_str(), at(x));
+                scope.push_dynamic(format!("{id}_prev"), at(px));
+            }
             let hit: Dynamic = host
                 .eval_ast_with_scope(&mut scope, &ast)
                 .with_context(|| format!("at {} point {i}", s.name))?;
@@ -185,5 +206,30 @@ mod tests {
         let (_, errors) = evaluate(&host, &[MarkRule::parse("value").unwrap()], &ds);
         assert!(errors[0].contains("expected true/false"), "{errors:?}");
         assert!(MarkRule::parse(" => x").is_err());
+        // Other series by name, now and at the previous point: crossings.
+        let crossing = Dataset {
+            x_kind: XKind::Time,
+            series: vec![
+                Series {
+                    name: "price".into(),
+                    unit: Unit::default(),
+                    points: vec![(0.0, 9.0), (1.0, 11.0), (2.0, 12.0), (3.0, 8.0)],
+                },
+                Series {
+                    name: "ema30".into(),
+                    unit: Unit::default(),
+                    points: vec![(0.0, 10.0), (1.0, 10.0), (2.0, 10.0), (3.0, 10.0)],
+                },
+            ],
+        };
+        let up = MarkRule::parse("name == \"price\" && prev < ema30_prev && value >= ema30 => up")
+            .unwrap();
+        let down =
+            MarkRule::parse("name == \"price\" && prev > ema30_prev && value <= ema30 => down")
+                .unwrap();
+        let (marks, errors) = evaluate(&host, &[up, down], &crossing);
+        assert!(errors.is_empty(), "{errors:?}");
+        let got: Vec<_> = marks.iter().map(|m| (m.x, m.label.as_str())).collect();
+        assert_eq!(got, [(1.0, "up"), (3.0, "down")]);
     }
 }

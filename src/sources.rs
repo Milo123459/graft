@@ -33,6 +33,124 @@ pub fn cli_for(name: &str) -> Result<Cli> {
         .with_context(|| format!("source '{name}'"))
 }
 
+/// `--merge`: another source whose series join the chart, named after it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Merge {
+    pub name: String,
+    /// The source's arguments (from a profile, or given inline).
+    pub args: Vec<String>,
+    pub spec: String,
+}
+
+impl Merge {
+    /// `NAME` (a profile/preset/recent chart), `NAME = PROFILE`, or `NAME = ARGS…`
+    /// with the source's own arguments inline: `binance = -c "curl …" --regex "…"`.
+    pub fn parse(spec: &str) -> Result<Merge> {
+        let (name, rhs) = match spec.split_once('=') {
+            Some((n, r)) if !n.trim().is_empty() && !n.trim().contains(char::is_whitespace) => {
+                (n.trim(), r.trim())
+            }
+            _ => (spec.trim(), spec.trim()),
+        };
+        if name.is_empty() {
+            anyhow::bail!("--merge: give a name, e.g. --merge 'binance = -c \"curl …\" --json'");
+        }
+        let args = if rhs.starts_with('-') || rhs.contains(char::is_whitespace) {
+            split_args(rhs).with_context(|| format!("--merge '{spec}'"))?
+        } else {
+            args_for(rhs).with_context(|| format!("--merge '{spec}'"))?
+        };
+        let cli = <Cli as clap::Parser>::try_parse_from(
+            std::iter::once("graft".to_string()).chain(args.iter().cloned()),
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "--merge '{spec}': {}",
+                e.to_string().lines().next().unwrap_or("")
+            )
+        })?;
+        if cli.cmd.is_none() && cli.input.is_none() {
+            anyhow::bail!("--merge '{spec}': no command or file to read");
+        }
+        if !cli.has_parser() {
+            anyhow::bail!("--merge '{spec}': say how to read it (--format, --regex, --json…)");
+        }
+        Ok(Merge {
+            name: name.to_string(),
+            args,
+            spec: spec.trim().to_string(),
+        })
+    }
+
+    pub fn cli(&self) -> Cli {
+        <Cli as clap::Parser>::parse_from(
+            std::iter::once("graft".to_string()).chain(self.args.iter().cloned()),
+        )
+    }
+}
+
+/// Split a command line like a shell would: spaces separate, '…' and "…" quote,
+/// backslash escapes (outside single quotes).
+pub fn split_args(s: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut has = false;
+    let mut chars = s.chars();
+    let mut quote: Option<char> = None;
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (Some('\''), c) => cur.push(c),
+            // In double quotes a backslash only escapes " \\ $ ` (like a shell).
+            (Some('"'), '\\') => match chars.next() {
+                Some(n @ ('"' | '\\' | '$' | '`')) => cur.push(n),
+                Some(n) => {
+                    cur.push('\\');
+                    cur.push(n);
+                }
+                None => cur.push('\\'),
+            },
+            (None, '\\') => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+                has = true;
+            }
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                has = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if has || !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                    has = false;
+                }
+            }
+            (_, c) => cur.push(c),
+        }
+    }
+    if quote.is_some() {
+        anyhow::bail!("unclosed quote");
+    }
+    if has || !cur.is_empty() {
+        out.push(cur);
+    }
+    Ok(out)
+}
+
+/// Name a source's series after it: one series takes the name itself, several become
+/// `name.series`.
+pub fn rename(name: &str, ds: &mut Dataset) {
+    let single = ds.series.len() == 1;
+    for s in &mut ds.series {
+        s.name = if single {
+            name.to_string()
+        } else {
+            format!("{name}.{}", s.name)
+        };
+    }
+}
+
 /// A dashboard of panes that all have their own `source=` and no main source: the
 /// first such pane's source becomes the main one (so recents, profiles and the
 /// builder work as usual). `args` includes the program name; returns the new
@@ -40,6 +158,26 @@ pub fn cli_for(name: &str) -> Result<Cli> {
 pub fn promote(cli: &Cli, args: &[String]) -> Result<Option<Vec<String>>> {
     if cli.cmd.is_some() || cli.input.is_some() || cli.has_parser() {
         return Ok(None);
+    }
+    // Only --merge sources: the first is the main one, named after itself.
+    if let Some(first) = cli.merge.first() {
+        let m = Merge::parse(first)?;
+        let mut new = vec!["graft".to_string()];
+        new.extend(m.args.iter().cloned());
+        new.extend(["--as".to_string(), m.name.clone()]);
+        let mut rest = args.iter().skip(1).peekable();
+        let mut dropped = false;
+        while let Some(a) = rest.next() {
+            if !dropped && a == "--merge" && rest.peek().is_some_and(|v| *v == first) {
+                rest.next();
+                dropped = true;
+            } else if !dropped && a.strip_prefix("--merge=") == Some(first.as_str()) {
+                dropped = true;
+            } else {
+                new.push(a.clone());
+            }
+        }
+        return Ok(Some(new));
     }
     let Some((i, mut first)) = cli.pane.iter().enumerate().find_map(|(i, spec)| {
         crate::render::panes::Pane::parse(spec)
@@ -84,8 +222,31 @@ impl Sub {
         }
     }
 
+    /// Start a merged source.
+    pub fn open_merge(m: &Merge, interactive: bool) -> Self {
+        let cli = m.cli();
+        match Self::start(&m.name, cli, interactive) {
+            Ok(s) => s,
+            Err(e) => Self::failed(&m.name, format!("{e:#}")),
+        }
+    }
+
+    /// Everything it has read, named after it (for merging into another chart).
+    pub fn merged(&self) -> Dataset {
+        let mut ds = self.session.full_dataset();
+        rename(&self.name, &mut ds);
+        ds
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.session.store.revision
+    }
+
     fn try_open(name: &str, interactive: bool) -> Result<Self> {
-        let cli = cli_for(name)?;
+        Self::start(name, cli_for(name)?, interactive)
+    }
+
+    fn start(name: &str, cli: Cli, interactive: bool) -> Result<Self> {
         let spec = crate::setup::source_spec(&cli, interactive)?;
         let setup = crate::setup::build(cli, spec.clone(), true)?;
         Ok(Self {
@@ -180,5 +341,56 @@ pub fn sync(subs: &mut Vec<Sub>, opts: &ChartOpts, interactive: bool) {
         if !subs.iter().any(|s| s.name == name) {
             subs.push(Sub::open(&name, interactive));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merges_and_argument_splitting() {
+        assert_eq!(
+            split_args(r#"-c "curl -s 'https://x/y?a=1'" --regex '"price":"(?P<v>[0-9.]+)"' a\ b"#)
+                .unwrap(),
+            [
+                "-c",
+                "curl -s 'https://x/y?a=1'",
+                "--regex",
+                r#""price":"(?P<v>[0-9.]+)""#,
+                "a b"
+            ]
+        );
+        assert!(split_args("'open").is_err());
+        assert_eq!(
+            split_args(r#"--regex "amount\W+(\d+)\"x""#).unwrap(),
+            ["--regex", r#"amount\W+(\d+)"x"#]
+        );
+        let m = Merge::parse(
+            r#"binance = -c "curl -s https://api.binance.com" --regex '"price":"(?P<v>[0-9.]+)"'"#,
+        )
+        .unwrap();
+        assert_eq!(m.name, "binance");
+        assert_eq!(
+            m.cli().cmd.as_deref(),
+            Some("curl -s https://api.binance.com")
+        );
+        // A preset by name.
+        assert_eq!(
+            Merge::parse("load").unwrap().cli().cmd.as_deref(),
+            Some("cat /proc/loadavg")
+        );
+        assert!(
+            Merge::parse("x = -c 'echo 1'")
+                .unwrap_err()
+                .to_string()
+                .contains("say how to read it")
+        );
+        let mut ds = Dataset {
+            x_kind: crate::data::XKind::Time,
+            series: vec![crate::data::Series::new("v", Default::default())],
+        };
+        rename("binance", &mut ds);
+        assert_eq!(ds.series[0].name, "binance");
     }
 }

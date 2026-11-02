@@ -64,12 +64,23 @@ impl Session {
 
     /// Every series after derived series and transforms (what scripts and alerts see).
     pub fn full_dataset(&self) -> Dataset {
-        let mut ds = self.pipeline.apply(self.store.dataset(), &self.script);
+        let mut ds = self.base_dataset();
+        self.add_custom_lines(&mut ds);
+        ds
+    }
+
+    /// The parsed data after transforms, before custom lines (so other sources can be
+    /// merged in first).
+    pub fn base_dataset(&self) -> Dataset {
+        self.pipeline.apply(self.store.dataset(), &self.script)
+    }
+
+    /// Work out the custom lines (`--line`) on `ds`.
+    pub fn add_custom_lines(&self, ds: &mut Dataset) {
         if !self.custom.is_empty() {
             *self.line_errors.borrow_mut() =
-                crate::lines::apply(&self.script, &self.custom, &mut ds, self.binary);
+                crate::lines::apply(&self.script, &self.custom, ds, self.binary);
         }
-        ds
     }
 
     /// The series selected for display (custom lines always are).

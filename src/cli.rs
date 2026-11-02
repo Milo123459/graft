@@ -51,6 +51,18 @@ pub struct Cli {
     )]
     pub cmd: Option<String>,
 
+    /// Add another source's series to this chart (repeatable), named after it: a preset
+    /// or saved profile (`--merge coinbase`), or inline with its own arguments:
+    /// `--merge 'binance = -c "curl -s …" --regex "…"'`. With only --merge, the first
+    /// becomes the main source. Custom lines (--line) can combine them.
+    #[arg(long, value_name = "NAME[ = ARGS]", help_heading = "Input")]
+    pub merge: Vec<String>,
+
+    /// Name this source's series after NAME (several become NAME.series), like a
+    /// --merge source.
+    #[arg(long = "as", value_name = "NAME", help_heading = "Input")]
+    pub as_name: Option<String>,
+
     /// Run --cmd on another machine (or read FILE there): `--ssh pi@raspberrypi`, or
     /// a host from ~/.ssh/config. Needs key/agent login (no password prompts). Presets
     /// work too: `graft -p cpu --ssh pi`.
@@ -487,6 +499,10 @@ impl Cli {
         };
         opt("--cmd", self.cmd.clone());
         opt("--ssh", self.ssh.clone());
+        opt("--as", self.as_name.clone());
+        for m in &self.merge {
+            opt("--merge", Some(m.clone()));
+        }
         opt(
             "--every",
             (self.every != d.every).then(|| fmt_secs(self.every.as_secs_f64())),

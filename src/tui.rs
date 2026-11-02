@@ -101,7 +101,7 @@ const HELP: &[(&str, &str)] = &[
     ),
     ("— other keys —", ""),
     ("1-9 / a", "show or hide a series / show all"),
-    ("t m y", "chart type, marker, log scale"),
+    ("t b y", "chart type, marker style, log scale"),
     ("[ ]", "narrower / wider timeframe"),
     ("G", "target lines on/off"),
     (
@@ -112,7 +112,7 @@ const HELP: &[(&str, &str)] = &[
         "e / space",
         "export to SVG / pause the chart (data keeps being read)",
     ),
-    ("M", "mouse on/off (off = select text in your terminal)"),
+    ("m", "mouse on/off (off = select text in your terminal)"),
     (":", "Rhai console, e.g. :slope(\"node1\", \"1d\")"),
     ("q", "quit (Esc only clears a measurement or the cursor)"),
 ];
@@ -231,6 +231,14 @@ const CONSOLE_HELP: &[(&str, &str)] = &[
     (
         "title(\"ETH\")  unit(\"USD\")",
         "the chart's title / the unit for plain numbers",
+    ),
+    (
+        "load(\"indicators.rhai\")",
+        "load a script now: use its functions in add_line, mark_when…",
+    ),
+    (
+        "merge(\"cb = -c '…' --json\")",
+        "add another source's series (unmerge(\"cb\"))",
     ),
     (
         "add_line(\"ema30\", \"ema(values(\\\"ETH\\\"), 30)\")",
@@ -538,6 +546,8 @@ pub struct App {
     stepped: bool,
     /// Custom line errors already reported.
     shown_line_errors: Vec<String>,
+    /// `--merge` sources, running.
+    merge_subs: Vec<crate::sources::Sub>,
     /// The source picker for the focused pane: (label, source name).
     source_menu: Option<(Vec<SourceChoice>, usize)>,
     /// Where the chart area was last drawn (for pane taps and border drags).
@@ -617,6 +627,7 @@ impl App {
             panes_before_side_by_side: None,
             stepped: false,
             shown_line_errors: Vec::new(),
+            merge_subs: Vec::new(),
             sub_views: Vec::new(),
             source_menu: None,
             chart_rect: std::cell::Cell::new(Rect::default()),
@@ -625,6 +636,7 @@ impl App {
             timeframe,
             presets: Vec::new(),
         };
+        app.start_merges();
         app.mark_rules = app
             .cli
             .mark
@@ -702,6 +714,9 @@ impl App {
         if let Some(e) = errors.into_iter().last() {
             self.say(e, true);
         }
+        for m in &mut self.merge_subs {
+            m.pump(Duration::from_millis(10));
+        }
         self.rebuild(false);
         self.tick_sources(false);
     }
@@ -725,7 +740,12 @@ impl App {
     }
 
     fn rebuild(&mut self, force: bool) {
-        let rev = self.session.store.revision;
+        let rev = self
+            .merge_subs
+            .iter()
+            .fold(self.session.store.revision, |r, m| {
+                r.wrapping_add(m.revision())
+            });
         if !force {
             // Throttle rebuilds while data is streaming in.
             let due = self.live.eof || self.last_build.elapsed() > Duration::from_millis(150);
@@ -734,11 +754,34 @@ impl App {
             }
         }
         let old_max = self.ds.x_range().map(|r| r.1);
-        self.full = self.session.full_dataset();
+        self.full = self.session.base_dataset();
         self.apply_unit();
+        // Merged sources join in, named after themselves; then custom lines, which can
+        // combine them.
+        if let Some(name) = &self.cli.as_name {
+            crate::sources::rename(name, &mut self.full);
+        }
+        for m in &self.merge_subs {
+            let mut merged = m.merged();
+            if self.full.series.is_empty() {
+                self.full.x_kind = merged.x_kind;
+            }
+            self.full.series.append(&mut merged.series);
+        }
+        self.session.add_custom_lines(&mut self.full);
         self.presets = timeframe_presets(&self.full);
         self.timeframe.apply(&mut self.full);
         self.ds = self.session.select(&self.full);
+        for m in &self.merge_subs {
+            let prefix = format!("{}.", m.name);
+            for s in &self.full.series {
+                if (s.name == m.name || s.name.starts_with(&prefix))
+                    && !self.ds.series.iter().any(|d| d.name == s.name)
+                {
+                    self.ds.series.push(s.clone());
+                }
+            }
+        }
         self.built_rev = rev;
         self.last_build = Instant::now();
         // A view pinned to the newest data keeps following it.
@@ -2477,7 +2520,7 @@ impl App {
                     if self.mouse {
                         "mouse on"
                     } else {
-                        "mouse off: terminal text selection works; M turns it back on"
+                        "mouse off: terminal text selection works; m turns it back on"
                     },
                     false,
                 );
@@ -2615,6 +2658,53 @@ impl App {
             Action::Svg(path) => self.export_view(path),
             Action::Pane(a) => self.apply_pane_action(a),
             Action::Copy(text) => self.copy(text),
+            Action::Merge(spec) => match crate::sources::Merge::parse(&spec) {
+                Ok(m) => {
+                    self.cli.merge.retain(|s| {
+                        crate::sources::Merge::parse(s).map_or(true, |o| o.name != m.name)
+                    });
+                    self.cli.merge.push(m.spec);
+                    self.start_merges();
+                    self.rebuild(true);
+                }
+                Err(e) => self.say(format!("{e:#}"), true),
+            },
+            Action::Unmerge(name) => {
+                let before = self.cli.merge.len();
+                self.cli
+                    .merge
+                    .retain(|s| crate::sources::Merge::parse(s).map_or(true, |o| o.name != name));
+                if self.cli.merge.len() == before {
+                    self.say(format!("unmerge: nothing merged as '{name}'"), true);
+                }
+                self.start_merges();
+                self.rebuild(true);
+            }
+            Action::Load(path) => {
+                let p = std::path::PathBuf::from(path.trim());
+                match self.session.script.load(&p) {
+                    Ok(n) => {
+                        // Saved with the view (the first script, if there's room).
+                        if self.cli.script.is_none() {
+                            self.cli.script = std::path::absolute(&p).ok();
+                        }
+                        self.binds.extend(
+                            self.session
+                                .script
+                                .binds()
+                                .into_iter()
+                                .filter_map(|(k, code)| Some((k.chars().next()?, code))),
+                        );
+                        self.update_marks();
+                        self.rebuild(true);
+                        self.say(
+                            format!("loaded {} ({n} functions): use them in add_line(…), mark_when(…)", p.display()),
+                            false,
+                        );
+                    }
+                    Err(e) => self.say(format!("load: {e:#}"), true),
+                }
+            }
             Action::Title(t) => {
                 self.opts.title = t.clone();
                 self.cli.title = (!t.is_empty()).then_some(t);
@@ -2778,6 +2868,19 @@ impl App {
         match (t, self.pending.take()) {
             (Transition::None, Some(p)) => p,
             (t, _) => t,
+        }
+    }
+
+    /// Start the `--merge` sources (again, after the list changed).
+    fn start_merges(&mut self) {
+        self.merge_subs.clear();
+        for spec in self.cli.merge.clone() {
+            match crate::sources::Merge::parse(&spec) {
+                Ok(m) => self
+                    .merge_subs
+                    .push(crate::sources::Sub::open_merge(&m, true)),
+                Err(e) => self.say(format!("{e:#}"), true),
+            }
         }
     }
 
@@ -3086,7 +3189,8 @@ impl App {
             }
 
             KeyCode::Char('t') => Cmd::Kind,
-            KeyCode::Char('m') => Cmd::Marker,
+            KeyCode::Char('m') => Cmd::Mouse,
+            KeyCode::Char('b') => Cmd::Marker,
             KeyCode::Char('y') => Cmd::Log,
             KeyCode::Char('x') => Cmd::Split,
             KeyCode::Char('s') => Cmd::Stats,
@@ -3723,14 +3827,14 @@ impl App {
             let hint = if self.mouse {
                 "tap to inspect · drag to measure · ? help"
             } else {
-                "? help  : console  q quit"
+                "mouse off · m turns it back on · ? help · q quit"
             };
             spans.push(Span::styled(format!("   {hint}"), dim));
         } else {
             let hint = if self.mouse {
                 "tap to inspect · drag to measure · ? help"
             } else {
-                "? help  : console  q quit"
+                "mouse off · m turns it back on · ? help · q quit"
             };
             spans.push(Span::styled(hint, dim));
         }
@@ -5126,6 +5230,44 @@ mod tests {
         // Undo brings the bad line back.
         key(&mut app, KeyCode::Char('u'));
         assert_eq!(app.current_cli().line.len(), 2);
+    }
+
+    #[test]
+    fn load_a_script_while_running_and_mouse_key() {
+        let mut app = app(&["graft", LOG, "-s", "node1"]);
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, r#"load("examples/indicators.rhai")"#);
+        key(&mut app, KeyCode::Enter);
+        assert!(
+            app.message.as_ref().unwrap().text.contains("3 functions"),
+            "{:?}",
+            app.message.as_ref().map(|m| &m.text)
+        );
+        key(&mut app, KeyCode::Char(':'));
+        type_str(
+            &mut app,
+            r#"add_line("upper", "band(values(\"node1\"), 5, 2.0)"); add_line("e", "my_ema(values(\"node1\"), 5)")"#,
+        );
+        key(&mut app, KeyCode::Enter);
+        assert!(
+            app.ds.series.iter().any(|s| s.name == "upper"),
+            "{:?}",
+            app.message.as_ref().map(|m| &m.text)
+        );
+        assert!(app.ds.series.iter().any(|s| s.name == "e"));
+        // The loaded script is kept in the command line.
+        assert!(
+            app.current_cli()
+                .script
+                .unwrap()
+                .ends_with("examples/indicators.rhai")
+        );
+        assert!(app.message.as_ref().is_none_or(|m| !m.error));
+        // m turns the mouse off, says how to get it back, and turns it on again.
+        assert_eq!(key(&mut app, KeyCode::Char('m')), Transition::Mouse(false));
+        app.message = None;
+        assert!(screen(&app).contains("m turns it back on"));
+        assert_eq!(key(&mut app, KeyCode::Char('m')), Transition::Mouse(true));
     }
 
     #[test]

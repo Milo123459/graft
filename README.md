@@ -195,11 +195,46 @@ graft … --script examples/indicators.rhai \
   --line 'upper = band(values("ETH"), 20, 2.0)' --line 'lower = band(values("ETH"), 20, -2.0)'
 ```
 
+Or load a script while the chart is running and use it straight away:
+
+```
+:load("examples/indicators.rhai")
+:add_line("upper", "band(values(\"eth\"), 20, 2.0)"); add_line("lower", "band(values(\"eth\"), 20, -2.0)")
+```
+
 A custom line is a series like any other (legend, readout, stats, markers,
 alerts). In the viewer, the lines menu (`T`) lists them: tap one to edit it,
 **✕** to delete, **+ custom line** to add; or `add_line("name", "expr")` and
 `remove_line("name")` in the console. Money: `-u USD` (or `$`, `EUR`, `GBP`)
 shows `$3,456.78`; `:unit("USD")` and `:title("ETH")` change it while running.
+
+### Combining sources (`--merge`)
+
+Several sources can share one chart: each `--merge` adds another source's
+series, named after it — a preset or saved profile (`--merge load`), or inline,
+with that source's own arguments after `NAME =`. With only `--merge`s, the
+first becomes the main source. Custom lines can then combine them, e.g. ETH
+from two exchanges, their average, and an EMA30 of it:
+
+```sh
+graft \
+  --merge 'coinbase = -c "curl -s https://api.coinbase.com/v2/prices/ETH-USD/spot" --regex "amount\W+(?P<p>[0-9.]+)" -n 1s -u USD' \
+  --merge "hyperliquid = -c 'curl -s --json {\\\"type\\\":\\\"allMids\\\"} https://api.hyperliquid.xyz/info' --regex '\\bETH\\W+(?P<p>[0-9.]+)' -n 1s -u USD" \
+  --line 'eth = mean_of(["coinbase", "hyperliquid"])' \
+  --line 'ema30 = ema(values("eth"), 30)' \
+  --mark 'name == "eth" && prev < ema30_prev && value >= ema30 => crossed above EMA30' \
+  --mark 'name == "eth" && prev > ema30_prev && value <= ema30 => crossed below EMA30' \
+  --title ETH --last 15m
+```
+
+Sources sample at slightly different moments, so `mean_of([...])` and
+`values_at(name, xs)` line other series up on the first one's times. In the
+viewer: `:merge("binance = -c '…' --regex '…'")` adds one, `:unmerge("binance")`
+removes it.
+
+In marker rules every series is also a variable — its value at that point
+(`ema30`) and at the point before (`ema30_prev`) — which is how the crossings
+above work.
 
 ### Markers
 
@@ -421,7 +456,7 @@ mouse capture off, so your terminal's own text selection works.
 | `Home` / `End` | cursor to first / last point |
 | `v` … `v` | measure a range from the keyboard |
 | `1`–`9` / `a` | toggle a series / show all |
-| `t` / `m` / `y` / `x` | chart type / marker / log scale / split panels |
+| `t` / `b` / `y` / `x` | chart type / marker style / log scale / split panels |
 | `T` | lines menu (inside: `l` `a` `m` `p` toggle, `+` `-` window, Esc closes) |
 | `D` | side by side: live data next to its trends |
 | `w` | pane panel (inside: `v` / `s` split right / down, `x` close, arrows pick, shift+arrows move, ctrl+arrows or `< > + -` resize, `=` even, `t` chart type, `T` lines, `1`–`9` series, `o` one chart) |
@@ -434,7 +469,7 @@ mouse capture off, so your terminal's own text selection works.
 | `s` | stats panel |
 | `space` | pause the chart: the source keeps running and its data is kept, so resuming jumps to the latest |
 | `e` | export the current view to SVG |
-| `M` | mouse capture on/off |
+| `m` | mouse capture on/off (off: your terminal can select text; the status line says how to turn it back on) |
 | `:` | Rhai console |
 | `q` | quit |
 
