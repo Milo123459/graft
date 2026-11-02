@@ -820,7 +820,7 @@ impl App {
         if self.opts.panes.is_none() && self.subs.is_empty() {
             return;
         }
-        crate::sources::sync(&mut self.subs, &self.opts, true);
+        crate::sources::sync(&mut self.subs, &self.opts, true, self.cli.ssh.as_deref());
         let mut changed = force || self.sub_views.len() != self.subs.len();
         for sub in &mut self.subs {
             if sub.pump(Duration::from_millis(10)) && (!self.paused || force) {
@@ -2178,7 +2178,7 @@ impl App {
                 let src = src.trim();
                 let src = (!src.is_empty() && src != "main").then(|| src.to_string());
                 if let Some(name) = &src
-                    && let Err(e) = crate::sources::cli_for(name)
+                    && let Err(e) = crate::sources::cli_for(name, self.cli.ssh.as_deref())
                 {
                     return self.say(format!("pane_source: {e:#}"), true);
                 }

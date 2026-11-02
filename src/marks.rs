@@ -61,9 +61,13 @@ impl MarkRule {
             None => (false, trimmed),
         };
         // A style after the label: `… => label | ▲ green`.
-        let (s, style) = match s.rsplit_once(" | ") {
-            Some((rule, style)) if s.contains("=>") => (rule, Some(style)),
-            _ => (s, None),
+        // (Only after `=>`: `a | b` in the condition is Rhai's "or".)
+        let (s, style) = match s.split_once("=>") {
+            Some((cond, label)) => match label.rsplit_once(" | ") {
+                Some((l, style)) => (&s[..cond.len() + 2 + l.len()], Some(style)),
+                None => (s, None),
+            },
+            None => (s, None),
         };
         let (mut symbol, mut color) = (None, None);
         for tok in style.unwrap_or("").split_whitespace() {
@@ -150,10 +154,21 @@ fn evaluate_rule(
         .filter(|(id, _)| {
             !matches!(
                 id.as_str(),
-                "value" | "prev" | "delta" | "pct" | "rate" | "x" | "time" | "i" | "name"
+                "value"
+                    | "prev"
+                    | "delta"
+                    | "pct"
+                    | "rate"
+                    | "x"
+                    | "time"
+                    | "prev_time"
+                    | "i"
+                    | "name"
             )
         })
         .collect();
+    // `x_prev` is x at the previous point — unless a series is itself called `x_prev`.
+    let idents: Vec<String> = named.iter().map(|(id, _)| id.clone()).collect();
     let mut placed = 0;
     for s in &ds.series {
         for (i, &(x, value)) in s.points.iter().enumerate() {
@@ -181,7 +196,10 @@ fn evaluate_rule(
                     crate::render::interpolate(pts, x).map_or(Dynamic::UNIT, Dynamic::from_float)
                 };
                 scope.push_dynamic(id.as_str(), at(x));
-                scope.push_dynamic(format!("{id}_prev"), at(px));
+                let prev_name = format!("{id}_prev");
+                if !idents.contains(&prev_name) {
+                    scope.push_dynamic(prev_name, at(px));
+                }
             }
             let hit: Dynamic = host
                 .eval_ast_with_scope(&mut scope, &ast)

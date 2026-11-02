@@ -55,7 +55,8 @@ fn command_for(target: &str, title: &str, message: &str) -> Option<Command> {
             let mut c = Command::new("curl");
             c.args(["-fsS", "-m", "10", "-H"])
                 .arg(format!("Title: {title}"))
-                .args(["-H", "Tags: chart_with_downwards_trend", "-d"])
+                // --data-raw: a message starting with @ is text, not a file to upload.
+                .args(["-H", "Tags: chart_with_downwards_trend", "--data-raw"])
                 .arg(message)
                 .arg(url);
             Some(c)
@@ -70,7 +71,7 @@ fn command_for(target: &str, title: &str, message: &str) -> Option<Command> {
                 "10",
                 "-H",
                 "Content-Type: application/json",
-                "-d",
+                "--data-raw",
             ])
             .arg(body)
             .arg(rest);
@@ -176,6 +177,7 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert_eq!(args.last().unwrap(), "https://ntfy.sh/disks");
+        assert!(args.contains(&"--data-raw".to_string()) && !args.contains(&"-d".to_string()));
         // cmd: targets get the alert in the environment.
         let dir = std::env::temp_dir().join(format!("graft-notify-{}", std::process::id()));
         let file = dir.with_extension("txt");

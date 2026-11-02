@@ -67,6 +67,12 @@ fn main() -> ExitCode {
 fn run() -> Result<ExitCode> {
     let args = profile::expand(std::env::args_os().collect())?;
     let cli = Cli::parse_from(&args);
+    // -p in a cluster of short flags (`-1p name`) isn't expanded: say so.
+    if let Some(name) = &cli.profile {
+        anyhow::bail!(
+            "give -p on its own: `-p {name}` (it can't be combined with other short flags)"
+        );
+    }
     let (args, cli) = promote_dashboard(args, cli)?;
 
     if let Some(shell) = cli.completions {
@@ -319,7 +325,7 @@ fn run_once(
         let views: Vec<render::SourceView> = sources::wanted(opts)
             .iter()
             .map(|name| {
-                let mut sub = sources::Sub::open(name, false);
+                let mut sub = sources::Sub::open(name, false, cli.ssh.as_deref());
                 sub.load_to_end(&timeframe);
                 sub.view
             })

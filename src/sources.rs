@@ -14,11 +14,22 @@ use crate::session::Session;
 use crate::transform::Timeframe;
 
 /// The arguments a source name stands for (without changing directory, unlike `-p @`).
-pub fn args_for(name: &str) -> Result<Vec<String>> {
+/// With `ssh`, it runs on that host (presets pick that machine's variant).
+pub fn args_for(name: &str, ssh: Option<&str>) -> Result<Vec<String>> {
     if let Some(recent) = crate::recent::find(name) {
-        return Ok(recent?.args);
+        let mut args = recent?.args;
+        if let Some(h) = ssh
+            && !args.iter().any(|a| a == "--ssh" || a.starts_with("--ssh="))
+        {
+            args.extend(["--ssh".to_string(), h.to_string()]);
+        }
+        return Ok(args);
     }
-    let expanded = crate::profile::expand(vec!["graft".into(), "-p".into(), name.into()])?;
+    let mut argv: Vec<std::ffi::OsString> = vec!["graft".into(), "-p".into(), name.into()];
+    if let Some(h) = ssh {
+        argv.extend(["--ssh".into(), h.into()]);
+    }
+    let expanded = crate::profile::expand(argv)?;
     Ok(expanded
         .into_iter()
         .skip(1)
@@ -27,8 +38,8 @@ pub fn args_for(name: &str) -> Result<Vec<String>> {
 }
 
 /// The command line a source runs, parsed.
-pub fn cli_for(name: &str) -> Result<Cli> {
-    let args = args_for(name)?;
+pub fn cli_for(name: &str, ssh: Option<&str>) -> Result<Cli> {
+    let args = args_for(name, ssh)?;
     <Cli as clap::Parser>::try_parse_from(std::iter::once("graft".to_string()).chain(args))
         .with_context(|| format!("source '{name}'"))
 }
@@ -58,7 +69,7 @@ impl Merge {
         let args = if rhs.starts_with('-') || rhs.contains(char::is_whitespace) {
             split_args(rhs).with_context(|| format!("--merge '{spec}'"))?
         } else {
-            args_for(rhs).with_context(|| format!("--merge '{spec}'"))?
+            args_for(rhs, None).with_context(|| format!("--merge '{spec}'"))?
         };
         let cli = <Cli as clap::Parser>::try_parse_from(
             std::iter::once("graft".to_string()).chain(args.iter().cloned()),
@@ -189,14 +200,24 @@ pub fn promote(cli: &Cli, args: &[String]) -> Result<Option<Vec<String>>> {
     };
     let source = first.source.take().expect("filtered");
     let mut new = vec!["graft".to_string()];
-    new.extend(args_for(&source)?);
+    new.extend(args_for(&source, None)?);
     // The rest of the command line, with that pane now showing the main data.
-    let spec = &cli.pane[i];
-    let mut replaced = false;
-    for a in args.iter().skip(1) {
-        if !replaced && a == spec {
-            new.push(first.to_spec());
-            replaced = true;
+    // (By position: the i-th --pane, written either `--pane SPEC` or `--pane=SPEC`.)
+    let mut seen = 0;
+    let mut rest = args.iter().skip(1);
+    while let Some(a) = rest.next() {
+        if a == "--pane" {
+            let value = rest.next().cloned().unwrap_or_default();
+            new.push(a.clone());
+            new.push(if seen == i { first.to_spec() } else { value });
+            seen += 1;
+        } else if a.starts_with("--pane=") {
+            new.push(if seen == i {
+                format!("--pane={}", first.to_spec())
+            } else {
+                a.clone()
+            });
+            seen += 1;
         } else {
             new.push(a.clone());
         }
@@ -215,8 +236,8 @@ pub struct Sub {
 
 impl Sub {
     /// Start a source (`interactive`: commands keep sampling).
-    pub fn open(name: &str, interactive: bool) -> Self {
-        match Self::try_open(name, interactive) {
+    pub fn open(name: &str, interactive: bool, ssh: Option<&str>) -> Self {
+        match Self::try_open(name, interactive, ssh) {
             Ok(s) => s,
             Err(e) => Self::failed(name, format!("{e:#}")),
         }
@@ -261,8 +282,8 @@ impl Sub {
         self.live.spec.is_live() && !self.live.eof
     }
 
-    fn try_open(name: &str, interactive: bool) -> Result<Self> {
-        Self::start(name, cli_for(name)?, interactive)
+    fn try_open(name: &str, interactive: bool, ssh: Option<&str>) -> Result<Self> {
+        Self::start(name, cli_for(name, ssh)?, interactive)
     }
 
     fn start(name: &str, cli: Cli, interactive: bool) -> Result<Self> {
@@ -353,12 +374,12 @@ pub fn wanted(opts: &ChartOpts) -> Vec<String> {
 }
 
 /// Keep `subs` in step with the panes: start new sources, stop unused ones.
-pub fn sync(subs: &mut Vec<Sub>, opts: &ChartOpts, interactive: bool) {
+pub fn sync(subs: &mut Vec<Sub>, opts: &ChartOpts, interactive: bool, ssh: Option<&str>) {
     let want = wanted(opts);
     subs.retain(|s| want.contains(&s.name));
     for name in want {
         if !subs.iter().any(|s| s.name == name) {
-            subs.push(Sub::open(&name, interactive));
+            subs.push(Sub::open(&name, interactive, ssh));
         }
     }
 }

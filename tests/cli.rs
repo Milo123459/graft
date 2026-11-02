@@ -602,3 +602,49 @@ fn review_fixes_for_parsing() {
         "a 1 1\nb 2 1\n"
     );
 }
+
+#[test]
+fn review_fixes_for_scripting() {
+    let out = |args: &[&str]| {
+        let o = graft(args);
+        (stdout(&o), String::from_utf8_lossy(&o.stderr).into_owned())
+    };
+    // A ' | ' in the condition is "or", not a style.
+    let (o, e) = out(&[
+        LOG,
+        "-F",
+        FMT,
+        "--no-chart",
+        "--stats",
+        "--mark",
+        "delta > 1GB | delta < -1.5GB => jump",
+    ]);
+    assert!(o.contains("jump") && e.is_empty(), "{o}{e}");
+    // Percent literals.
+    let (o, e) = out(&[
+        LOG,
+        "-F",
+        FMT,
+        "--no-chart",
+        "--stats",
+        "--mark",
+        "pct < -0.3% => fell",
+    ]);
+    assert!(o.contains("fell") && e.is_empty(), "{o}{e}");
+    // A line can't quietly replace a series of the same name.
+    let (_, e) = out(&[
+        LOG,
+        "-F",
+        FMT,
+        "--no-chart",
+        "--line",
+        "node1 = ema(values(\"node1\"), 3)",
+    ]);
+    assert!(e.contains("already a series called 'node1'"), "{e}");
+    // Host names can't be ssh options.
+    let (_, e) = out(&["--ssh=-oProxyCommand=x", "-c", "uptime", "--kv", "--once"]);
+    assert!(e.contains("isn't a host name"), "{e}");
+    // -p clustered with other flags is refused, not ignored.
+    let (_, e) = out(&["-1p", "load"]);
+    assert!(e.contains("give -p on its own"), "{e}");
+}

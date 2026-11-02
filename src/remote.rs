@@ -8,7 +8,14 @@ use std::process::Command;
 
 /// The `ssh` options graft uses: no prompts, a shared connection kept for two minutes.
 fn ssh_options() -> Vec<String> {
-    let control = std::env::temp_dir().join("graft-ssh-%C");
+    // The shared connection's socket: in a directory only this user can write to.
+    let control = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_dir())
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".ssh")))
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(std::env::temp_dir)
+        .join("graft-ssh-%C");
     [
         "-o",
         "BatchMode=yes",

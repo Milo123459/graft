@@ -178,10 +178,67 @@ pub struct ScriptHost {
 /// Turn a series name into a valid Rhai identifier (`cpu.user` → `cpu_user`).
 pub fn ident(name: &str) -> String {
     const RESERVED: &[&str] = &[
-        "if", "else", "let", "const", "fn", "in", "for", "while", "loop", "do", "until", "return",
-        "true", "false", "this", "switch", "import", "export", "as", "private", "break",
-        "continue", "throw", "try", "catch", "global", "Fn", "call", "curry", "type_of", "print",
-        "debug", "eval",
+        "if",
+        "else",
+        "let",
+        "const",
+        "fn",
+        "in",
+        "for",
+        "while",
+        "loop",
+        "do",
+        "until",
+        "return",
+        "true",
+        "false",
+        "this",
+        "switch",
+        "import",
+        "export",
+        "as",
+        "private",
+        "break",
+        "continue",
+        "throw",
+        "try",
+        "catch",
+        "global",
+        "Fn",
+        "call",
+        "curry",
+        "type_of",
+        "print",
+        "debug",
+        "eval",
+        // Reserved by Rhai for the future: also not usable as names.
+        "var",
+        "static",
+        "shared",
+        "goto",
+        "exit",
+        "match",
+        "case",
+        "public",
+        "protected",
+        "new",
+        "use",
+        "with",
+        "module",
+        "package",
+        "super",
+        "thread",
+        "spawn",
+        "go",
+        "await",
+        "async",
+        "sync",
+        "yield",
+        "default",
+        "void",
+        "null",
+        "nil",
+        "is",
     ];
     let mut s: String = name
         .chars()
@@ -206,7 +263,8 @@ static UNIT_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
         r"\b(?P<n>\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)",
         r"(?:\s?(?P<long>KiB|MiB|GiB|TiB|PiB|kB|KB|MB|GB|TB|PB|ms|us|ns|min|day|days|week|weeks)",
-        r"|(?P<short>[KMGTPBshdw]))\b"
+        r"|(?P<short>[KMGTPBshdw]))\b",
+        r"|\b(?P<pn>\d+(?:\.\d+)?)%(?P<pct>)"
     ))
     .expect("valid unit literal regex")
 });
@@ -218,10 +276,30 @@ pub fn preprocess(src: &str, binary: bool) -> String {
     let mut out = String::with_capacity(src.len());
     let mut rest = src.as_str();
     while !rest.is_empty() {
-        // Copy code up to the next string literal, rewriting it; then copy the literal.
-        let code_end = rest.find(['"', '`', '\'']).unwrap_or(rest.len());
+        // Copy code up to the next string literal or comment, rewriting it; then copy
+        // the literal or comment as it is (an apostrophe in `// we're` isn't a quote).
+        let code_end = rest
+            .char_indices()
+            .find(|&(i, c)| {
+                matches!(c, '"' | '`' | '\'')
+                    || rest[i..].starts_with("//")
+                    || rest[i..].starts_with("/*")
+            })
+            .map_or(rest.len(), |(i, _)| i);
         out.push_str(&rewrite_units(&rest[..code_end], binary));
         rest = &rest[code_end..];
+        if rest.starts_with("//") {
+            let end = rest.find('\n').unwrap_or(rest.len());
+            out.push_str(&rest[..end]);
+            rest = &rest[end..];
+            continue;
+        }
+        if rest.starts_with("/*") {
+            let end = rest.find("*/").map_or(rest.len(), |i| i + 2);
+            out.push_str(&rest[..end]);
+            rest = &rest[end..];
+            continue;
+        }
         if let Some(quote) = rest.chars().next() {
             let mut end = rest.len();
             let mut escaped = false;
@@ -260,6 +338,9 @@ fn quote_bind_code(src: &str) -> String {
                     i += 1;
                 }
             }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i = src[i..].find("*/").map_or(b.len(), |e| i + e + 2);
+            }
             b'b' if src[i..].starts_with("bind")
                 && (i == 0 || !is_ident(b[i - 1]))
                 && src[i + 4..].trim_start().starts_with('(') =>
@@ -281,7 +362,14 @@ fn quote_bind_code(src: &str) -> String {
                     let code = arg.strip_prefix("||").unwrap_or(arg).trim();
                     out.push_str(&src[copied..=comma]);
                     out.push_str(" \"");
-                    out.push_str(&code.replace('\\', "\\\\").replace('"', "\\\""));
+                    out.push_str(
+                        &code
+                            .replace('\\', "\\\\")
+                            .replace('"', "\\\"")
+                            .replace('\n', "\\n")
+                            .replace('\r', "\\r")
+                            .replace('\t', "\\t"),
+                    );
                     out.push('"');
                     copied = close;
                 }
@@ -338,6 +426,16 @@ fn scan_to(b: &[u8], mut i: usize, target: u8) -> Option<usize> {
 fn rewrite_units(code: &str, binary: bool) -> String {
     UNIT_LITERAL
         .replace_all(code, |c: &regex::Captures| {
+            // `90%` is a percentage — unless an operand follows (`10 % 3`, remainder).
+            if let Some(pn) = c.name("pn") {
+                let whole = c.get(0).expect("match");
+                let next = code[whole.end()..].trim_start().chars().next();
+                if next.is_some_and(|ch| ch.is_alphanumeric() || matches!(ch, '(' | '_' | '"')) {
+                    return whole.as_str().to_string();
+                }
+                let s = pn.as_str().to_string();
+                return if s.contains('.') { s } else { format!("{s}.0") };
+            }
             let n: f64 = c["n"].parse().unwrap_or(0.0);
             let unit = c
                 .name("long")
@@ -1168,6 +1266,29 @@ rebind("a", b)"#;
             host.take_actions().is_empty(),
             "binding doesn't run the code"
         );
+    }
+
+    #[test]
+    fn comments_percent_and_multiline_binds() {
+        // An apostrophe in a comment doesn't hide the code after it from unit rewriting.
+        assert_eq!(
+            preprocess("// we're over\nx > 5GB", false),
+            "// we're over\nx > 5000000000.0"
+        );
+        assert_eq!(
+            preprocess("/* it's */ x > 1KB", false),
+            "/* it's */ x > 1000.0"
+        );
+        // Percentages, but not the remainder operator.
+        assert_eq!(preprocess("value > 90%", false), "value > 90.0");
+        assert_eq!(preprocess("10 % 3 == 1", false), "10 % 3 == 1");
+        assert_eq!(preprocess("(90%)", false), "(90.0)");
+        // A bind() block over several lines.
+        let host = ScriptHost::new(None, false).unwrap();
+        let _ = host
+            .eval("bind(\"x\", {\n  hide(\"a\");\n  zoom(6h)\n})")
+            .unwrap();
+        assert_eq!(host.binds()[0].1, "{\n  hide(\"a\");\n  zoom(6h)\n}");
     }
 
     #[test]

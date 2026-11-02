@@ -66,7 +66,15 @@ pub fn apply(
     binary: bool,
 ) -> Vec<String> {
     let mut errors = Vec::new();
+    let sources: Vec<String> = ds.series.iter().map(|s| s.name.clone()).collect();
     for line in lines {
+        if sources.contains(&line.name) {
+            errors.push(format!(
+                "line {}: there's already a series called '{}' — give the line another name",
+                line.name, line.name
+            ));
+            continue;
+        }
         ds.series.retain(|s| s.name != line.name);
         match evaluate(host, line, ds, binary) {
             Ok(Some(s)) => ds.series.push(s),
@@ -130,10 +138,14 @@ fn base_series<'a>(line: &CustomLine, ds: &'a Dataset, result: &Dynamic) -> &'a 
         .try_cast::<rhai::Array>()
         .filter(|a| !a.first().is_some_and(|d| d.is_array()))
         .map(|a| a.len());
+    // Series the expression names first; others only if none of those fit.
+    let named = order.iter().filter(|o| o.0 < usize::MAX - ds.series.len());
     let pick = match len {
-        Some(n) => order
-            .iter()
+        Some(n) => named
+            .clone()
             .find(|o| o.2.points.len() == n)
+            .or_else(|| named.clone().find(|o| o.2.points.len() >= n))
+            .or_else(|| order.iter().find(|o| o.2.points.len() == n))
             .or_else(|| order.iter().find(|o| o.2.points.len() >= n)),
         None => None,
     };

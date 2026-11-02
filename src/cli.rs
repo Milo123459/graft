@@ -71,7 +71,7 @@ pub struct Cli {
     /// Run --cmd on another machine (or read FILE there): `--ssh pi@raspberrypi`, or
     /// a host from ~/.ssh/config. Needs key/agent login (no password prompts). Presets
     /// work too: `graft -p cpu --ssh pi`.
-    #[arg(long, value_name = "HOST", help_heading = "Input")]
+    #[arg(long, value_name = "HOST", value_parser = parse_host, help_heading = "Input")]
     pub ssh: Option<String>,
 
     /// Interval between --cmd runs.
@@ -514,8 +514,13 @@ impl Cli {
         let mut a: Vec<String> = Vec::new();
         let mut opt = |flag: &str, v: Option<String>| {
             if let Some(v) = v {
-                a.push(flag.into());
-                a.push(v);
+                // A value starting with '-' would read as a flag: keep it attached.
+                if v.starts_with('-') {
+                    a.push(format!("{flag}={v}"));
+                } else {
+                    a.push(flag.into());
+                    a.push(v);
+                }
             }
         };
         opt("--cmd", self.cmd.clone());
@@ -734,6 +739,16 @@ impl Cli {
     /// The bucket --grep sums into, in seconds.
     pub fn grep_bucket(&self) -> f64 {
         self.grep_every.unwrap_or(60.0)
+    }
+}
+
+fn parse_host(s: &str) -> Result<String, String> {
+    if s.starts_with('-') || s.trim().is_empty() || s.contains(char::is_whitespace) {
+        Err(format!(
+            "'{s}' isn't a host name (e.g. pi@raspberrypi, or a name from ~/.ssh/config)"
+        ))
+    } else {
+        Ok(s.to_string())
     }
 }
 
@@ -1124,6 +1139,20 @@ mod tests {
         assert_eq!(cli.forecast.as_deref(), Some("auto"));
         assert_eq!(cli.explain, Some(50));
         assert_eq!(cli.input, Some("x.log".into()));
+    }
+
+    #[test]
+    fn values_starting_with_a_dash_round_trip() {
+        let c = Cli::parse_from([
+            "graft",
+            "x.log",
+            "--kv",
+            "--hline=-5:red:low",
+            "--title=-draft-",
+        ]);
+        let again = Cli::parse_from(std::iter::once("graft".to_string()).chain(c.to_args()));
+        assert_eq!(again.hline, ["-5:red:low"]);
+        assert_eq!(again.title.as_deref(), Some("-draft-"));
     }
 
     #[test]

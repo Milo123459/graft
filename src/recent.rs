@@ -61,11 +61,22 @@ fn recent_path_from_env() -> Option<PathBuf> {
 }
 
 fn load() -> Vec<Recent> {
-    path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| toml::from_str::<RecentFile>(&s).ok())
-        .map(|f| f.recent)
-        .unwrap_or_default()
+    load_checked().unwrap_or_default()
+}
+
+/// The list, or an error if the file is there but can't be read (so it isn't
+/// overwritten — and lost — by the next chart).
+fn load_checked() -> Result<Vec<Recent>> {
+    let Some(p) = path() else {
+        return Ok(Vec::new());
+    };
+    match std::fs::read_to_string(&p) {
+        Ok(s) => Ok(toml::from_str::<RecentFile>(&s)
+            .with_context(|| format!("{} is damaged; not updating it", p.display()))?
+            .recent),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e).with_context(|| format!("reading {}", p.display())),
+    }
 }
 
 fn store(recent: Vec<Recent>) -> Result<()> {
@@ -124,7 +135,7 @@ fn try_remember(cli: &Cli) -> Result<()> {
             .map(|d| d.display().to_string()),
         at: chrono::Local::now().timestamp(),
     };
-    let mut all = load();
+    let mut all = load_checked()?;
     all.retain(|r| r.cli().is_none_or(|c| !same_source(&c, &cli)));
     all.insert(0, entry);
     all.truncate(KEEP);
@@ -267,6 +278,19 @@ mod tests {
 
     fn cli(args: &[&str]) -> Cli {
         <Cli as clap::Parser>::parse_from(args)
+    }
+
+    #[test]
+    fn a_damaged_list_is_left_alone() {
+        with_file(|| {
+            let p = path().unwrap();
+            std::fs::write(&p, "[[recent]]\nargs = [\"x\"]\nat = \"yesterday\"\n").unwrap();
+            remember(&cli(&["graft", "-c", "uptime", "--kv"]));
+            assert!(
+                std::fs::read_to_string(&p).unwrap().contains("yesterday"),
+                "not overwritten"
+            );
+        });
     }
 
     #[test]
