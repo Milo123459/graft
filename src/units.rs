@@ -212,14 +212,31 @@ pub fn split_number(s: &str) -> Option<(f64, &str)> {
         }
     }
     let n: f64 = s[..i].parse().ok()?;
-    Some((n, &s[i..]))
+    // 1e400 and friends: not a number anyone means.
+    n.is_finite().then_some((n, &s[i..]))
 }
 
 /// Parse a complete value with an optional unit: `59.9 GB`, `1.2G`, `42`, `15%`.
 ///
 /// Unknown suffixes are kept as [`Dim::Other`].
 pub fn parse_value(s: &str, binary: bool) -> Option<(f64, Unit)> {
-    let (n, rest) = split_number(s.trim())?;
+    let s = s.trim();
+    // Money with the symbol in front: `$12.50`, `-€3`.
+    let (sign, unsigned) = match s.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", s),
+    };
+    for sym in ['$', '€', '£'] {
+        if let Some(rest) = unsigned.strip_prefix(sym) {
+            let (n, tail) = split_number(rest.trim_start())?;
+            if !tail.trim().is_empty() {
+                return None;
+            }
+            let n = if sign == "-" { -n } else { n };
+            return Some((n, Unit::new(Dim::Money(sym.to_string()))));
+        }
+    }
+    let (n, rest) = split_number(s)?;
     apply_unit(n, rest, binary)
 }
 
@@ -236,7 +253,12 @@ pub fn apply_unit(n: f64, suffix: &str, binary: bool) -> Option<(f64, Unit)> {
     if let Some((dim, mult)) = lookup_unit(suffix, binary) {
         return Some((n * mult, Unit { dim, rate }));
     }
-    if suffix.chars().any(|c| c.is_whitespace()) {
+    // A unit starts with a letter or a unit sign: `,234` (a thousands separator) or
+    // `:00` (a time) aren't units.
+    let unit_like = suffix.chars().next().is_some_and(|c| {
+        c.is_alphabetic() || matches!(c, '%' | '°' | 'µ' | 'μ' | '$' | '€' | '£' | '\'')
+    });
+    if !unit_like || suffix.chars().any(|c| c.is_whitespace()) {
         return None;
     }
     Some((
@@ -331,6 +353,17 @@ fn fmt_seconds(v: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suffixes_must_look_like_units() {
+        assert_eq!(parse_value("1,234", false), None);
+        assert_eq!(parse_value("05:00", false), None);
+        assert_eq!(parse_value("1e400", false), None);
+        assert_eq!(parse_value("12ms", false).unwrap().0, 0.012);
+        let (v, u) = parse_value("$12.50", false).unwrap();
+        assert_eq!((v, u.format(v)), (12.5, "$12.50".to_string()));
+        assert_eq!(parse_value("-€3", false).unwrap().0, -3.0);
+    }
 
     #[test]
     fn money() {

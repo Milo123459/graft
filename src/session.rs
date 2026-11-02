@@ -39,7 +39,12 @@ impl Session {
             script,
             lines: 0,
             matched: 0,
-            arrival_time: !cli.grep.is_empty() && cli.x == crate::cli::XMode::Auto,
+            // Only for live sources: a file's untimed lines aren't "now".
+            arrival_time: !cli.grep.is_empty()
+                && cli.x == crate::cli::XMode::Auto
+                && (cli.cmd.is_some()
+                    || cli.follow
+                    || cli.input.as_ref().is_none_or(|p| p.as_os_str() == "-")),
             custom: cli
                 .line
                 .iter()

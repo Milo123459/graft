@@ -17,7 +17,7 @@ static AUTO_PATTERNS: LazyLock<Vec<(Regex, AutoKind)>> = LazyLock::new(|| {
     vec![
         // 2026-11-01 04:00, 2026-11-01T04:00:00.123Z, 2026/11/01 04:00:00+01:00
         p(
-            r"^\s*\[?((\d{4})[-/](\d{2})[-/](\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:[.,](\d{1,9}))?)?(?:\s?(Z|[+-]\d{2}:?\d{2}))?)\]?",
+            r"^\s*\[?((\d{4})[-/](\d{2})[-/](\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:[.,](\d{1,9}))?)?(?:\s?(Z)|([+-]\d{2}:?\d{2})|\s([+-]\d{2}:\d{2}))?)\]?",
             AutoKind::DateTime,
         ),
         // Nov  2 08:00:01 (syslog, no year)
@@ -59,11 +59,38 @@ enum AutoKind {
 #[derive(Debug, Clone, Default)]
 pub struct TimeParser {
     format: Option<String>,
+    /// The last time of day read (a time with no date): one going backwards by more
+    /// than half a day means the log went past midnight.
+    last_time_of_day: std::cell::Cell<Option<f64>>,
 }
 
 impl TimeParser {
     pub fn new(format: Option<String>) -> Self {
-        Self { format }
+        Self {
+            format,
+            last_time_of_day: Default::default(),
+        }
+    }
+
+    /// A time of day put on a day: today (yesterday if that would be well in the
+    /// future), moving on a day each time the log passes midnight.
+    fn place_time_of_day(&self, ts: f64) -> f64 {
+        const DAY: f64 = 86400.0;
+        let mut ts = ts;
+        match self.last_time_of_day.get() {
+            Some(prev) => {
+                while ts < prev - DAY / 2.0 {
+                    ts += DAY;
+                }
+                while ts > prev + DAY / 2.0 {
+                    ts -= DAY;
+                }
+            }
+            None if ts > now_secs() + 3600.0 => ts -= DAY,
+            None => {}
+        }
+        self.last_time_of_day.set(Some(ts));
+        ts
     }
 
     /// Find a timestamp at the start of `line`. Returns its value and the byte length
@@ -75,10 +102,16 @@ impl TimeParser {
             let (ts, rest) = parse_with_format_prefix(trimmed, fmt)?;
             return Some((ts, lead + trimmed.len() - rest.len()));
         }
-        AUTO_PATTERNS.iter().find_map(|(re, kind)| {
+        // The first pattern that matches decides (a malformed timestamp isn't read
+        // again as something shorter, e.g. just its date).
+        let (re, kind) = AUTO_PATTERNS.iter().find(|(re, _)| re.is_match(line))?;
+        std::iter::once((re, kind)).find_map(|(re, kind)| {
             let caps = re.captures(line)?;
             let ts = match kind {
                 AutoKind::DateTime => parse_iso(&caps)?,
+                AutoKind::TimeOfDay => {
+                    self.place_time_of_day(parse_auto(caps.get(1)?.as_str(), *kind)?)
+                }
                 _ => parse_auto(caps.get(1)?.as_str(), *kind)?,
             };
             Some((ts, caps.get(0)?.end()))
@@ -98,9 +131,24 @@ impl TimeParser {
             return Some(ts);
         }
         // Bare epoch numbers of any size.
-        let n: f64 = s.parse().ok()?;
-        Some(if n > 1e11 { n / 1000.0 } else { n })
+        epoch(s.parse().ok()?)
     }
+}
+
+/// A Unix epoch in seconds, milliseconds, microseconds or nanoseconds (told apart by
+/// size), as local wall-clock time like every other timestamp.
+pub fn epoch(n: f64) -> Option<f64> {
+    if !n.is_finite() {
+        return None;
+    }
+    let secs = match n.abs() {
+        a if a > 1e17 => n / 1e9,
+        a if a > 1e14 => n / 1e6,
+        a if a > 1e11 => n / 1e3,
+        _ => n,
+    };
+    let dt = DateTime::from_timestamp_micros((secs * 1e6) as i64)?;
+    Some(aware_secs(dt))
 }
 
 fn naive_secs(dt: NaiveDateTime) -> f64 {
@@ -141,7 +189,9 @@ fn parse_iso(c: &regex::Captures) -> Option<f64> {
             .map(|n| n * 10u32.pow(9 - digits.len() as u32))
     })?;
     let dt = date.and_hms_nano_opt(num(5)?, num(6)?, num(7)?, nanos)?;
-    match c.get(9).map(|m| m.as_str()) {
+    // The offset: Z, attached (+0100), or spaced only in the +01:00 form.
+    let offset = c.get(9).or_else(|| c.get(10)).or_else(|| c.get(11));
+    match offset.map(|m| m.as_str()) {
         None => Some(naive_secs(dt)),
         Some("Z") => Some(aware_secs(dt.and_utc())),
         Some(off) => {
@@ -161,11 +211,22 @@ fn parse_auto(s: &str, kind: AutoKind) -> Option<f64> {
     match kind {
         AutoKind::DateTime => unreachable!("handled by parse_iso"),
         AutoKind::Syslog => {
+            // No year: this year, unless that's more than a day ahead (then it's from
+            // last year — a December log read in January).
             let year = Local::now().year();
             let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-            NaiveDateTime::parse_from_str(&format!("{year} {s}"), "%Y %b %d %H:%M:%S")
-                .ok()
-                .map(naive_secs)
+            let at = |y: i32| {
+                NaiveDateTime::parse_from_str(&format!("{y} {s}"), "%Y %b %d %H:%M:%S")
+                    .ok()
+                    .map(naive_secs)
+            };
+            at(year).map(|t| {
+                if t > now_secs() + 86400.0 {
+                    at(year - 1).unwrap_or(t)
+                } else {
+                    t
+                }
+            })
         }
         AutoKind::Clf => DateTime::parse_from_str(s, "%d/%b/%Y:%H:%M:%S %z")
             .ok()
@@ -182,17 +243,8 @@ fn parse_auto(s: &str, kind: AutoKind) -> Option<f64> {
         AutoKind::Date => NaiveDate::parse_from_str(s, "%Y-%m-%d")
             .ok()
             .map(|d| naive_secs(d.and_time(NaiveTime::MIN))),
-        AutoKind::Epoch => {
-            let n: f64 = s.parse().ok()?;
-            let secs = if s.len() == 13 && !s.contains('.') {
-                n / 1000.0
-            } else {
-                n
-            };
-            // Epochs are UTC; convert to local wall-clock for consistency.
-            let dt = DateTime::from_timestamp_micros((secs * 1e6) as i64)?;
-            Some(aware_secs(dt))
-        }
+        // Epochs are UTC; converted to local wall-clock for consistency.
+        AutoKind::Epoch => epoch(s.parse().ok()?),
     }
 }
 
@@ -350,6 +402,23 @@ pub fn auto_per(span: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn times_of_day_cross_midnight() {
+        let t = TimeParser::default();
+        let x = |line: &str| t.detect(line).unwrap().0;
+        let (a, b, c) = (x("23:59:50 a=1"), x("00:00:10 a=2"), x("00:00:20 a=3"));
+        assert_eq!(
+            (b - a, c - b),
+            (20.0, 10.0),
+            "past midnight is the next day"
+        );
+        // Syslog dates ahead of now are last year's.
+        let next_month = (Local::now() + chrono::Duration::days(40))
+            .format("%b %d 10:00:00")
+            .to_string();
+        assert!(t.detect(&next_month).unwrap().0 < now_secs());
+    }
 
     #[test]
     fn access_log_timestamps() {

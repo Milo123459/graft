@@ -555,7 +555,7 @@ impl SeriesReport {
         let mut out = String::new();
         let mut rest = template;
         while let Some(start) = rest.find('{') {
-            out.push_str(&rest[..start]);
+            out.push_str(&rest[..start].replace("}}", "}"));
             let after = &rest[start + 1..];
             if let Some(stripped) = after.strip_prefix('{') {
                 out.push('{');

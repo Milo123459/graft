@@ -129,12 +129,30 @@ fn read_lines(
     }
 }
 
+/// Which file a handle or path is (so a rotated log is noticed).
+#[cfg(unix)]
+fn meta_id(m: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (m.dev(), m.ino())
+}
+
+#[cfg(not(unix))]
+fn meta_id(_: &std::fs::Metadata) -> (u64, u64) {
+    (0, 0)
+}
+
+fn file_id(f: &File) -> (u64, u64) {
+    f.metadata().map(|m| meta_id(&m)).unwrap_or_default()
+}
+
 fn read_file(path: &PathBuf, follow: bool, tx: &Sender<Event>) -> Result<(), String> {
     let open = || File::open(path).map_err(|e| format!("{}: {e}", path.display()));
     if !follow {
         return read_lines(BufReader::new(open()?), tx, None);
     }
-    let mut reader = BufReader::new(open()?);
+    let first = open()?;
+    let mut identity = file_id(&first);
+    let mut reader = BufReader::new(first);
     let mut pos = 0u64;
     let mut partial = Vec::new();
     loop {
@@ -157,11 +175,15 @@ fn read_file(path: &PathBuf, follow: bool, tx: &Sender<Event>) -> Result<(), Str
             continue;
         }
         thread::sleep(Duration::from_millis(250));
-        // Handle truncation / rotation: start again from the top.
-        let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(pos);
-        if len < pos
+        // Truncated (shorter than what was read) or rotated (a different file now has
+        // the name): start again from the top of what's there now.
+        let meta = std::fs::metadata(path).ok();
+        let len = meta.as_ref().map_or(pos, |m| m.len());
+        let rotated = meta.as_ref().is_some_and(|m| meta_id(m) != identity);
+        if (len < pos || rotated)
             && let Ok(f) = File::open(path)
         {
+            identity = file_id(&f);
             reader = BufReader::new(f);
             pos = 0;
             partial.clear();
@@ -227,11 +249,17 @@ fn run_command(
             .spawn()
             .map_err(|e| format!("failed to run `{cmd}`: {e}"))?;
         let stdout = child.stdout.take().expect("piped stdout");
+        // Drain stderr alongside stdout: a command that writes a lot to stderr would
+        // otherwise block on a full pipe and never finish its stdout.
+        let errors = child.stderr.take().map(|mut e| {
+            thread::spawn(move || {
+                let mut s = String::new();
+                let _ = e.read_to_string(&mut s);
+                s
+            })
+        });
         read_lines(BufReader::new(stdout), tx, Some(sample))?;
-        let mut stderr = String::new();
-        if let Some(mut e) = child.stderr.take() {
-            let _ = e.read_to_string(&mut stderr);
-        }
+        let stderr = errors.and_then(|h| h.join().ok()).unwrap_or_default();
         let status = child.wait().map_err(|e| e.to_string())?;
         if !status.success() {
             let detail = stderr.lines().next().unwrap_or("").trim();
@@ -287,6 +315,34 @@ mod tests {
         std::fs::write(&path, "a=9\n").unwrap();
         assert_eq!(next_line(), "a=9", "truncation restarts from the top");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn follow_switches_to_a_rotated_file() {
+        let dir = std::env::temp_dir().join(format!("graft-rotate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("app.log");
+        std::fs::write(&path, "a=1\n").unwrap();
+        let rx = spawn(SourceSpec::File {
+            path: path.clone(),
+            follow: true,
+        });
+        let mut lines = Vec::new();
+        let mut collect = |until: usize| {
+            let end = Instant::now() + Duration::from_secs(3);
+            while lines.len() < until && Instant::now() < end {
+                if let Ok(Event::Line(l, _)) = rx.recv_timeout(Duration::from_millis(50)) {
+                    lines.push(l);
+                }
+            }
+        };
+        collect(1);
+        // Rotate: the old file moves away, a new one takes the name.
+        std::fs::rename(&path, dir.join("app.log.1")).unwrap();
+        std::fs::write(&path, "a=2\na=3\n").unwrap();
+        collect(3);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(lines, ["a=1", "a=2", "a=3"]);
     }
 
     #[test]

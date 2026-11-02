@@ -567,3 +567,38 @@ fn merge_sources_into_one_chart() {
     let bad = graft(&["--merge", "x = -c 'echo 1'"]);
     assert!(String::from_utf8_lossy(&bad.stderr).contains("say how to read it"));
 }
+
+#[test]
+fn review_fixes_for_parsing() {
+    let last = |input: &str, args: &[&str]| {
+        let mut a = args.to_vec();
+        a.extend(["--no-chart", "--stats-template", "{name} {last:raw} {n}"]);
+        stdout(&graft_stdin(&a, input))
+    };
+    // Thousands separators, not "1 with unit ,234".
+    assert_eq!(
+        last("req: 1,234\nreq: 2,500\n", &["-F", "req: {req}"]),
+        "req 2500 2\n"
+    );
+    // Money with the symbol in front.
+    assert_eq!(last("price: $12.50\n", &["--kv"]), "price 12.5 1\n");
+    // Infinity isn't a value.
+    assert_eq!(last("x=1e400\nx=2\n", &["--kv"]), "x 2 1\n");
+    // An untimed first line doesn't turn timestamps into line numbers.
+    let out = last(
+        "boot a=0\n2026-11-01 04:00 a=1\n2026-11-01 05:00 a=2\n",
+        &["--kv"],
+    );
+    assert_eq!(out, "a 2 2\n");
+    // A header naming the time column keeps the other names.
+    let out = last(
+        "time cpu mem\n08:00:01 5 6\n08:00:02 7 8\n",
+        &["--columns", "all"],
+    );
+    assert_eq!(out, "cpu 7 2\nmem 8 2\n");
+    // No crash on --time-field 0.
+    assert_eq!(
+        last("a,b\n1,2\n", &["--csv", "--time-field", "0"]),
+        "a 1 1\nb 2 1\n"
+    );
+}

@@ -165,7 +165,24 @@ impl Store {
         if meta.sample.is_none() {
             self.next_index += 1;
         }
-        self.x_kind.get_or_insert(kind);
+        // One x axis per chart. Timestamps turning up after untimed lines (a header, a
+        // "boot" line) take over: those points were only line numbers. Once on a time
+        // axis, lines without one are skipped rather than plotted at "line 3".
+        match self.x_kind {
+            None => self.x_kind = Some(kind),
+            Some(k) if k == kind => {}
+            Some(XKind::Index) if kind == XKind::Time => {
+                self.series.clear();
+                self.x_kind = Some(kind);
+            }
+            Some(k) => {
+                return Err(Skip::Invalid(format!(
+                    "x is {} here, but the chart's x axis is {}",
+                    kind_name(kind),
+                    kind_name(k)
+                )));
+            }
+        }
         for p in parsed.points {
             let (value, unit) = match &self.default_unit {
                 Some((dim, mult)) if p.unit.is_none() => (p.value * mult, Unit::new(dim.clone())),
@@ -223,6 +240,14 @@ impl Store {
             x_kind: self.x_kind.unwrap_or_default(),
             series,
         }
+    }
+}
+
+fn kind_name(k: XKind) -> &'static str {
+    match k {
+        XKind::Time => "a time",
+        XKind::Index => "a line number",
+        XKind::Number => "a number",
     }
 }
 

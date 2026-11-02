@@ -230,21 +230,34 @@ fn finish(x: Option<XVal>, points: Vec<Point>) -> Result<Parsed, Skip> {
     }
 }
 
-/// Parse a value, tolerating thousands separators (`1,234`).
+/// Parse a value, tolerating thousands separators (`1,234`, `12,500,000`).
 fn value(s: &str, binary: bool) -> Option<(f64, Unit)> {
     parse_value(s, binary).or_else(|| {
-        s.contains(',')
-            .then(|| parse_value(&s.replace(',', ""), binary))
+        let t = s.trim();
+        let end = t
+            .find(|c: char| {
+                !(c.is_ascii_digit() || matches!(c, ',' | '.' | '-' | '+' | '$' | '€' | '£'))
+            })
+            .unwrap_or(t.len());
+        let (num, rest) = t.split_at(end);
+        THOUSANDS
+            .is_match(num)
+            .then(|| parse_value(&format!("{}{rest}", num.replace(',', "")), binary))
             .flatten()
     })
 }
+
+/// Digits grouped in threes: `1,234`, `-12,500,000.75`, `$1,234`.
+static THOUSANDS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[-+]?[$€£]?\d{1,3}(,\d{3})+(\.\d+)?$").expect("valid thousands regex")
+});
 
 // ───────────────────────────── key/value ─────────────────────────────
 
 /// `key: number` / `key=number`. Deliberately capture-free and ASCII-only so the
 /// regex crate can use its fast DFA; the match is split by hand.
 static KV_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"[A-Za-z_][A-Za-z0-9_.\-/()\[\]]*"?[ \t]*[:=][ \t]*[-+]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][-+]?[0-9]+)?"#)
+    Regex::new(r#"[A-Za-z_][A-Za-z0-9_.\-/()\[\]]*"?[ \t]*[:=][ \t]*[-+]?(?:\$|€|£)?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][-+]?[0-9]+)?"#)
         .expect("valid kv regex")
 });
 
@@ -282,7 +295,17 @@ impl LineParser for KvParser {
                 let text = m.as_str();
                 let sep = text.find([':', '='])?;
                 let key = text[..sep].trim_end().trim_end_matches('"');
-                let n: f64 = text[sep + 1..].trim_start().parse().ok()?;
+                let num = text[sep + 1..].trim_start();
+                // `$12.50`: money, symbol in front.
+                if num.contains(['$', '€', '£']) {
+                    let (value, unit) = crate::units::parse_value(num, self.binary)?;
+                    return Some(Point {
+                        series: key.to_string(),
+                        value,
+                        unit,
+                    });
+                }
+                let n: f64 = num.parse().ok().filter(|n: &f64| n.is_finite())?;
                 let unit = Self::unit_after(&body[m.end()..], self.binary);
                 let (value, unit) = crate::units::apply_unit(n, unit, self.binary)?;
                 Some(Point {
@@ -341,6 +364,9 @@ impl ColumnsParser {
         }
         match &self.header {
             Some(h) if h.len() == ntokens => h[pos].clone(),
+            // The header also named the time column, which the line had stripped:
+            // `time cpu mem` over `08:00:01 5 6`.
+            Some(h) if h.len() == ntokens + 1 => h[pos + 1].clone(),
             _ => format!("col{}", pos + 1),
         }
     }
@@ -611,7 +637,7 @@ impl CsvParser {
         if let Some(tf) = &self.time_field {
             return (0..fields.len())
                 .find(|&i| self.column_name(i) == *tf)
-                .or_else(|| tf.parse::<usize>().ok().map(|n| n - 1));
+                .or_else(|| tf.parse::<usize>().ok().and_then(|n| n.checked_sub(1)));
         }
         (0..fields.len())
             .find(|&i| TIME_NAMES.contains(&self.column_name(i).to_lowercase().as_str()))
@@ -722,7 +748,7 @@ fn fields_to_parsed(
         }
         if x.is_none() && is_time(&k) {
             let ts = match &v {
-                ScriptVal::Num(n) => Some(if *n > 1e11 { n / 1000.0 } else { *n }),
+                ScriptVal::Num(n) => crate::time::epoch(*n),
                 ScriptVal::Str(s) => time.parse(s),
             };
             if let Some(ts) = ts {
