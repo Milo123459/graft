@@ -15,9 +15,9 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, Widget, Wrap};
+use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, Widget};
 
-use crate::cli::{ChartKind, Cli, Window, parse_window};
+use crate::cli::{ChartKind, Cli, TrendStyle, Window, parse_window};
 use crate::data::Dataset;
 use crate::interactive::{Live, Transition};
 use crate::render::{
@@ -94,6 +94,130 @@ const HELP: &[(&str, &str)] = &[
     ("q / Esc", "quit (Esc first clears a measurement)"),
 ];
 
+/// `:help` — the console's commands. Series names go in quotes.
+const CONSOLE_HELP: &[(&str, &str)] = &[
+    ("— the console —", ""),
+    (
+        "node2 - node1",
+        "series names are variables holding their latest value",
+    ),
+    (
+        "50GB  200ms  1d",
+        "units work in numbers, e.g. last(\"node1\") < 50GB",
+    ),
+    (
+        "",
+        "functions use the visible range, or the measured stretch if there is one",
+    ),
+    ("— values —", ""),
+    ("last(\"s\")  first(\"s\")", "the latest / first value"),
+    (
+        "min max mean median",
+        "smallest, largest, average (also avg), middle value",
+    ),
+    (
+        "stddev p95 sum count",
+        "spread, 95th percentile, total, number of points",
+    ),
+    ("percentile(\"s\", 90)", "any percentile"),
+    (
+        "change pct_change",
+        "difference from first to last (pct_change: in %)",
+    ),
+    (
+        "values(\"s\")  xs(\"s\")",
+        "all values / x positions, as arrays",
+    ),
+    ("series()", "the names of all series"),
+    ("— trends & forecasts —", ""),
+    (
+        "slope(\"s\", \"1d\")",
+        "average change per day (\"1h\", \"1w\"…; no 2nd arg: per second)",
+    ),
+    (
+        "r2(\"s\")",
+        "how well a straight line fits: 0 (noise) to 1 (perfect)",
+    ),
+    (
+        "eta(\"s\", 50GB)",
+        "seconds until the trend reaches 50 GB (nothing if never)",
+    ),
+    (
+        "forecast(\"s\", 3d)",
+        "the trend's value 3 days after the last point",
+    ),
+    ("— formatting —", ""),
+    (
+        "fmt(\"s\", v)",
+        "v in the series' unit, e.g. fmt(\"node1\", 5e10) → 50 GB",
+    ),
+    ("fmt_dur(secs)", "a duration in words, e.g. 3.5 days"),
+    (
+        "fmt_time(t)  bytes(v)",
+        "a timestamp / a byte count, readable",
+    ),
+    ("— changing the chart —", ""),
+    (
+        "trend(\"line\")",
+        "trend lines: \"line\", \"avg\" (moving average) or \"off\"",
+    ),
+    (
+        "raw(false)",
+        "hide the raw data (trend only); raw(true) brings it back",
+    ),
+    (
+        "side_by_side(true)",
+        "live data and its trends in two charts",
+    ),
+    (
+        "forecast(\"7d\")",
+        "project trends 7 days ahead (\"auto\", \"off\")",
+    ),
+    (
+        "target(\"s\", 50GB)",
+        "a forecast target for a series (clear_target(\"s\"))",
+    ),
+    (
+        "range(\"24h\")",
+        "only recent data (\"all\" for everything)",
+    ),
+    (
+        "zoom(\"6h\")  reset()",
+        "zoom to the last 6 hours / show everything",
+    ),
+    (
+        "hline(50GB, \"label\")",
+        "a reference line (clear_hlines() removes them)",
+    ),
+    ("show(\"s\")  hide(\"s\")", "show or hide a series"),
+    (
+        "chart(\"bar\")",
+        "chart type: line, scatter, bar, histogram, sparkline",
+    ),
+    ("print(x)", "show a value (several prints are joined)"),
+    ("— examples —", ""),
+    (
+        "fmt_dur(eta(\"node1\", 50GB))",
+        "when will node1 reach 50 GB?",
+    ),
+    (
+        "fmt(\"node2\", slope(\"node2\", \"1d\"))",
+        "how much node2 changes per day",
+    ),
+    (
+        "mean(\"node2\") - mean(\"node1\")",
+        "the average gap between two series",
+    ),
+    (
+        "target(\"node1\", 50GB); forecast(\"auto\")",
+        "aim for 50 GB and draw the forecast",
+    ),
+    (
+        "",
+        "your own functions and key bindings: --script file.rhai (see README)",
+    ),
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Cmd {
     PanLeft,
@@ -121,6 +245,8 @@ enum Cmd {
     Marker,
     Mouse,
     Trend,
+    TrendStyle,
+    SideBySide,
     Targets,
     /// Step through timeframe presets (-1 narrower, +1 wider).
     RangeStep(i8),
@@ -175,6 +301,9 @@ pub struct App {
     show_stats: bool,
     paused: bool,
     help: bool,
+    /// `:help` (the console reference) is open.
+    console_help: bool,
+    help_scroll: u16,
     console: Option<TextInput>,
     history: Vec<String>,
     history_pos: Option<usize>,
@@ -187,6 +316,8 @@ pub struct App {
     drag: Option<Drag>,
     /// Horizon to use when forecasting is switched on.
     horizon: Horizon,
+    /// Trend style used when trend lines are switched on.
+    trend_style: TrendStyle,
     hits: Hits<Hit>,
     plots: RefCell<Vec<PlotArea>>,
     /// The part of the data shown and analysed.
@@ -215,6 +346,7 @@ impl App {
             .filter_map(|(k, code)| Some((k.chars().next()?, code)))
             .collect();
         let horizon = opts.forecast.unwrap_or(Horizon::Auto);
+        let trend_style = opts.trend.unwrap_or(TrendStyle::Fit);
         let mut app = Self {
             alerts: cli.alert.clone(),
             show_stats: cli.stats,
@@ -235,6 +367,8 @@ impl App {
             hidden: HashSet::new(),
             paused: false,
             help: false,
+            console_help: false,
+            help_scroll: 0,
             console: None,
             history: Vec::new(),
             history_pos: None,
@@ -245,6 +379,7 @@ impl App {
             toolbar_more: false,
             drag: None,
             horizon,
+            trend_style,
             hits: Hits::default(),
             plots: RefCell::new(Vec::new()),
             timeframe,
@@ -264,7 +399,9 @@ impl App {
         c.stats = self.show_stats;
         c.no_mouse = !self.mouse;
         c.target = self.opts.analysis.targets.to_specs();
-        c.trend = self.opts.show_trend;
+        c.trend = self.opts.trend;
+        c.trend_only = self.opts.trend.is_some() && !self.opts.show_raw;
+        c.side_by_side = self.opts.side_by_side;
         c.no_targets = !self.opts.show_targets;
         c.last = self.timeframe.last;
         if self.timeframe.since.is_none() {
@@ -508,6 +645,35 @@ impl App {
         self.set_timeframe(next.map_or_else(Timeframe::default, Timeframe::last));
     }
 
+    /// The "view" button: raw → raw + trend → trend only → raw.
+    fn cycle_view(&mut self) {
+        let (trend, raw) = match (self.opts.trend, self.opts.show_raw) {
+            (None, _) => (Some(self.trend_style), true),
+            (Some(_), true) => (Some(self.trend_style), false),
+            (Some(_), false) => (None, true),
+        };
+        self.opts.trend = trend;
+        self.opts.show_raw = raw;
+        self.say(
+            match (trend, raw) {
+                (None, _) => "showing the raw data",
+                (Some(_), true) => {
+                    "trend lines on top of the raw data (greyed) — ⋯ switches line / moving average"
+                }
+                (Some(_), false) => "trend lines only",
+            },
+            false,
+        );
+    }
+
+    fn view_label(&self) -> &'static str {
+        match (self.opts.trend, self.opts.show_raw) {
+            (None, _) => "view: raw",
+            (Some(_), true) => "view: raw + trend",
+            (Some(_), false) => "view: trend",
+        }
+    }
+
     fn toggle_forecast(&mut self) {
         self.opts.forecast = match self.opts.forecast {
             Some(h) => {
@@ -633,10 +799,23 @@ impl App {
             Cmd::Format => return Transition::OpenBuilder,
             Cmd::Console => self.console = Some(TextInput::default()),
             Cmd::Export => self.export_view(),
-            Cmd::Help => self.help = !self.help,
+            Cmd::Help => {
+                self.help = !self.help;
+                self.help_scroll = 0;
+            }
             Cmd::Quit => return Transition::Quit,
             Cmd::More => self.toolbar_more = !self.toolbar_more,
-            Cmd::Trend => self.opts.show_trend = !self.opts.show_trend,
+            Cmd::Trend => self.cycle_view(),
+            Cmd::TrendStyle => {
+                self.trend_style = match self.trend_style {
+                    TrendStyle::Fit => TrendStyle::Avg,
+                    TrendStyle::Avg => TrendStyle::Fit,
+                };
+                if self.opts.trend.is_some() {
+                    self.opts.trend = Some(self.trend_style);
+                }
+            }
+            Cmd::SideBySide => self.opts.side_by_side = !self.opts.side_by_side,
             Cmd::Targets => self.opts.show_targets = !self.opts.show_targets,
             Cmd::RangeStep(dir) => self.step_timeframe(dir),
             Cmd::Mouse => {
@@ -658,6 +837,11 @@ impl App {
     // ───────────── console ─────────────
 
     fn eval(&mut self, code: &str) {
+        if matches!(code.trim(), "help" | "help()" | "?" | "commands") {
+            self.console_help = true;
+            self.help_scroll = 0;
+            return;
+        }
         let script = self.session.script.clone();
         script.set_data(self.full.clone(), self.focus());
         let result = script.eval(code);
@@ -712,6 +896,28 @@ impl App {
                 Ok(h) => self.opts.forecast = h,
                 Err(e) => self.say(format!("forecast: {e}"), true),
             },
+            Action::Trend(t) => match t.as_deref() {
+                None => self.opts.trend = None,
+                Some("fit" | "line" | "linear") => {
+                    self.trend_style = TrendStyle::Fit;
+                    self.opts.trend = Some(TrendStyle::Fit);
+                }
+                Some("avg" | "average" | "smooth") => {
+                    self.trend_style = TrendStyle::Avg;
+                    self.opts.trend = Some(TrendStyle::Avg);
+                }
+                Some(other) => self.say(
+                    format!("trend: use \"line\", \"avg\" or \"off\" (not \"{other}\")"),
+                    true,
+                ),
+            },
+            Action::Raw(on) => {
+                self.opts.show_raw = on;
+                if !on && self.opts.trend.is_none() {
+                    self.opts.trend = Some(self.trend_style);
+                }
+            }
+            Action::SideBySide(on) => self.opts.side_by_side = on,
             Action::Range(r) => match r.map(|r| parse_window(&r)).transpose() {
                 Ok(w) => self.set_timeframe(w.map_or_else(Timeframe::default, Timeframe::last)),
                 Err(e) => self.say(format!("range: {e}"), true),
@@ -769,8 +975,19 @@ impl App {
             self.on_console_key(key);
             return Transition::None;
         }
-        if self.help {
-            self.help = false;
+        if self.help || self.console_help {
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => self.help_scroll += 1,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1)
+                }
+                KeyCode::PageDown | KeyCode::Char(' ') => self.help_scroll += 10,
+                KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
+                _ => {
+                    self.help = false;
+                    self.console_help = false;
+                }
+            }
             return Transition::None;
         }
         if let KeyCode::Char(c) = key.code
@@ -843,6 +1060,7 @@ impl App {
             KeyCode::Char('F') => Cmd::Format,
             KeyCode::Char('M') => Cmd::Mouse,
             KeyCode::Char('T') => Cmd::Trend,
+            KeyCode::Char('D') => Cmd::SideBySide,
             KeyCode::Char('G') => Cmd::Targets,
             KeyCode::Char('[') => Cmd::RangeStep(-1),
             KeyCode::Char(']') => Cmd::RangeStep(1),
@@ -868,9 +1086,15 @@ impl App {
 
     fn on_mouse(&mut self, m: MouseEvent) -> Transition {
         let (col, row) = (m.column, m.row);
-        if self.help {
-            if matches!(m.kind, MouseEventKind::Down(_)) {
-                self.help = false;
+        if self.help || self.console_help {
+            match m.kind {
+                MouseEventKind::Down(_) => {
+                    self.help = false;
+                    self.console_help = false;
+                }
+                MouseEventKind::ScrollDown => self.help_scroll += 2,
+                MouseEventKind::ScrollUp => self.help_scroll = self.help_scroll.saturating_sub(2),
+                _ => {}
             }
             return Transition::None;
         }
@@ -991,6 +1215,8 @@ impl App {
             )
             .active(self.measuring || self.anchor.is_some() || self.selection.is_some()),
             b("stats", Cmd::Stats).active(self.show_stats),
+            b(self.view_label(), Cmd::Trend).active(self.opts.trend.is_some()),
+            b("side by side", Cmd::SideBySide).active(self.opts.side_by_side),
             b("forecast", Cmd::Forecast).active(self.opts.forecast.is_some()),
             b("split", Cmd::Split).active(self.opts.split),
         ];
@@ -1021,7 +1247,13 @@ impl App {
                 v.push(Button::new(label, Hit::Range(Some(*w))).active(current == Some(*w)));
             }
             v.extend([
-                b("trend", Cmd::Trend).active(self.opts.show_trend),
+                b(
+                    match self.trend_style {
+                        TrendStyle::Fit => "trend: line",
+                        TrendStyle::Avg => "trend: average",
+                    },
+                    Cmd::TrendStyle,
+                ),
                 b("targets", Cmd::Targets).active(self.opts.show_targets),
                 b(self.opts.kind.name(), Cmd::Kind),
                 b("log", Cmd::Log).active(self.opts.log),
@@ -1116,10 +1348,44 @@ impl App {
                 Span::styled(":", Style::default().fg(Color::Yellow)),
                 prompt,
             );
-            input.render(field, f.buffer_mut(), true, "");
+            input.render(
+                field,
+                f.buffer_mut(),
+                true,
+                "type help to see every command · Enter runs · Esc closes",
+            );
         }
         if self.help {
-            self.draw_help(f);
+            let mut entries: Vec<(String, String, Color)> = HELP
+                .iter()
+                .map(|(k, d)| (k.to_string(), d.to_string(), Color::Yellow))
+                .collect();
+            entries.extend(
+                self.binds
+                    .iter()
+                    .map(|(k, code)| (k.to_string(), format!("script: {code}"), Color::Cyan)),
+            );
+            entries.push((
+                String::new(),
+                "type : then help for the console's commands".into(),
+                Color::Yellow,
+            ));
+            self.draw_overlay(
+                f,
+                " graft keys · ↑↓ scroll · any other key or tap closes ",
+                &entries,
+            );
+        }
+        if self.console_help {
+            let entries: Vec<(String, String, Color)> = CONSOLE_HELP
+                .iter()
+                .map(|(k, d)| (k.to_string(), d.to_string(), Color::Cyan))
+                .collect();
+            self.draw_overlay(
+                f,
+                " console commands (Rhai) · ↑↓ scroll · any other key or tap closes ",
+                &entries,
+            );
         }
     }
 
@@ -1379,23 +1645,58 @@ impl App {
         f.render_widget(table, area);
     }
 
-    fn draw_help(&self, f: &mut Frame) {
+    /// A centred, scrollable two-column reference (keys / commands and what they do).
+    /// Long commands get a line of their own; descriptions wrap with an indent.
+    fn draw_overlay(&self, f: &mut Frame, title: &str, entries: &[(String, String, Color)]) {
         let area = f.area();
-        let w = 92.min(area.width);
-        let mut lines: Vec<Line> = HELP
+        let w = 100.min(area.width);
+        let inner_w = w.saturating_sub(2) as usize;
+        let key_w = entries
             .iter()
-            .map(|(k, d)| {
-                Line::from(vec![
-                    Span::styled(format!("{k:>15}  "), Style::default().fg(Color::Yellow)),
-                    Span::raw(*d),
-                ])
-            })
-            .collect();
-        for (k, code) in &self.binds {
-            lines.push(Line::from(vec![
-                Span::styled(format!("{k:>15}  "), Style::default().fg(Color::Cyan)),
-                Span::raw(format!("script: {code}")),
-            ]));
+            .filter(|e| !e.1.is_empty())
+            .map(|e| e.0.chars().count())
+            .filter(|n| *n <= 26)
+            .max()
+            .unwrap_or(10)
+            .min(inner_w / 2);
+        let desc_w = inner_w.saturating_sub(key_w + 2).max(10);
+        let wrap = |text: &str| -> Vec<String> {
+            let mut out = vec![String::new()];
+            for word in text.split(' ') {
+                let cur = out.last_mut().expect("non-empty");
+                if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > desc_w {
+                    out.push(word.to_string());
+                } else {
+                    if !cur.is_empty() {
+                        cur.push(' ');
+                    }
+                    cur.push_str(word);
+                }
+            }
+            out
+        };
+        let mut lines: Vec<Line> = Vec::new();
+        for (k, d, color) in entries {
+            if d.is_empty() {
+                lines.push(Line::styled(
+                    k.clone(),
+                    Style::default().fg(*color).add_modifier(Modifier::BOLD),
+                ));
+                continue;
+            }
+            let key_style = Style::default().fg(*color);
+            let pad = " ".repeat(key_w + 2);
+            let mut desc = wrap(d).into_iter();
+            if k.chars().count() > key_w {
+                lines.push(Line::styled(format!("  {k}"), key_style));
+            } else {
+                let first = desc.next().unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{k:>key_w$}  "), key_style),
+                    Span::raw(first),
+                ]));
+            }
+            lines.extend(desc.map(|rest| Line::raw(format!("{pad}{rest}"))));
         }
         let h = (lines.len() as u16 + 2).min(area.height);
         let rect = Rect {
@@ -1404,13 +1705,16 @@ impl App {
             width: w,
             height: h,
         };
+        let max_scroll = (lines.len() as u16 + 2).saturating_sub(h);
         Clear.render(rect, f.buffer_mut());
         f.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-                Block::bordered()
-                    .title(" graft · tap or press any key to close ")
-                    .border_style(Style::default().fg(Color::Yellow)),
-            ),
+            Paragraph::new(lines)
+                .scroll((self.help_scroll.min(max_scroll), 0))
+                .block(
+                    Block::bordered()
+                        .title(title.to_string())
+                        .border_style(Style::default().fg(Color::Yellow)),
+                ),
             rect,
         );
     }
@@ -1698,7 +2002,7 @@ mod tests {
         key(&mut app, KeyCode::Char('G'));
         assert!(!screen(&app).contains("node1 target"));
         key(&mut app, KeyCode::Char('T'));
-        assert!(app.opts.show_trend && app.current_cli().trend);
+        assert!(app.opts.trend.is_some() && app.current_cli().trend.is_some());
     }
 
     #[test]
@@ -1831,6 +2135,47 @@ mod tests {
             ..shift_click
         }));
         assert!(app.selection.is_some());
+    }
+
+    #[test]
+    fn console_help_and_trend_views() {
+        let mut app = app(&["graft", LOG]);
+        key(&mut app, KeyCode::Char(':'));
+        assert!(screen(&app).contains("type help to see every command"));
+        type_str(&mut app, "help");
+        key(&mut app, KeyCode::Enter);
+        let s = screen(&app);
+        assert!(
+            s.contains("console commands") && s.contains("slope(\"s\", \"1d\")"),
+            "{s}"
+        );
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Char('x'));
+        assert!(!app.console_help);
+        // view: raw → raw + trend → trend only → raw
+        let (x, y) = find(&app, "view: raw");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert_eq!(
+            (app.opts.trend, app.opts.show_raw),
+            (Some(TrendStyle::Fit), true)
+        );
+        key(&mut app, KeyCode::Char('T'));
+        assert_eq!(
+            (app.opts.trend, app.opts.show_raw),
+            (Some(TrendStyle::Fit), false)
+        );
+        assert!(screen(&app).contains("view: trend"));
+        key(&mut app, KeyCode::Char('T'));
+        assert_eq!(app.opts.trend, None);
+        // Console control, moving average, side by side.
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, "trend(\"avg\"); side_by_side(true)");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.opts.trend, Some(TrendStyle::Avg));
+        let s = screen(&app);
+        assert!(s.contains("· live") && s.contains("· trend"), "{s}");
+        let cli = app.current_cli();
+        assert_eq!((cli.trend, cli.side_by_side), (Some(TrendStyle::Avg), true));
     }
 
     #[test]

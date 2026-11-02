@@ -17,7 +17,7 @@ use ratatui::widgets::{
     Sparkline, Widget,
 };
 
-use crate::cli::{ChartKind, FitModel, LegendPos, MarkerKind};
+use crate::cli::{ChartKind, FitModel, LegendPos, MarkerKind, TrendStyle};
 use crate::data::{Dataset, Series, XKind};
 use crate::stats::{Analysis, Fit};
 use crate::units::Unit;
@@ -84,8 +84,14 @@ pub struct ChartOpts {
     pub analysis: Analysis,
     /// Project trends this far into the future.
     pub forecast: Option<Horizon>,
-    /// Draw the fitted trend over the data.
-    pub show_trend: bool,
+    /// Draw trend lines (fit or moving average) over the data.
+    pub trend: Option<TrendStyle>,
+    /// Points in the moving average (default: about 1/30 of the data).
+    pub trend_window: Option<usize>,
+    /// Draw the raw data (off for "trend only").
+    pub show_raw: bool,
+    /// Live data and trends in two charts side by side.
+    pub side_by_side: bool,
     /// Draw explicit target lines.
     pub show_targets: bool,
 }
@@ -107,7 +113,10 @@ impl Default for ChartOpts {
             x_format: None,
             analysis: Analysis::default(),
             forecast: None,
-            show_trend: false,
+            trend: None,
+            trend_window: None,
+            show_raw: true,
+            side_by_side: false,
             show_targets: true,
         }
     }
@@ -116,6 +125,38 @@ impl Default for ChartOpts {
 impl ChartOpts {
     pub fn color(&self, idx: usize) -> Color {
         self.palette[idx % self.palette.len()]
+    }
+
+    /// A series' trend line: the fitted curve over the data it was fitted to, or a
+    /// centred moving average.
+    pub fn trend_points(&self, s: &Series) -> Option<Vec<(f64, f64)>> {
+        match self.trend? {
+            TrendStyle::Fit => {
+                let fit = self.analysis.fit(s)?;
+                Some(projection_points(&fit, fit.x_first, fit.x_last))
+            }
+            TrendStyle::Avg => {
+                let n = s.points.len();
+                (n >= 2).then(|| {
+                    moving_average(&s.points, self.trend_window.unwrap_or((n / 30).max(3)))
+                })
+            }
+        }
+    }
+
+    /// The trend's value at x (for the cursor readout).
+    pub fn trend_at(&self, s: &Series, x: f64) -> Option<f64> {
+        match self.trend? {
+            TrendStyle::Fit => {
+                let fit = self.analysis.fit(s)?;
+                (fit.x_first..=fit.x_last).contains(&x).then(|| fit.at(x))
+            }
+            TrendStyle::Avg => {
+                let pts = self.trend_points(s)?;
+                let i = pts.partition_point(|p| p.0 < x).min(pts.len() - 1);
+                Some(pts[i].1)
+            }
+        }
     }
 
     /// The projection for one series: its fit and how far ahead to draw it.
@@ -288,6 +329,23 @@ pub fn visible_points(s: &Series, x0: f64, x1: f64, buckets: usize) -> Vec<(f64,
     out
 }
 
+/// Centred moving average over `window` points (shrinking at the edges).
+pub fn moving_average(points: &[(f64, f64)], window: usize) -> Vec<(f64, f64)> {
+    let n = points.len();
+    let half = window.max(1) / 2;
+    let mut prefix = Vec::with_capacity(n + 1);
+    prefix.push(0.0);
+    for p in points {
+        prefix.push(prefix.last().copied().unwrap_or(0.0) + p.1);
+    }
+    (0..n)
+        .map(|i| {
+            let (a, b) = (i.saturating_sub(half), (i + half + 1).min(n));
+            (points[i].0, (prefix[b] - prefix[a]) / (b - a) as f64)
+        })
+        .collect()
+}
+
 /// Points along a fitted trend from `from` to `to`.
 pub fn projection_points(fit: &Fit, from: f64, to: f64) -> Vec<(f64, f64)> {
     let steps = if fit.model == FitModel::Linear { 1 } else { 48 };
@@ -401,6 +459,31 @@ pub fn value_at(s: &Series, opts: &ChartOpts, x: f64) -> Option<(f64, bool)> {
         .filter_map(|i| s.points.get(i))
         .min_by(|a, b| (a.0 - x).abs().total_cmp(&(b.0 - x).abs()))
         .map(|p| (p.1, false))
+}
+
+/// A darker shade of a series colour, for the raw data under its (bright) trend line.
+pub fn dim_color(c: Color) -> Color {
+    match c {
+        Color::Indexed(81) => Color::Indexed(31),
+        Color::Indexed(213) => Color::Indexed(133),
+        Color::Indexed(221) => Color::Indexed(136),
+        Color::Indexed(114) => Color::Indexed(65),
+        Color::Indexed(209) => Color::Indexed(130),
+        Color::Indexed(141) => Color::Indexed(97),
+        Color::Indexed(203) => Color::Indexed(124),
+        Color::Indexed(43) => Color::Indexed(30),
+        Color::Indexed(33) => Color::Indexed(25),
+        Color::Indexed(186) => Color::Indexed(101),
+        Color::Indexed(168) => Color::Indexed(125),
+        Color::Rgb(r, g, b) => Color::Rgb(r / 2, g / 2, b / 2),
+        Color::Cyan | Color::LightCyan => Color::Indexed(30),
+        Color::Magenta | Color::LightMagenta => Color::Indexed(90),
+        Color::Yellow | Color::LightYellow => Color::Indexed(136),
+        Color::Green | Color::LightGreen => Color::Indexed(28),
+        Color::Red | Color::LightRed => Color::Indexed(88),
+        Color::Blue | Color::LightBlue => Color::Indexed(25),
+        _ => Color::Indexed(242),
+    }
 }
 
 /// "Nice" tick values covering `[lo, hi]` with roughly `target` steps.
@@ -784,18 +867,7 @@ impl<'a> ChartWidget<'a> {
         let mut projections: Vec<(usize, Vec<Line2>)> = Vec::new();
         let mut targets: Vec<(usize, &str, f64)> = Vec::new();
         for &(i, s, _) in &lines {
-            // The trend over the data (optional), then the forecast to the right edge.
-            if self.opts.show_trend
-                && let Some(fit) = self.opts.analysis.fit(s)
-            {
-                let (from, to) = (fit.x_first.max(x0), fit.x_last.min(x1));
-                if to > from {
-                    let pieces = (cols * (to - from) / (x1 - x0) / 3.0) as usize;
-                    let mut dashes = dashed(|x| fit.at(x), from, to, pieces);
-                    dashes.iter_mut().for_each(&to_log);
-                    projections.push((i, dashes));
-                }
-            }
+            // The forecast, from the last point to the right edge.
             if let Some((fit, _)) = self.opts.projection(s) {
                 let (from, to) = (fit.x_last.max(x0), x1);
                 if to > from {
@@ -813,9 +885,30 @@ impl<'a> ChartWidget<'a> {
             }
         }
 
+        // Trend lines (solid, in the series' colour), limited to the view.
+        let mut trends: Vec<Prepared> = Vec::new();
+        for &(i, s, _) in &lines {
+            if let Some(pts) = self.opts.trend_points(s) {
+                let tmp = Series {
+                    name: String::new(),
+                    unit: s.unit.clone(),
+                    points: pts,
+                };
+                let mut pts = visible_points(&tmp, x0, x1, buckets);
+                to_log(&mut pts);
+                trends.push((i, s, pts));
+            }
+        }
+        let raw_shown = self.opts.show_raw || trends.is_empty();
         let in_range: Vec<f64> = lines
             .iter()
+            .filter(|_| raw_shown)
             .flat_map(|l| l.2.iter().filter(|p| p.0 >= x0 && p.0 <= x1).map(|p| p.1))
+            .chain(
+                trends
+                    .iter()
+                    .flat_map(|t| t.2.iter().filter(|p| p.0 >= x0 && p.0 <= x1).map(|p| p.1)),
+            )
             .chain(
                 projections
                     .iter()
@@ -945,19 +1038,42 @@ impl<'a> ChartWidget<'a> {
                 }
             })
             .collect();
-        for (i, s, pts) in &lines {
-            let last = s
-                .in_view(self.overlay.view)
+        let last_text = |s: &Series| {
+            s.in_view(self.overlay.view)
                 .last()
                 .or(s.points.last())
                 .map(|p| s.unit.format(p.1))
-                .unwrap_or_default();
-            datasets.push(
-                RDataset::default()
-                    .name(format!("{} {last}", s.name))
+                .unwrap_or_default()
+        };
+        if raw_shown {
+            // Under trend lines the raw data takes a darker shade of the series colour,
+            // so each trend is clearly distinct from (but matches) its data.
+            for (i, s, pts) in &lines {
+                let color = self.opts.color(*i);
+                let style = Style::default().fg(if trends.is_empty() {
+                    color
+                } else {
+                    dim_color(color)
+                });
+                let d = RDataset::default()
                     .data(pts)
                     .graph_type(graph)
                     .marker(mk)
+                    .style(style);
+                datasets.push(if trends.is_empty() {
+                    d.name(format!("{} {}", s.name, last_text(s)))
+                } else {
+                    d
+                });
+            }
+        }
+        for (i, s, pts) in &trends {
+            datasets.push(
+                RDataset::default()
+                    .name(format!("{} {}", s.name, last_text(s)))
+                    .data(pts)
+                    .graph_type(GraphType::Line)
+                    .marker(Marker::Braille)
                     .style(Style::default().fg(self.opts.color(*i))),
             );
         }
@@ -1041,10 +1157,16 @@ impl<'a> ChartWidget<'a> {
         )];
         for &(i, s) in series {
             if let Some((v, projected)) = value_at(s, self.opts, x) {
-                let text = if projected {
-                    format!("≈{} (forecast)", s.unit.format(v))
-                } else {
-                    s.unit.format(v)
+                let trend = (!projected).then(|| self.opts.trend_at(s, x)).flatten();
+                let text = match (projected, trend) {
+                    (true, _) => format!("≈{} (forecast)", s.unit.format(v)),
+                    (false, Some(t)) if !self.opts.show_raw => {
+                        format!("{} (trend)", s.unit.format(t))
+                    }
+                    (false, Some(t)) => {
+                        format!("{} · trend {}", s.unit.format(v), s.unit.format(t))
+                    }
+                    (false, None) => s.unit.format(v),
                 };
                 lines.push(Line::from(vec![
                     Span::styled(
@@ -1319,10 +1441,44 @@ impl<'a> ChartWidget<'a> {
     }
 }
 
+impl ChartWidget<'_> {
+    /// Live data on the left (or top, when narrow), its trends on the right.
+    fn render_side_by_side(self, area: Rect, buf: &mut Buffer) {
+        let base = ChartOpts {
+            side_by_side: false,
+            ..self.opts.clone()
+        };
+        let live = ChartOpts {
+            trend: None,
+            show_raw: true,
+            forecast: None,
+            title: format!("{} · live", base.title),
+            ..base.clone()
+        };
+        let trend = ChartOpts {
+            trend: Some(base.trend.unwrap_or(TrendStyle::Fit)),
+            show_raw: false,
+            title: format!("{} · trend", base.title),
+            ..base
+        };
+        let [a, b] = if area.width >= 100 {
+            Layout::horizontal([Constraint::Ratio(1, 2); 2]).areas(area)
+        } else {
+            Layout::vertical([Constraint::Ratio(1, 2); 2]).areas(area)
+        };
+        ChartWidget::new(self.ds, &live, self.overlay).render(a, buf);
+        ChartWidget::new(self.ds, &trend, self.overlay).render(b, buf);
+    }
+}
+
 impl Widget for ChartWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         if area.width < 4 || area.height < 3 {
             return;
+        }
+        if self.opts.side_by_side && matches!(self.opts.kind, ChartKind::Line | ChartKind::Scatter)
+        {
+            return self.render_side_by_side(area, buf);
         }
         match self.opts.kind {
             ChartKind::Line | ChartKind::Scatter if self.opts.split => self.render_split(area, buf),

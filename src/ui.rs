@@ -222,8 +222,12 @@ impl TextInput {
         };
         let base = Style::default().bg(bg).fg(Color::White);
         buf.set_style(area, base);
-        if self.value.is_empty() && !focused {
+        if self.value.is_empty() {
             Line::styled(placeholder.to_string(), base.fg(Color::DarkGray)).render(area, buf);
+            if focused {
+                buf[(area.x, area.y)]
+                    .set_style(Style::default().bg(Color::Yellow).fg(Color::Black));
+            }
             return;
         }
         let offset = self.scroll(width);

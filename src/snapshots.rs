@@ -210,6 +210,20 @@ pub fn scenarios() -> Vec<(String, String)> {
     app.test_keys("[");
     app.test_keys("[");
     add("view-timeframe", screen(&app, 150, 45));
+    let app = viewer(&[month, "-F", FMT, "--split", "--trend"]);
+    add("view-raw-and-trend", screen(&app, 150, 45));
+    let app = viewer(&[cpu, "--kv", "--trend=avg"]);
+    add("view-trend-avg-many", screen(&app, 150, 45));
+    let app = viewer(&[
+        month,
+        "-F",
+        FMT,
+        "--side-by-side",
+        "--trend=avg",
+        "--forecast",
+    ]);
+    add("view-side-by-side", screen(&app, 150, 45));
+    add("phone-side-by-side", screen(&app, 46, 34));
     let mut app = viewer(&[cpu, "--kv", "--stats"]);
     add("view-many-series", screen(&app, 150, 45));
     app.test_keys("?");
@@ -221,6 +235,8 @@ pub fn scenarios() -> Vec<(String, String)> {
     app.test_keys(":");
     app.test_keys("slope(\"node2\", \"1d\")");
     add("view-console", screen(&app, 120, 30));
+    app.test_keys("\x1b:help\n");
+    add("view-console-help", screen(&app, 120, 40));
 
     // Viewer, phone size.
     let mut app = viewer(&[

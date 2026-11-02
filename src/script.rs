@@ -42,6 +42,11 @@ pub enum Action {
     Forecast(Option<String>),
     /// Timeframe (`"7d"`, `"500"`), or `None` for all data.
     Range(Option<String>),
+    /// Trend lines: "fit"/"line", "avg"/"average", or `None` for off.
+    Trend(Option<String>),
+    /// Show the raw data (false = trend only).
+    Raw(bool),
+    SideBySide(bool),
 }
 
 /// State shared between the host and registered functions.
@@ -513,6 +518,19 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
             ),
         );
         Ok(())
+    });
+    let st = state.clone();
+    engine.register_fn("trend", move |t: &str| {
+        push(
+            &st,
+            Action::Trend((!matches!(t, "off" | "none" | "false")).then(|| t.to_string())),
+        );
+    });
+    let st = state.clone();
+    engine.register_fn("raw", move |on: bool| push(&st, Action::Raw(on)));
+    let st = state.clone();
+    engine.register_fn("side_by_side", move |on: bool| {
+        push(&st, Action::SideBySide(on))
     });
     let st = state.clone();
     engine.register_fn("range", move |r: &str| {

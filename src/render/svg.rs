@@ -83,6 +83,13 @@ fn xterm(i: u8) -> (u8, u8, u8) {
     }
 }
 
+/// Blend a `#rrggbb` colour towards white by `amount` (0..1).
+fn tint(hex: &str, amount: f64) -> String {
+    let c = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).unwrap_or(0) as f64;
+    let mix = |v: f64| (v + (255.0 - v) * amount).round() as u8;
+    format!("#{:02x}{:02x}{:02x}", mix(c(1)), mix(c(3)), mix(c(5)))
+}
+
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -179,26 +186,15 @@ fn xy(
     let projections: Vec<(usize, Vec<(f64, f64)>)> = series
         .iter()
         .filter_map(|&(i, s)| {
-            let (fit, from) = match opts.projection(s) {
-                Some((fit, _)) => (
-                    fit,
-                    if opts.show_trend {
-                        fit.x_first
-                    } else {
-                        fit.x_last
-                    },
-                ),
-                None if opts.show_trend => (opts.analysis.fit(s)?, opts.analysis.fit(s)?.x_first),
-                None => return None,
-            };
-            let to = if opts.forecast.is_some() {
-                x1
-            } else {
-                fit.x_last
-            };
-            Some((i, super::projection_points(&fit, from, to)))
+            let (fit, _) = opts.projection(s)?;
+            Some((i, super::projection_points(&fit, fit.x_last, x1)))
         })
         .collect();
+    let trends: Vec<(usize, Vec<(f64, f64)>)> = series
+        .iter()
+        .filter_map(|&(i, s)| Some((i, opts.trend_points(s)?)))
+        .collect();
+    let raw_shown = opts.show_raw || trends.is_empty();
     let near = super::min_max(
         series
             .iter()
@@ -357,8 +353,26 @@ fn xy(
             path.join(" ")
         );
     }
-    for &(i, s) in series {
-        let c = hex(opts.color(i));
+    for (i, pts) in &trends {
+        let c = hex(opts.color(*i));
+        let path: Vec<String> = pts
+            .iter()
+            .filter(|p| !log || p.1 > 0.0)
+            .map(|p| format!("{:.1},{:.1}", f.px(p.0), f.py(ty(p.1))))
+            .collect();
+        let _ = writeln!(
+            out,
+            r#"<polyline fill="none" stroke="{c}" stroke-width="2.4" stroke-linejoin="round" points="{}"/>"#,
+            path.join(" ")
+        );
+    }
+    for &(i, s) in series.iter().filter(|_| raw_shown) {
+        // Under trend lines, a pale tint of the series colour.
+        let c = if trends.is_empty() {
+            hex(opts.color(i))
+        } else {
+            tint(&hex(opts.color(i)), 0.6)
+        };
         let pts: Vec<(f64, f64)> = s
             .points
             .iter()

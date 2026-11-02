@@ -103,6 +103,7 @@ enum Opt {
     Follow,
     Fit,
     Trend,
+    SideBySide,
     Range,
 }
 
@@ -811,7 +812,15 @@ impl Builder {
                             FitModel::Linear
                         }
                     }
-                    Opt::Trend => c.trend = !c.trend,
+                    Opt::Trend => {
+                        use crate::cli::TrendStyle::{Avg, Fit};
+                        c.trend = match c.trend {
+                            None => Some(Fit),
+                            Some(Fit) => Some(Avg),
+                            Some(Avg) => None,
+                        }
+                    }
+                    Opt::SideBySide => c.side_by_side = !c.side_by_side,
                     Opt::Range => {
                         // all → 1h → 6h → 24h → 7d → 30d → all
                         const STEPS: [f64; 5] = [3600.0, 21600.0, 86400.0, 604_800.0, 2_592_000.0];
@@ -939,7 +948,16 @@ impl Builder {
                 format!("fit: {}", crate::cli::fit_name(c.fit)),
                 Hit::Opt(Opt::Fit),
             ),
-            Button::new("trend", Hit::Opt(Opt::Trend)).active(c.trend),
+            Button::new(
+                match c.trend {
+                    None => "trend: off",
+                    Some(crate::cli::TrendStyle::Fit) => "trend: line",
+                    Some(crate::cli::TrendStyle::Avg) => "trend: average",
+                },
+                Hit::Opt(Opt::Trend),
+            )
+            .active(c.trend.is_some()),
+            Button::new("side by side", Hit::Opt(Opt::SideBySide)).active(c.side_by_side),
             Button::new(
                 format!(
                     "range: {}",

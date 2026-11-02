@@ -330,9 +330,22 @@ pub struct Cli {
     #[arg(long, value_name = "HORIZON", num_args = 0..=1, require_equals = true, default_missing_value = "auto", help_heading = "Analysis")]
     pub forecast: Option<String>,
 
-    /// Draw the fitted trend line over the data.
+    /// Draw trend lines: `--trend` (the fitted line, see --fit) or `--trend=avg`
+    /// (a moving average). The raw data is greyed so the trends stand out.
+    #[arg(long, value_enum, value_name = "STYLE", num_args = 0..=1, require_equals = true, default_missing_value = "fit", help_heading = "Analysis")]
+    pub trend: Option<TrendStyle>,
+
+    /// Show only the trend lines, not the raw data (implies --trend).
     #[arg(long, help_heading = "Analysis")]
-    pub trend: bool,
+    pub trend_only: bool,
+
+    /// Points in the moving average for --trend=avg (default: about 1/30 of the data).
+    #[arg(long, value_name = "N", help_heading = "Analysis")]
+    pub trend_window: Option<usize>,
+
+    /// Two charts side by side: the live data, and its trends.
+    #[arg(long, help_heading = "Chart")]
+    pub side_by_side: bool,
 
     /// Don't draw target lines (targets still drive forecasts and stats).
     #[arg(long, help_heading = "Analysis")]
@@ -450,6 +463,7 @@ impl Cli {
         );
         opt("--smooth", self.smooth.map(|n| n.to_string()));
         opt("--last", self.last.map(fmt_window));
+        opt("--trend-window", self.trend_window.map(|n| n.to_string()));
         opt("--since", self.since.clone());
         opt("--until", self.until.clone());
         opt(
@@ -520,7 +534,8 @@ impl Cli {
             (self.once, "--once"),
             (self.no_chart, "--no-chart"),
             (self.no_mouse, "--no-mouse"),
-            (self.trend, "--trend"),
+            (self.trend_only, "--trend-only"),
+            (self.side_by_side, "--side-by-side"),
             (self.no_targets, "--no-targets"),
         ];
         a.extend(flags.iter().filter(|f| f.0).map(|f| f.1.to_string()));
@@ -530,6 +545,12 @@ impl Cli {
                 "--forecast".into()
             } else {
                 format!("--forecast={f}")
+            });
+        }
+        if let Some(t) = self.trend {
+            a.push(match t {
+                TrendStyle::Fit => "--trend".into(),
+                TrendStyle::Avg => "--trend=avg".into(),
             });
         }
         if let Some(n) = self.explain {
@@ -689,6 +710,14 @@ pub enum LegendPos {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TrendStyle {
+    /// The fitted trend (linear or exponential, see --fit).
+    Fit,
+    /// A moving average.
+    Avg,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum StatsFormat {
     Text,
     Json,
@@ -844,6 +873,11 @@ mod tests {
                 "--explain=3",
                 "--forecast",
                 "--no-mouse",
+                "--trend=avg",
+                "--trend-only",
+                "--side-by-side",
+                "--trend-window",
+                "9",
             ],
         ];
         for args in cases {

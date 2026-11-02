@@ -199,7 +199,9 @@ Every part of this is configurable:
 | `--fit-window 12h` / `--fit-window 50` | fit only recent data (a duration or a number of points) |
 | `--per 1h` | the unit trends are expressed in (default: chosen from the data's span) |
 | `--forecast` / `--forecast=7d` | draw the projected trend (dashed) past the data |
-| `--trend` | also draw the fitted trend line over the data |
+| `--trend` / `--trend=avg` | trend lines: the fitted line, or a moving average (`--trend-window N`). Each trend is drawn in its series' colour, with the raw data in a darker shade |
+| `--trend-only` | only the trend lines, not the raw data |
+| `--side-by-side` | two charts: the live data, and its trends (with any forecast) |
 | `--no-targets` | don't draw target lines (they still drive forecasts and stats) |
 | `--last 7d` / `--since …` | fit and forecast from that timeframe only, e.g. just the last week |
 | `--stats-template '{name}: {trend} → {target} in {eta}'` | your own output line per series |
@@ -271,7 +273,7 @@ including over SSH from a phone.
 | drag the cursor line | scrub through the data, and past it into the forecast |
 | **measure**, then tap start and end (or drag across, or click then **shift+click**) | stats for just that stretch, including how much each series *changed*; tap again to clear |
 | scroll | zoom around the pointer (sideways or shift + scroll moves); never past your data |
-| toolbar / series chips | ◀ ▶ + − reset cursor measure stats forecast split **all time**; `⋯` shows more: timeframe presets, trend, targets, chart type, log, follow, pause, format, console, export, mouse, help, quit |
+| toolbar / series chips | ◀ ▶ + − reset cursor measure stats **view** (raw / raw + trend / trend) **side by side** forecast split **all time**; `⋯` shows more: timeframe presets, trend, targets, chart type, log, follow, pause, format, console, export, mouse, help, quit |
 
 **Timeframe picker** (time series): tap **all time** to step through
 presets that are shorter than your data (`24h`, `6h`, `1h`, … then back to
@@ -297,7 +299,9 @@ mouse capture off, so your terminal's own text selection works.
 | `v` … `v` | measure a range from the keyboard |
 | `1`–`9` / `a` | toggle a series / show all |
 | `t` / `m` / `y` / `x` | chart type / marker / log scale / split panels |
-| `f` / `T` / `G` | forecast / trend line / target lines on or off |
+| `T` | view: raw → raw + trend → trend only |
+| `D` | side by side: live data next to its trends |
+| `f` / `G` | forecast / target lines on or off |
 | `[` / `]` | narrower / wider timeframe (the **all time** / **last 24h** button) |
 | `F` | change the format or source (builder) |
 | `s` | stats panel |
@@ -309,7 +313,8 @@ mouse capture off, so your terminal's own text selection works.
 
 ### The Rhai console and scripts
 
-Inside the console, every series is a variable holding its latest value.
+Press `:` and type `help` to see every command with a short explanation and
+examples. Inside the console, every series is a variable holding its latest value.
 Functions work on the visible range, or on the selection if you've made one:
 
 ```
@@ -331,7 +336,8 @@ Available functions:
 - Viewer actions: `hline(v[, label])`, `clear_hlines()`, `zoom("6h")`,
   `reset()`, `show(name)`, `hide(name)`, `chart("bar")`,
   `target(name, v)`, `clear_target(name)`, `forecast("7d" | "auto" | "off")`,
-  `range("7d" | "500" | "all")`.
+  `range("7d" | "500" | "all")`, `trend("line" | "avg" | "off")`, `raw(bool)`,
+  `side_by_side(bool)`.
 - Output: `print(...)`.
 
 Unit literals such as `50GB`, `200ms` and `1d` work in all expressions.
