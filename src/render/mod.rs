@@ -263,6 +263,8 @@ pub struct Mark {
     pub x: f64,
     pub y: Option<f64>,
     pub label: String,
+    /// The rule that placed it (index), or `None` when placed by hand.
+    pub rule: Option<usize>,
 }
 
 /// What a pane's own source has produced so far.

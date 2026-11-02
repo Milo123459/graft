@@ -228,6 +228,19 @@ pub fn scenarios() -> Vec<(String, String)> {
     app.test_keys("T");
     add("view-lines-menu-side-by-side", screen(&app, 150, 45));
     let mut app = viewer(&[
+        LOG,
+        "-F",
+        FMT,
+        "--mark",
+        "delta < -400MB => {name} {delta}",
+        "--mark",
+        "name == \"node1\" && pct > 1 => node1 up {pct}",
+    ]);
+    add("view-markers", screen(&app, 150, 45));
+    app.test_keys("K");
+    add("view-markers-menu", screen(&app, 150, 45));
+    add("phone-markers-menu", screen(&app, 46, 34));
+    let mut app = viewer(&[
         month,
         "-F",
         FMT,
@@ -445,6 +458,10 @@ fn write_custom_snapshot() {
     }
     std::fs::create_dir_all(&dir).unwrap();
     for (name, w, h) in [("custom", 150, 45), ("phone-custom", 46, 40)] {
-        std::fs::write(PathBuf::from(&dir).join(format!("{name}.ans")), screen(&app, w, h)).unwrap();
+        std::fs::write(
+            PathBuf::from(&dir).join(format!("{name}.ans")),
+            screen(&app, w, h),
+        )
+        .unwrap();
     }
 }

@@ -192,6 +192,9 @@ literals work. The label after `=>` can use `{name} {value} {prev} {delta}
 and `--stats` lists them. In a `--script` file or the console:
 `mark_when("delta < -1GB", "dropped {delta}")`; `mark("deploy")` drops one by
 hand at the cursor (or the newest data); `clear_marks()` removes them all.
+While it runs, press `K` (or tap **markers**) for the list of rules and
+markers: tap a rule to edit it (it opens in the console; Enter saves, Esc
+cancels), **✕** deletes one, **+ add rule** and **mark now** add more.
 
 ### Counting log lines
 
@@ -393,6 +396,7 @@ mouse capture off, so your terminal's own text selection works.
 | `D` | side by side: live data next to its trends |
 | `w` | pane panel (inside: `v` / `s` split right / down, `x` close, arrows pick, shift+arrows move, ctrl+arrows or `< > + -` resize, `=` even, `t` chart type, `T` lines, `1`–`9` series, `o` one chart) |
 | `Tab` / `Alt+arrows` | pick the next pane / the pane that way |
+| `K` | markers: edit, delete or add rules and markers |
 | `f` / `G` | forecast / target lines on or off |
 | `R` / `[` `]` | timeframe dropdown / narrower, wider timeframe |
 | `F` | change the format or source (builder) |

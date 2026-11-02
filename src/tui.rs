@@ -88,6 +88,8 @@ const HELP: &[(&str, &str)] = &[
     ),
     ("", "each pane has its own series, chart type and lines"),
     ("Tab / Alt+arrows", "pick the next pane / the pane that way"),
+    ("K", "markers: edit, delete or add rules"),
+    ("C", "copy the command for this view"),
     ("⋯", "more: chart type, log scale, target lines, pause,"),
     (
         "",
@@ -238,6 +240,10 @@ const CONSOLE_HELP: &[(&str, &str)] = &[
         "mark(\"deploy\")  clear_marks()",
         "a marker at the cursor (or newest data) / remove all",
     ),
+    (
+        "",
+        "K (or the markers button) lists them: edit, delete, add",
+    ),
     ("— panes —", ""),
     (
         "split_right() split_down()",
@@ -327,6 +333,7 @@ enum Cmd {
     Panes,
     Save,
     Copy,
+    Markers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -344,6 +351,11 @@ enum Hit {
     Pane(PaneOp),
     /// Source picker: use item `n`.
     PickSource(usize),
+    /// Markers menu.
+    EditRule(usize),
+    DeleteRule(usize),
+    DeleteManual(usize),
+    MarkAction(MarkAction),
     /// Timeframe dropdown: type a range in the console.
     CustomRange,
     MenuBackground,
@@ -366,6 +378,15 @@ fn parse_dir(s: &str) -> Option<PDir> {
         "down" | "d" => Some(PDir::Down),
         _ => None,
     }
+}
+
+/// Buttons at the bottom of the markers menu.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MarkAction {
+    AddRule,
+    MarkNow,
+    ClearAll,
+    Close,
 }
 
 /// An entry in the source picker: its label and the source name (`None`: main chart).
@@ -466,6 +487,10 @@ pub struct App {
     mark_rules: Vec<crate::marks::MarkRule>,
     /// Markers placed by hand with `mark("…")`.
     manual_marks: Vec<crate::render::Mark>,
+    /// The markers menu is open, with this row picked.
+    marks_menu: Option<usize>,
+    /// The console is editing this rule: the next `mark_when` replaces it.
+    editing_rule: Option<usize>,
     /// The source picker for the focused pane: (label, source name).
     source_menu: Option<(Vec<SourceChoice>, usize)>,
     /// Where the chart area was last drawn (for pane taps and border drags).
@@ -538,6 +563,8 @@ impl App {
             subs: Vec::new(),
             mark_rules: Vec::new(),
             manual_marks: Vec::new(),
+            marks_menu: None,
+            editing_rule: None,
             sub_views: Vec::new(),
             source_menu: None,
             chart_rect: std::cell::Cell::new(Rect::default()),
@@ -673,8 +700,15 @@ impl App {
 
     /// Place markers from the rules (and those set by hand) on the current data.
     fn update_marks(&mut self) {
-        self.mark_rules
-            .extend(self.session.script.take_mark_rules());
+        let mut new = self.session.script.take_mark_rules();
+        // An edit replaces the rule it started from.
+        if let Some(i) = self.editing_rule.take()
+            && i < self.mark_rules.len()
+            && !new.is_empty()
+        {
+            self.mark_rules[i] = new.remove(0);
+        }
+        self.mark_rules.extend(new);
         let (mut marks, errors) =
             crate::marks::evaluate(&self.session.script, &self.mark_rules, &self.ds);
         if let Some(e) = errors.into_iter().next() {
@@ -893,6 +927,216 @@ impl App {
         let n = options.len() as isize;
         let next = options[((i + dir as isize) % n + n) as usize % options.len()];
         self.set_timeframe(next.map_or_else(Timeframe::default, Timeframe::last));
+    }
+
+    // ───────────── markers menu ─────────────
+
+    /// Rows of the markers menu: the rules, then markers placed by hand.
+    fn mark_rows(&self) -> usize {
+        self.mark_rules.len() + self.manual_marks.len()
+    }
+
+    /// Open the console on a rule; running it replaces the rule.
+    fn edit_rule(&mut self, i: usize) {
+        let Some(rule) = self.mark_rules.get(i) else {
+            return;
+        };
+        let q = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+        let code = match &rule.label {
+            Some(l) => format!("mark_when({}, {})", q(&rule.expr), q(l)),
+            None => format!("mark_when({})", q(&rule.expr)),
+        };
+        self.marks_menu = None;
+        self.editing_rule = Some(i);
+        self.console = Some(TextInput::new(code));
+        self.say("edit the rule · Enter saves · Esc cancels", false);
+    }
+
+    fn delete_mark_row(&mut self, row: usize) {
+        if row < self.mark_rules.len() {
+            self.mark_rules.remove(row);
+        } else if row - self.mark_rules.len() < self.manual_marks.len() {
+            self.manual_marks.remove(row - self.mark_rules.len());
+        }
+        self.update_marks();
+        let last = self.mark_rows().saturating_sub(1);
+        if let Some(sel) = self.marks_menu.as_mut() {
+            *sel = (*sel).min(last);
+        }
+    }
+
+    fn mark_action(&mut self, a: MarkAction) {
+        match a {
+            MarkAction::AddRule => {
+                self.marks_menu = None;
+                self.console = Some(TextInput::new("mark_when(\""));
+                self.say(
+                    "e.g. mark_when(\"delta < -1GB\", \"dropped {delta}\") · value prev delta pct rate time name",
+                    false,
+                );
+            }
+            MarkAction::MarkNow => {
+                self.marks_menu = None;
+                self.console = Some(TextInput::new("mark(\""));
+                self.say("label the marker, e.g. mark(\"router reboot\") (at the cursor, else the newest data)", false);
+            }
+            MarkAction::ClearAll => {
+                self.mark_rules.clear();
+                self.manual_marks.clear();
+                self.update_marks();
+            }
+            MarkAction::Close => self.marks_menu = None,
+        }
+    }
+
+    fn on_marks_menu_key(&mut self, key: KeyEvent) {
+        let n = self.mark_rows();
+        let sel = self.marks_menu.unwrap_or(0);
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') if n > 0 => self.marks_menu = Some((sel + 1) % n),
+            KeyCode::Up | KeyCode::Char('k') if n > 0 => self.marks_menu = Some((sel + n - 1) % n),
+            KeyCode::Enter | KeyCode::Char('e') if sel < self.mark_rules.len() => {
+                self.edit_rule(sel)
+            }
+            KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace if sel < n => {
+                self.delete_mark_row(sel)
+            }
+            KeyCode::Char('a') => self.mark_action(MarkAction::AddRule),
+            KeyCode::Char('n') => self.mark_action(MarkAction::MarkNow),
+            _ => self.marks_menu = None,
+        }
+    }
+
+    fn draw_marks_menu(&self, f: &mut Frame) {
+        let Some(sel) = self.marks_menu else {
+            return;
+        };
+        let area = f.area();
+        let w = 80.min(area.width);
+        let rows = self.mark_rows().max(1) as u16;
+        let h = (rows + 7).min(area.height);
+        let rect = Rect {
+            x: (area.width - w) / 2,
+            y: area.height.saturating_sub(h) / 2,
+            width: w,
+            height: h,
+        };
+        Clear.render(rect, f.buffer_mut());
+        let block = Block::bordered()
+            .title(" markers · tap a rule to edit it ")
+            .border_style(Style::default().fg(Color::Yellow));
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        self.hits.push(rect, Hit::MenuBackground);
+        let dim = Style::default().fg(Color::Gray);
+        let mut y = inner.y;
+        let line = |f: &mut Frame, y: u16, text: Line| {
+            if y < inner.bottom() {
+                f.render_widget(
+                    text,
+                    Rect {
+                        y,
+                        height: 1,
+                        ..inner
+                    },
+                );
+            }
+        };
+        let delete = |f: &mut Frame, y: u16, hit: Hit| {
+            if y < inner.bottom() && inner.width > 4 {
+                let r = Rect {
+                    x: inner.right() - 3,
+                    y,
+                    width: 3,
+                    height: 1,
+                };
+                f.render_widget(
+                    Span::styled(" ✕ ", Style::default().fg(Color::White).bg(Color::DarkGray)),
+                    r,
+                );
+                self.hits.push(r, hit);
+            }
+        };
+        if self.mark_rules.is_empty() && self.manual_marks.is_empty() {
+            line(
+                f,
+                y,
+                Line::styled(" no markers yet: add a rule, or mark the moment", dim),
+            );
+            y += 1;
+        }
+        for (i, rule) in self.mark_rules.iter().enumerate() {
+            let count = self.opts.marks.iter().filter(|m| m.rule == Some(i)).count();
+            let style = if sel == i {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let r = Rect {
+                y,
+                height: 1,
+                width: inner.width.saturating_sub(4),
+                ..inner
+            };
+            if y < inner.bottom() {
+                f.render_widget(
+                    Line::from(vec![
+                        Span::styled(" ✎ ", Style::default().fg(Color::Yellow)),
+                        Span::styled(rule.to_spec(), style),
+                        Span::styled(format!("  ▼ {count}"), dim),
+                    ]),
+                    r,
+                );
+                self.hits.push(r, Hit::EditRule(i));
+            }
+            delete(f, y, Hit::DeleteRule(i));
+            y += 1;
+        }
+        for (j, m) in self.manual_marks.iter().enumerate() {
+            let style = if sel == self.mark_rules.len() + j {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            line(
+                f,
+                y,
+                Line::from(vec![
+                    Span::styled(" ▼ ", Style::default().fg(Color::Yellow)),
+                    Span::styled(format!("{}  {}", self.ds.fmt_x_full(m.x), m.label), style),
+                    Span::styled("  by hand", dim),
+                ]),
+            );
+            delete(f, y, Hit::DeleteManual(j));
+            y += 1;
+        }
+        y += 1;
+        if y < inner.bottom() {
+            let buttons = vec![
+                Button::new("+ add rule", Hit::MarkAction(MarkAction::AddRule)),
+                Button::new("mark now", Hit::MarkAction(MarkAction::MarkNow)),
+                Button::new("clear all", Hit::MarkAction(MarkAction::ClearAll)),
+                Button::new("done", Hit::MarkAction(MarkAction::Close)),
+            ];
+            render_buttons(
+                &buttons,
+                Rect {
+                    y,
+                    height: inner.bottom() - y,
+                    ..inner
+                },
+                f.buffer_mut(),
+                &self.hits,
+            );
+        }
+        line(
+            f,
+            inner.bottom().saturating_sub(1),
+            Line::styled(
+                "keys: ↑↓ pick · Enter edit · x delete · a add rule · n mark now · Esc",
+                Style::default().fg(Color::DarkGray),
+            ),
+        );
     }
 
     /// Copy `text`, or the command that reproduces this view.
@@ -2029,6 +2273,12 @@ impl App {
             Cmd::Targets => self.opts.show_targets = !self.opts.show_targets,
             Cmd::RangeStep(dir) => self.step_timeframe(dir),
             Cmd::Copy => self.copy(None),
+            Cmd::Markers => {
+                self.marks_menu = match self.marks_menu {
+                    Some(_) => None,
+                    None => Some(0),
+                };
+            }
             Cmd::Save => {
                 self.console = Some(TextInput::new("save(\""));
                 self.say(
@@ -2199,6 +2449,7 @@ impl App {
                             x,
                             y: None,
                             label,
+                            rule: None,
                         });
                         self.update_marks();
                     }
@@ -2245,7 +2496,10 @@ impl App {
             return;
         };
         match key.code {
-            KeyCode::Esc => self.console = None,
+            KeyCode::Esc => {
+                self.console = None;
+                self.editing_rule = None;
+            }
             KeyCode::Enter => {
                 let code = std::mem::take(&mut input.value);
                 self.console = None;
@@ -2345,6 +2599,10 @@ impl App {
         }
         if self.source_menu.is_some() {
             self.on_source_menu_key(key);
+            return Transition::None;
+        }
+        if self.marks_menu.is_some() {
+            self.on_marks_menu_key(key);
             return Transition::None;
         }
         if self.pane_menu && self.on_pane_key(key) {
@@ -2472,6 +2730,7 @@ impl App {
             KeyCode::Char('G') => Cmd::Targets,
             KeyCode::Char('R') => Cmd::RangeMenu,
             KeyCode::Char('C') => Cmd::Copy,
+            KeyCode::Char('K') => Cmd::Markers,
             KeyCode::Char('[') => Cmd::RangeStep(-1),
             KeyCode::Char(']') => Cmd::RangeStep(1),
             KeyCode::Char(' ' | 'p') => Cmd::Pause,
@@ -2549,6 +2808,22 @@ impl App {
                             self.pane_op(op);
                             Transition::None
                         }
+                        Hit::EditRule(i) => {
+                            self.edit_rule(i);
+                            Transition::None
+                        }
+                        Hit::DeleteRule(i) => {
+                            self.delete_mark_row(i);
+                            Transition::None
+                        }
+                        Hit::DeleteManual(j) => {
+                            self.delete_mark_row(self.mark_rules.len() + j);
+                            Transition::None
+                        }
+                        Hit::MarkAction(a) => {
+                            self.mark_action(a);
+                            Transition::None
+                        }
                         Hit::PickSource(i) => {
                             let src = self
                                 .source_menu
@@ -2560,11 +2835,16 @@ impl App {
                         }
                     };
                 }
-                if self.lines_menu || self.range_menu || self.source_menu.is_some() {
+                if self.lines_menu
+                    || self.range_menu
+                    || self.source_menu.is_some()
+                    || self.marks_menu.is_some()
+                {
                     // A tap outside a menu closes it.
                     self.lines_menu = false;
                     self.range_menu = false;
                     self.source_menu = None;
+                    self.marks_menu = None;
                     return Transition::None;
                 }
                 // Panes: grab a border to resize, or tap a pane to focus it.
@@ -2711,6 +2991,16 @@ impl App {
             b("forecast", Cmd::Forecast).active(self.opts.forecast.is_some()),
             b("split", Cmd::Split).active(self.opts.split),
         ];
+        // Markers, once there are some (always under ⋯).
+        if self.mark_rows() > 0 {
+            v.push(
+                b(
+                    &format!("markers ({})", self.opts.marks.len()),
+                    Cmd::Markers,
+                )
+                .active(self.marks_menu.is_some()),
+            );
+        }
         // The timeframe dropdown.
         if self.has_timeframes() {
             let label = if self.timeframe.is_all() {
@@ -2745,6 +3035,7 @@ impl App {
                 b("format", Cmd::Format),
                 b("save", Cmd::Save),
                 b("copy cmd", Cmd::Copy),
+                b("markers", Cmd::Markers).active(self.marks_menu.is_some()),
                 b(":", Cmd::Console),
                 b("svg", Cmd::Export),
                 b("mouse", Cmd::Mouse).active(self.mouse),
@@ -2864,6 +3155,7 @@ impl App {
             self.draw_range_menu(f);
         }
         self.draw_source_menu(f);
+        self.draw_marks_menu(f);
         if self.help {
             let mut entries: Vec<(String, String, Color)> = HELP
                 .iter()
@@ -4142,6 +4434,87 @@ mod tests {
                 .marks
                 .iter()
                 .all(|m| m.label == "drop" && m.series.as_deref() == Some("node1"))
+        );
+    }
+
+    #[test]
+    fn edit_and_delete_markers_from_the_menu() {
+        let mut app = app(&[
+            "graft",
+            LOG,
+            "--mark",
+            "delta < -1.5GB => fell {delta}",
+            "--mark",
+            "pct > 0.3 => up",
+        ]);
+        let before = app.opts.marks.len();
+        key(&mut app, KeyCode::Char('K'));
+        let s = screen(&app);
+        assert!(
+            s.contains("delta < -1.5GB => fell {delta}") && s.contains("▼ 3"),
+            "{s}"
+        );
+        // Enter edits the picked rule in the console; running it replaces the rule.
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.console.as_ref().unwrap().value,
+            "mark_when(\"delta < -1.5GB\", \"fell {delta}\")"
+        );
+        app.console
+            .as_mut()
+            .unwrap()
+            .set("mark_when(\"delta < -500MB\", \"fell {delta}\")");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.mark_rules.len(), 2);
+        assert_eq!(app.mark_rules[0].expr, "delta < -500MB");
+        assert!(app.opts.marks.len() > before);
+        // Esc while editing changes nothing.
+        key(&mut app, KeyCode::Char('K'));
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.mark_rules[0].expr, "delta < -500MB");
+        // ✕ deletes a rule.
+        key(&mut app, KeyCode::Char('K'));
+        let (x, y) = find(&app, "pct > 0.3 => up");
+        let row = screen(&app).lines().nth(y as usize).unwrap().to_string();
+        let col = row.chars().position(|c| c == '✕').unwrap() as u16;
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), col, y);
+        let _ = x;
+        assert_eq!(app.current_cli().mark, ["delta < -500MB => fell {delta}"]);
+        assert!(app.opts.marks.iter().all(|m| m.label.starts_with("fell")));
+    }
+
+    #[test]
+    fn each_pane_has_its_own_lines() {
+        // Stat tiles of the median above a chart of just the live data.
+        let mut app = app(&[
+            "graft",
+            LOG,
+            "--pane",
+            "* kind=stat",
+            "--pane",
+            "* lines=live,median",
+            "--layout",
+            "1 / 2",
+        ]);
+        key(&mut app, KeyCode::Char('w'));
+        key(&mut app, KeyCode::Down); // pick the chart
+        key(&mut app, KeyCode::Char('T'));
+        key(&mut app, KeyCode::Char('m')); // median off
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Up); // pick the tiles
+        key(&mut app, KeyCode::Char('T'));
+        key(&mut app, KeyCode::Char('m')); // median on
+        key(&mut app, KeyCode::Char('l')); // live off
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(
+            app.current_cli().pane,
+            ["* kind=stat lines=median", "* lines=live"]
+        );
+        let s = screen(&app);
+        assert!(
+            s.contains("node1 median") && !s.contains("node1 live"),
+            "{s}"
         );
     }
 

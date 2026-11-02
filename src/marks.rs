@@ -54,8 +54,8 @@ impl MarkRule {
 pub fn evaluate(host: &ScriptHost, rules: &[MarkRule], ds: &Dataset) -> (Vec<Mark>, Vec<String>) {
     let mut marks = Vec::new();
     let mut errors = Vec::new();
-    for rule in rules {
-        if let Err(e) = evaluate_rule(host, rule, ds, &mut marks) {
+    for (n, rule) in rules.iter().enumerate() {
+        if let Err(e) = evaluate_rule(host, n, rule, ds, &mut marks) {
             errors.push(format!("mark '{}': {e:#}", rule.expr));
         }
     }
@@ -65,6 +65,7 @@ pub fn evaluate(host: &ScriptHost, rules: &[MarkRule], ds: &Dataset) -> (Vec<Mar
 
 fn evaluate_rule(
     host: &ScriptHost,
+    n: usize,
     rule: &MarkRule,
     ds: &Dataset,
     out: &mut Vec<Mark>,
@@ -119,6 +120,7 @@ fn evaluate_rule(
                 x,
                 y: Some(value),
                 label: fill(rule.label.as_deref().unwrap_or("{name} {delta}")),
+                rule: Some(n),
             });
         }
     }
