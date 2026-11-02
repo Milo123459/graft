@@ -330,16 +330,17 @@ pub struct Cli {
     #[arg(long, value_name = "HORIZON", num_args = 0..=1, require_equals = true, default_missing_value = "auto", help_heading = "Analysis")]
     pub forecast: Option<String>,
 
-    /// Draw trend lines: `--trend` (the fitted line, see --fit) or `--trend=avg`
-    /// (a moving average). The raw data is greyed so the trends stand out.
-    #[arg(long, value_enum, value_name = "STYLE", num_args = 0..=1, require_equals = true, default_missing_value = "fit", help_heading = "Analysis")]
-    pub trend: Option<TrendStyle>,
+    /// Trend lines, any combination: avg (moving average), median, p95 (rolling 95th
+    /// percentile), fit (the straight trend line). `--trend` alone = fit;
+    /// `--trend=avg,p95`. The raw data is drawn in a darker shade underneath.
+    #[arg(long, value_enum, value_name = "LINES", num_args = 0..=1, require_equals = true, value_delimiter = ',', default_missing_value = "fit", help_heading = "Analysis")]
+    pub trend: Vec<TrendStyle>,
 
     /// Show only the trend lines, not the raw data (implies --trend).
     #[arg(long, help_heading = "Analysis")]
     pub trend_only: bool,
 
-    /// Points in the moving average for --trend=avg (default: about 1/30 of the data).
+    /// Points in the moving average / median / p95 (default: 10% of the data, at least 10).
     #[arg(long, value_name = "N", help_heading = "Analysis")]
     pub trend_window: Option<usize>,
 
@@ -547,11 +548,15 @@ impl Cli {
                 format!("--forecast={f}")
             });
         }
-        if let Some(t) = self.trend {
-            a.push(match t {
-                TrendStyle::Fit => "--trend".into(),
-                TrendStyle::Avg => "--trend=avg".into(),
-            });
+        if !self.trend.is_empty() {
+            a.push(format!(
+                "--trend={}",
+                self.trend
+                    .iter()
+                    .map(|t| value_name(*t))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
         }
         if let Some(n) = self.explain {
             a.push(format!("--explain={n}"));
@@ -711,10 +716,35 @@ pub enum LegendPos {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum TrendStyle {
-    /// The fitted trend (linear or exponential, see --fit).
-    Fit,
-    /// A moving average.
+    /// Moving average.
+    #[value(alias = "average", alias = "mean")]
     Avg,
+    /// Moving median: like the average but ignores spikes.
+    Median,
+    /// Rolling 95th percentile: the slow end (good for latency).
+    P95,
+    /// The fitted trend line (linear or exponential, see --fit), as used for forecasts.
+    #[value(alias = "line", alias = "linear")]
+    Fit,
+}
+
+impl TrendStyle {
+    pub const ALL: [TrendStyle; 4] = [
+        TrendStyle::Avg,
+        TrendStyle::Median,
+        TrendStyle::P95,
+        TrendStyle::Fit,
+    ];
+
+    /// Short name for legends and buttons.
+    pub fn label(self) -> &'static str {
+        match self {
+            TrendStyle::Avg => "avg",
+            TrendStyle::Median => "median",
+            TrendStyle::P95 => "p95",
+            TrendStyle::Fit => "trend",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -873,7 +903,7 @@ mod tests {
                 "--explain=3",
                 "--forecast",
                 "--no-mouse",
-                "--trend=avg",
+                "--trend=avg,p95",
                 "--trend-only",
                 "--side-by-side",
                 "--trend-window",

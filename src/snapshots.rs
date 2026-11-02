@@ -210,8 +210,15 @@ pub fn scenarios() -> Vec<(String, String)> {
     app.test_keys("[");
     app.test_keys("[");
     add("view-timeframe", screen(&app, 150, 45));
-    let app = viewer(&[month, "-F", FMT, "--split", "--trend"]);
+    let app = viewer(&[month, "-F", FMT, "--split", "--trend=avg,median,p95"]);
     add("view-raw-and-trend", screen(&app, 150, 45));
+    let mut app = viewer(&[month, "-F", FMT, "--trend=avg"]);
+    app.test_keys("T");
+    add("view-lines-menu", screen(&app, 150, 45));
+    add("phone-lines-menu", screen(&app, 46, 34));
+    app.test_keys("\x1bR");
+    add("view-timeframe-menu", screen(&app, 150, 45));
+    add("phone-timeframe-menu", screen(&app, 46, 34));
     let app = viewer(&[cpu, "--kv", "--trend=avg"]);
     add("view-trend-avg-many", screen(&app, 150, 45));
     let app = viewer(&[

@@ -813,12 +813,15 @@ impl Builder {
                         }
                     }
                     Opt::Trend => {
-                        use crate::cli::TrendStyle::{Avg, Fit};
-                        c.trend = match c.trend {
-                            None => Some(Fit),
-                            Some(Fit) => Some(Avg),
-                            Some(Avg) => None,
-                        }
+                        // off → avg → avg + trend line → median + p95 → trend line → off
+                        use crate::cli::TrendStyle::{Avg, Median, P95};
+                        let cycle: [&[crate::cli::TrendStyle]; 4] =
+                            [&[], &[Avg], &[Median], &[Median, P95]];
+                        let i = cycle
+                            .iter()
+                            .position(|set| *set == c.trend.as_slice())
+                            .unwrap_or(0);
+                        c.trend = cycle[(i + 1) % cycle.len()].to_vec();
                     }
                     Opt::SideBySide => c.side_by_side = !c.side_by_side,
                     Opt::Range => {
@@ -949,14 +952,21 @@ impl Builder {
                 Hit::Opt(Opt::Fit),
             ),
             Button::new(
-                match c.trend {
-                    None => "trend: off",
-                    Some(crate::cli::TrendStyle::Fit) => "trend: line",
-                    Some(crate::cli::TrendStyle::Avg) => "trend: average",
+                if c.trend.is_empty() {
+                    "trends: off".to_string()
+                } else {
+                    format!(
+                        "trends: {}",
+                        c.trend
+                            .iter()
+                            .map(|t| t.label())
+                            .collect::<Vec<_>>()
+                            .join(" + ")
+                    )
                 },
                 Hit::Opt(Opt::Trend),
             )
-            .active(c.trend.is_some()),
+            .active(!c.trend.is_empty()),
             Button::new("side by side", Hit::Opt(Opt::SideBySide)).active(c.side_by_side),
             Button::new(
                 format!(

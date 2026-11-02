@@ -71,11 +71,15 @@ const HELP: &[(&str, &str)] = &[
         "project each trend forward (targets: --target)",
     ),
     ("split / x", "one panel per series, each with its own scale"),
-    ("all time / [ ]", "only show recent data: last 24h, 6h, 1h…"),
     (
-        "⋯",
-        "more: chart type, log scale, trend & target lines, pause,",
+        "all time ▾ / R",
+        "timeframe menu: last 1d, 6h, 5m… or custom",
     ),
+    (
+        "lines / T",
+        "lines menu: live, average, median, p95, window",
+    ),
+    ("⋯", "more: chart type, log scale, target lines, pause,"),
     (
         "",
         "format (change how lines are read), console, export, mouse",
@@ -83,12 +87,16 @@ const HELP: &[(&str, &str)] = &[
     ("— other keys —", ""),
     ("1-9 / a", "show or hide a series / show all"),
     ("t m y", "chart type, marker, log scale"),
-    ("T / G", "trend line over the data / target lines"),
+    ("[ ]", "narrower / wider timeframe"),
+    ("G", "target lines on/off"),
     (
         "F",
         "change the format or source (builder, with suggestions)",
     ),
-    ("e / space", "export to SVG / pause live updates"),
+    (
+        "e / space",
+        "export to SVG / pause the chart (data keeps being read)",
+    ),
     ("M", "mouse on/off (off = select text in your terminal)"),
     (":", "Rhai console, e.g. :slope(\"node1\", \"1d\")"),
     ("q / Esc", "quit (Esc first clears a measurement)"),
@@ -158,12 +166,12 @@ const CONSOLE_HELP: &[(&str, &str)] = &[
     ),
     ("— changing the chart —", ""),
     (
-        "trend(\"line\")",
-        "trend lines: \"line\", \"avg\" (moving average) or \"off\"",
+        "trend(\"avg,median\")",
+        "extra lines: avg, median, p95 (any mix), line, or \"off\"",
     ),
     (
         "raw(false)",
-        "hide the raw data (trend only); raw(true) brings it back",
+        "hide the live data (trends only); raw(true) brings it back",
     ),
     (
         "side_by_side(true)",
@@ -245,11 +253,11 @@ enum Cmd {
     Marker,
     Mouse,
     Trend,
-    TrendStyle,
     SideBySide,
     Targets,
     /// Step through timeframe presets (-1 narrower, +1 wider).
     RangeStep(i8),
+    RangeMenu,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -258,6 +266,13 @@ enum Hit {
     Series(usize),
     /// A timeframe preset (`None` = all data).
     Range(Option<Window>),
+    /// Lines menu: toggle a layer (`None` = live data), resize the window, close.
+    Layer(Option<TrendStyle>),
+    Window(bool),
+    CloseMenu,
+    /// Timeframe dropdown: type a range in the console.
+    CustomRange,
+    MenuBackground,
 }
 
 /// What a mouse press on the chart turned into.
@@ -316,8 +331,10 @@ pub struct App {
     drag: Option<Drag>,
     /// Horizon to use when forecasting is switched on.
     horizon: Horizon,
-    /// Trend style used when trend lines are switched on.
-    trend_style: TrendStyle,
+    /// The "lines" menu (live / avg / median / p95 / trend line) is open.
+    lines_menu: bool,
+    /// The timeframe dropdown is open.
+    range_menu: bool,
     hits: Hits<Hit>,
     plots: RefCell<Vec<PlotArea>>,
     /// The part of the data shown and analysed.
@@ -346,7 +363,6 @@ impl App {
             .filter_map(|(k, code)| Some((k.chars().next()?, code)))
             .collect();
         let horizon = opts.forecast.unwrap_or(Horizon::Auto);
-        let trend_style = opts.trend.unwrap_or(TrendStyle::Fit);
         let mut app = Self {
             alerts: cli.alert.clone(),
             show_stats: cli.stats,
@@ -379,7 +395,8 @@ impl App {
             toolbar_more: false,
             drag: None,
             horizon,
-            trend_style,
+            lines_menu: false,
+            range_menu: false,
             hits: Hits::default(),
             plots: RefCell::new(Vec::new()),
             timeframe,
@@ -399,8 +416,9 @@ impl App {
         c.stats = self.show_stats;
         c.no_mouse = !self.mouse;
         c.target = self.opts.analysis.targets.to_specs();
-        c.trend = self.opts.trend;
-        c.trend_only = self.opts.trend.is_some() && !self.opts.show_raw;
+        c.trend = self.opts.trends.clone();
+        c.trend_only = !self.opts.trends.is_empty() && !self.opts.show_raw;
+        c.trend_window = self.opts.trend_window;
         c.side_by_side = self.opts.side_by_side;
         c.no_targets = !self.opts.show_targets;
         c.last = self.timeframe.last;
@@ -645,32 +663,362 @@ impl App {
         self.set_timeframe(next.map_or_else(Timeframe::default, Timeframe::last));
     }
 
-    /// The "view" button: raw → raw + trend → trend only → raw.
-    fn cycle_view(&mut self) {
-        let (trend, raw) = match (self.opts.trend, self.opts.show_raw) {
-            (None, _) => (Some(self.trend_style), true),
-            (Some(_), true) => (Some(self.trend_style), false),
-            (Some(_), false) => (None, true),
-        };
-        self.opts.trend = trend;
-        self.opts.show_raw = raw;
-        self.say(
-            match (trend, raw) {
-                (None, _) => "showing the raw data",
-                (Some(_), true) => {
-                    "trend lines on top of the raw data (greyed) — ⋯ switches line / moving average"
+    /// Turn a layer on/off: `None` is the live data. At least one layer stays visible.
+    fn toggle_layer(&mut self, layer: Option<TrendStyle>) {
+        match layer {
+            None => {
+                self.opts.show_raw = !self.opts.show_raw;
+                if !self.opts.show_raw && self.opts.trends.is_empty() {
+                    self.opts.trends.push(TrendStyle::Avg);
                 }
-                (Some(_), false) => "trend lines only",
-            },
-            false,
-        );
+            }
+            Some(t) => {
+                if let Some(i) = self.opts.trends.iter().position(|x| *x == t) {
+                    self.opts.trends.remove(i);
+                    if self.opts.trends.is_empty() {
+                        self.opts.show_raw = true;
+                    }
+                } else {
+                    self.opts.trends.push(t);
+                    self.opts
+                        .trends
+                        .sort_by_key(|x| TrendStyle::ALL.iter().position(|a| a == x));
+                }
+            }
+        }
     }
 
-    fn view_label(&self) -> &'static str {
-        match (self.opts.trend, self.opts.show_raw) {
-            (None, _) => "view: raw",
-            (Some(_), true) => "view: raw + trend",
-            (Some(_), false) => "view: trend",
+    /// Grow/shrink the rolling window (average, median, p95).
+    fn change_window(&mut self, bigger: bool) {
+        let n = self
+            .ds
+            .series
+            .iter()
+            .map(|s| s.points.len())
+            .max()
+            .unwrap_or(10);
+        let w = self.opts.window_for(n) as f64;
+        let new = if bigger {
+            (w * 1.5).ceil()
+        } else {
+            (w / 1.5).floor()
+        };
+        self.opts.trend_window = Some((new as usize).clamp(2, n.max(2)));
+    }
+
+    /// Data on a time axis (log timestamps or arrival times) can be cut to a timeframe.
+    fn has_timeframes(&self) -> bool {
+        !self.presets.is_empty() || !self.timeframe.is_all()
+    }
+
+    /// Entries of the timeframe dropdown: all, then presets widest first.
+    fn range_options(&self) -> Vec<Option<Window>> {
+        let mut v = vec![None];
+        v.extend(self.presets.iter().rev().copied().map(Some));
+        v
+    }
+
+    fn current_preset(&self) -> Option<Option<Window>> {
+        if self.timeframe.is_all() {
+            return Some(None);
+        }
+        (self.timeframe.since.is_none() && self.timeframe.until.is_none())
+            .then_some(self.timeframe.last.map(Some))
+            .flatten()
+    }
+
+    fn on_range_menu_key(&mut self, key: KeyEvent) {
+        let opts = self.range_options();
+        let cur = self
+            .current_preset()
+            .and_then(|c| opts.iter().position(|o| *o == c));
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j' | ']') => {
+                let i = cur.map_or(0, |i| (i + 1).min(opts.len() - 1));
+                self.set_timeframe(opts[i].map_or_else(Timeframe::default, Timeframe::last));
+            }
+            KeyCode::Up | KeyCode::Char('k' | '[') => {
+                let i = cur.map_or(0, |i| i.saturating_sub(1));
+                self.set_timeframe(opts[i].map_or_else(Timeframe::default, Timeframe::last));
+            }
+            KeyCode::Char('c' | ':') => {
+                self.range_menu = false;
+                self.console = Some(TextInput::new("range(\""));
+            }
+            _ => self.range_menu = false,
+        }
+    }
+
+    /// A dropdown above the timeframe button (or centred when the toolbar is hidden).
+    fn draw_range_menu(&self, f: &mut Frame) {
+        let area = f.area();
+        let opts = self.range_options();
+        let current = self.current_preset();
+        let mut items: Vec<(String, Hit, bool)> = opts
+            .iter()
+            .map(|o| {
+                let label = match o {
+                    None => "all time".to_string(),
+                    Some(Window::Span(d)) => {
+                        format!("last {}", crate::time::fmt_duration_compact(*d))
+                    }
+                    Some(Window::Points(n)) => format!("last {n} points"),
+                };
+                (label, Hit::Range(*o), current == Some(*o))
+            })
+            .collect();
+        let custom_on = current.is_none();
+        items.push((
+            if custom_on {
+                format!("{} (edit…)", self.timeframe.label(&self.ds))
+            } else {
+                "custom…".into()
+            },
+            Hit::CustomRange,
+            custom_on,
+        ));
+        let w = (items.iter().map(|i| i.0.chars().count()).max().unwrap_or(8) as u16 + 6)
+            .min(area.width);
+        let h = (items.len() as u16 + 2).min(area.height);
+        let anchor = self.hits.find(|h| matches!(h, Hit::Cmd(Cmd::RangeMenu)));
+        let (x, y) = match anchor {
+            Some(r) => (
+                r.x.min(area.width.saturating_sub(w)),
+                if r.y >= h {
+                    r.y - h
+                } else {
+                    (r.y + 1).min(area.height.saturating_sub(h))
+                },
+            ),
+            None => ((area.width - w) / 2, area.height.saturating_sub(h) / 2),
+        };
+        let rect = Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        };
+        Clear.render(rect, f.buffer_mut());
+        let block = Block::bordered()
+            .title(" timeframe ")
+            .border_style(Style::default().fg(Color::Yellow));
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        self.hits.push(rect, Hit::MenuBackground);
+        for (row, (label, hit, on)) in items.into_iter().enumerate() {
+            let y = inner.y + row as u16;
+            if y >= inner.bottom() {
+                break;
+            }
+            let r = Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            };
+            let style = if on {
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let mark = if on { "●" } else { " " };
+            f.render_widget(
+                Span::styled(
+                    format!(
+                        "{mark} {label:<width$}",
+                        width = r.width.saturating_sub(2) as usize
+                    ),
+                    style,
+                ),
+                r,
+            );
+            self.hits.push(r, hit);
+        }
+    }
+
+    fn lines_label(&self) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        if self.opts.show_raw || self.opts.trends.is_empty() {
+            parts.push("live");
+        }
+        parts.extend(self.opts.trends.iter().map(|t| t.label()));
+        format!("lines: {}", parts.join(" + "))
+    }
+
+    /// How much time `points` samples cover, on a time axis.
+    fn window_span(&self, points: usize) -> Option<f64> {
+        if self.ds.x_kind != crate::data::XKind::Time {
+            return None;
+        }
+        let s = self.ds.series.iter().max_by_key(|s| s.points.len())?;
+        let (a, b) = (s.points.first()?.0, s.points.last()?.0);
+        (s.points.len() > 1).then(|| (b - a) / (s.points.len() - 1) as f64 * points as f64)
+    }
+
+    fn on_lines_menu_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('l') => self.toggle_layer(None),
+            KeyCode::Char('a') => self.toggle_layer(Some(TrendStyle::Avg)),
+            KeyCode::Char('m') => self.toggle_layer(Some(TrendStyle::Median)),
+            KeyCode::Char('p') => self.toggle_layer(Some(TrendStyle::P95)),
+            KeyCode::Char('+' | '=') => self.change_window(true),
+            KeyCode::Char('-' | '_') => self.change_window(false),
+            KeyCode::Char('D') => self.opts.side_by_side = !self.opts.side_by_side,
+            _ => self.lines_menu = false,
+        }
+    }
+
+    fn draw_lines_menu(&self, f: &mut Frame) {
+        let area = f.area();
+        let w = 64.min(area.width);
+        let n = self
+            .ds
+            .series
+            .iter()
+            .map(|s| s.points.len())
+            .max()
+            .unwrap_or(0);
+        // The straight fit isn't offered here: it's what `forecast` draws.
+        let mut rows: Vec<(Option<TrendStyle>, &str, &str)> = vec![
+            (None, "live", "the data as it comes in"),
+            (
+                Some(TrendStyle::Avg),
+                "average",
+                "moving average (spikes pull it up)",
+            ),
+            (
+                Some(TrendStyle::Median),
+                "median",
+                "the typical value, ignores spikes",
+            ),
+            (
+                Some(TrendStyle::P95),
+                "p95",
+                "95% of values are below this line",
+            ),
+        ];
+        if self.opts.trends.contains(&TrendStyle::Fit) {
+            rows.push((
+                Some(TrendStyle::Fit),
+                "trend line",
+                "straight fit (as used by forecast)",
+            ));
+        }
+        let h = (rows.len() as u16 + 7).min(area.height);
+        let rect = Rect {
+            x: (area.width - w) / 2,
+            y: (area.height.saturating_sub(h)) / 2,
+            width: w,
+            height: h,
+        };
+        Clear.render(rect, f.buffer_mut());
+        let block = Block::bordered()
+            .title(" lines to show · tap to turn on/off ")
+            .border_style(Style::default().fg(Color::Yellow));
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        self.hits.push(rect, Hit::MenuBackground);
+        let mut y = inner.y;
+        for (layer, name, desc) in rows {
+            if y >= inner.bottom() {
+                break;
+            }
+            let on = match layer {
+                None => self.opts.show_raw || self.opts.trends.is_empty(),
+                Some(t) => self.opts.trends.contains(&t),
+            };
+            let label = format!("{} {name}", if on { "☑" } else { "☐" });
+            let bw = 14.min(inner.width);
+            let style = if on {
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White).bg(Color::DarkGray)
+            };
+            let r = Rect {
+                x: inner.x,
+                y,
+                width: bw,
+                height: 1,
+            };
+            f.render_widget(Span::styled(format!(" {label:<12}"), style), r);
+            self.hits.push(r, Hit::Layer(layer));
+            f.render_widget(
+                Span::styled(desc, Style::default().fg(Color::Gray)),
+                Rect {
+                    x: inner.x + bw + 1,
+                    y,
+                    width: inner.width.saturating_sub(bw + 1),
+                    height: 1,
+                },
+            );
+            y += 1;
+        }
+        y += 1;
+        if y < inner.bottom() {
+            let pts = self.opts.window_for(n.max(1));
+            let span = self
+                .window_span(pts)
+                .map(|d| format!(" (≈{})", crate::time::fmt_duration_compact(d)))
+                .unwrap_or_default();
+            let text = format!("window: {pts} points{span}  ");
+            f.render_widget(
+                Span::raw(text.clone()),
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+            let x = inner.x + text.chars().count() as u16;
+            let buttons = vec![
+                Button::new("−", Hit::Window(false)),
+                Button::new("+", Hit::Window(true)),
+            ];
+            render_buttons(
+                &buttons,
+                Rect {
+                    x,
+                    y,
+                    width: inner.right().saturating_sub(x),
+                    height: 1,
+                },
+                f.buffer_mut(),
+                &self.hits,
+            );
+            y += 2;
+        }
+        if y < inner.bottom() {
+            let buttons = vec![
+                Button::new("side by side", Hit::Cmd(Cmd::SideBySide))
+                    .active(self.opts.side_by_side),
+                Button::new("done", Hit::CloseMenu),
+            ];
+            render_buttons(
+                &buttons,
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
+                f.buffer_mut(),
+                &self.hits,
+            );
+        }
+        if inner.bottom() > inner.y {
+            f.render_widget(
+                Span::styled(
+                    "keys: l a m p toggle · + − window · Esc closes",
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Rect {
+                    x: inner.x,
+                    y: inner.bottom() - 1,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
         }
     }
 
@@ -805,19 +1153,17 @@ impl App {
             }
             Cmd::Quit => return Transition::Quit,
             Cmd::More => self.toolbar_more = !self.toolbar_more,
-            Cmd::Trend => self.cycle_view(),
-            Cmd::TrendStyle => {
-                self.trend_style = match self.trend_style {
-                    TrendStyle::Fit => TrendStyle::Avg,
-                    TrendStyle::Avg => TrendStyle::Fit,
-                };
-                if self.opts.trend.is_some() {
-                    self.opts.trend = Some(self.trend_style);
-                }
+            Cmd::Trend => {
+                self.lines_menu = !self.lines_menu;
+                self.range_menu = false;
             }
             Cmd::SideBySide => self.opts.side_by_side = !self.opts.side_by_side,
             Cmd::Targets => self.opts.show_targets = !self.opts.show_targets,
             Cmd::RangeStep(dir) => self.step_timeframe(dir),
+            Cmd::RangeMenu => {
+                self.range_menu = !self.range_menu;
+                self.lines_menu = false;
+            }
             Cmd::Mouse => {
                 self.mouse = !self.mouse;
                 self.say(
@@ -896,25 +1242,20 @@ impl App {
                 Ok(h) => self.opts.forecast = h,
                 Err(e) => self.say(format!("forecast: {e}"), true),
             },
-            Action::Trend(t) => match t.as_deref() {
-                None => self.opts.trend = None,
-                Some("fit" | "line" | "linear") => {
-                    self.trend_style = TrendStyle::Fit;
-                    self.opts.trend = Some(TrendStyle::Fit);
+            Action::Trend(t) => match t {
+                None => {
+                    self.opts.trends.clear();
+                    self.opts.show_raw = true;
                 }
-                Some("avg" | "average" | "smooth") => {
-                    self.trend_style = TrendStyle::Avg;
-                    self.opts.trend = Some(TrendStyle::Avg);
-                }
-                Some(other) => self.say(
-                    format!("trend: use \"line\", \"avg\" or \"off\" (not \"{other}\")"),
-                    true,
-                ),
+                Some(list) => match list.split(',').map(|x| TrendStyle::from_str(x.trim(), true)).collect::<Result<Vec<_>, _>>() {
+                    Ok(v) => self.opts.trends = v,
+                    Err(_) => self.say(format!("trend: use avg, median, p95 or line (comma separated), or \"off\" — not \"{list}\""), true),
+                },
             },
             Action::Raw(on) => {
                 self.opts.show_raw = on;
-                if !on && self.opts.trend.is_none() {
-                    self.opts.trend = Some(self.trend_style);
+                if !on && self.opts.trends.is_empty() {
+                    self.opts.trends.push(TrendStyle::Avg);
                 }
             }
             Action::SideBySide(on) => self.opts.side_by_side = on,
@@ -973,6 +1314,14 @@ impl App {
         }
         if self.console.is_some() {
             self.on_console_key(key);
+            return Transition::None;
+        }
+        if self.lines_menu {
+            self.on_lines_menu_key(key);
+            return Transition::None;
+        }
+        if self.range_menu {
+            self.on_range_menu_key(key);
             return Transition::None;
         }
         if self.help || self.console_help {
@@ -1062,6 +1411,7 @@ impl App {
             KeyCode::Char('T') => Cmd::Trend,
             KeyCode::Char('D') => Cmd::SideBySide,
             KeyCode::Char('G') => Cmd::Targets,
+            KeyCode::Char('R') => Cmd::RangeMenu,
             KeyCode::Char('[') => Cmd::RangeStep(-1),
             KeyCode::Char(']') => Cmd::RangeStep(1),
             KeyCode::Char(' ' | 'p') => Cmd::Pause,
@@ -1105,13 +1455,39 @@ impl App {
                         Hit::Cmd(cmd) => self.run_cmd(cmd),
                         Hit::Range(w) => {
                             self.set_timeframe(w.map_or_else(Timeframe::default, Timeframe::last));
+                            self.range_menu = false;
+                            Transition::None
+                        }
+                        Hit::CustomRange => {
+                            self.range_menu = false;
+                            self.console = Some(TextInput::new("range(\""));
+                            self.say("e.g. range(\"2h\"), range(\"2026-11-01\", \"2026-11-02 12:00\") or range(\"all\")", false);
                             Transition::None
                         }
                         Hit::Series(i) => {
                             self.toggle_series(i);
                             Transition::None
                         }
+                        Hit::Layer(l) => {
+                            self.toggle_layer(l);
+                            Transition::None
+                        }
+                        Hit::Window(bigger) => {
+                            self.change_window(bigger);
+                            Transition::None
+                        }
+                        Hit::CloseMenu => {
+                            self.lines_menu = false;
+                            Transition::None
+                        }
+                        Hit::MenuBackground => Transition::None,
                     };
+                }
+                if self.lines_menu || self.range_menu {
+                    // A tap outside a menu closes it.
+                    self.lines_menu = false;
+                    self.range_menu = false;
+                    return Transition::None;
                 }
                 // Shift+click: measure from the cursor (or the previous shift+click) to here.
                 if let Some(plot) = self.plot_at(col, row)
@@ -1215,13 +1591,14 @@ impl App {
             )
             .active(self.measuring || self.anchor.is_some() || self.selection.is_some()),
             b("stats", Cmd::Stats).active(self.show_stats),
-            b(self.view_label(), Cmd::Trend).active(self.opts.trend.is_some()),
+            b(&self.lines_label(), Cmd::Trend)
+                .active(self.lines_menu || !self.opts.trends.is_empty()),
             b("side by side", Cmd::SideBySide).active(self.opts.side_by_side),
             b("forecast", Cmd::Forecast).active(self.opts.forecast.is_some()),
             b("split", Cmd::Split).active(self.opts.split),
         ];
-        // The timeframe picker (tap to step to a narrower range, wrapping to all).
-        if !self.presets.is_empty() || !self.timeframe.is_all() {
+        // The timeframe dropdown.
+        if self.has_timeframes() {
             let label = if self.timeframe.is_all() {
                 "all time".to_string()
             } else if self.timeframe.last.is_some() {
@@ -1229,31 +1606,16 @@ impl App {
             } else {
                 self.timeframe.label(&self.ds)
             };
-            v.push(b(&label, Cmd::RangeStep(-1)).active(!self.timeframe.is_all()));
+            v.push(
+                b(&format!("{label} ▾"), Cmd::RangeMenu)
+                    .active(self.range_menu || !self.timeframe.is_all()),
+            );
         }
         v.push(
             b(if self.toolbar_more { "less" } else { "⋯" }, Cmd::More).active(self.toolbar_more),
         );
         if self.toolbar_more {
-            let current = (self.timeframe.since.is_none() && self.timeframe.until.is_none())
-                .then_some(self.timeframe.last)
-                .flatten();
-            v.push(Button::new("all", Hit::Range(None)).active(self.timeframe.is_all()));
-            for w in &self.presets {
-                let label = match w {
-                    Window::Span(d) => crate::time::fmt_duration_compact(*d),
-                    Window::Points(n) => format!("{n} pts"),
-                };
-                v.push(Button::new(label, Hit::Range(Some(*w))).active(current == Some(*w)));
-            }
             v.extend([
-                b(
-                    match self.trend_style {
-                        TrendStyle::Fit => "trend: line",
-                        TrendStyle::Avg => "trend: average",
-                    },
-                    Cmd::TrendStyle,
-                ),
                 b("targets", Cmd::Targets).active(self.opts.show_targets),
                 b(self.opts.kind.name(), Cmd::Kind),
                 b("log", Cmd::Log).active(self.opts.log),
@@ -1354,6 +1716,12 @@ impl App {
                 true,
                 "type help to see every command · Enter runs · Esc closes",
             );
+        }
+        if self.lines_menu {
+            self.draw_lines_menu(f);
+        }
+        if self.range_menu {
+            self.draw_range_menu(f);
         }
         if self.help {
             let mut entries: Vec<(String, String, Color)> = HELP
@@ -1966,18 +2334,20 @@ mod tests {
     #[test]
     fn timeframe_picker_and_line_toggles() {
         let mut app = app(&["graft", LOG, "--forecast", "--target", "node1=50GB"]);
-        // 28 h of data → presets 1h, 6h, 24h.
-        assert_eq!(
-            app.presets,
-            [
-                Window::Span(3600.0),
-                Window::Span(21600.0),
-                Window::Span(86400.0)
-            ]
-        );
-        // Tap "range: all" → steps to the widest preset.
-        let (x, y) = find(&app, "all time");
+        // 28 h of hourly data → presets 6h, 24h (1h would hold a single point).
+        assert_eq!(app.presets, [Window::Span(21600.0), Window::Span(86400.0)]);
+        // Tap "all time ▾" → a dropdown; tap "last 1d" in it.
+        let (x, y) = find(&app, "all time ▾");
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert!(app.range_menu);
+        let s = screen(&app);
+        assert!(
+            s.contains("timeframe") && s.contains("last 6h") && s.contains("custom…"),
+            "{s}"
+        );
+        let (x, y) = find(&app, "last 1d");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert!(!app.range_menu);
         assert_eq!(app.timeframe.last, Some(Window::Span(86400.0)));
         assert!(app.ds.series[0].points.len() < 29);
         key(&mut app, KeyCode::Char('['));
@@ -1986,12 +2356,13 @@ mod tests {
         key(&mut app, KeyCode::Char(']'));
         key(&mut app, KeyCode::Char(']'));
         assert!(app.timeframe.is_all());
-        // Preset buttons under ⋯, and the console.
-        let (x, y) = find(&app, " ⋯ ");
-        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
-        let (x, y) = find(&app, " 6h ");
-        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        // Keyboard: R opens the dropdown, ↓ moves to narrower ranges, Esc closes.
+        key(&mut app, KeyCode::Char('R'));
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Down);
         assert_eq!(app.timeframe.last, Some(Window::Span(21600.0)));
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.range_menu);
         assert_eq!(app.current_cli().last, Some(Window::Span(21600.0)));
         key(&mut app, KeyCode::Char(':'));
         type_str(&mut app, "range(\"all\")");
@@ -2002,7 +2373,9 @@ mod tests {
         key(&mut app, KeyCode::Char('G'));
         assert!(!screen(&app).contains("node1 target"));
         key(&mut app, KeyCode::Char('T'));
-        assert!(app.opts.trend.is_some() && app.current_cli().trend.is_some());
+        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.current_cli().trend, [TrendStyle::Avg]);
     }
 
     #[test]
@@ -2152,30 +2525,46 @@ mod tests {
         key(&mut app, KeyCode::Down);
         key(&mut app, KeyCode::Char('x'));
         assert!(!app.console_help);
-        // view: raw → raw + trend → trend only → raw
-        let (x, y) = find(&app, "view: raw");
+        // The lines menu: tick any mix of layers.
+        let (x, y) = find(&app, "lines: live");
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
-        assert_eq!(
-            (app.opts.trend, app.opts.show_raw),
-            (Some(TrendStyle::Fit), true)
+        assert!(app.lines_menu);
+        let (x, y) = find(&app, "☐ average");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        let (x, y) = find(&app, "☐ median");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert_eq!(app.opts.trends, [TrendStyle::Avg, TrendStyle::Median]);
+        key(&mut app, KeyCode::Char('l'));
+        assert!(!app.opts.show_raw);
+        let w = app.opts.window_for(29);
+        key(&mut app, KeyCode::Char('+'));
+        assert!(app.opts.window_for(29) > w);
+        let (x, y) = find(&app, " done ");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert!(!app.lines_menu);
+        let s = screen(&app);
+        assert!(
+            s.contains("lines: avg + median") && s.contains("node1 avg"),
+            "{s}"
         );
+        let cli = app.current_cli();
+        assert!(cli.trend_only && cli.trend == [TrendStyle::Avg, TrendStyle::Median]);
+        // Turning every trend off brings the live data back.
         key(&mut app, KeyCode::Char('T'));
-        assert_eq!(
-            (app.opts.trend, app.opts.show_raw),
-            (Some(TrendStyle::Fit), false)
-        );
-        assert!(screen(&app).contains("view: trend"));
-        key(&mut app, KeyCode::Char('T'));
-        assert_eq!(app.opts.trend, None);
-        // Console control, moving average, side by side.
+        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Char('m'));
+        assert!(app.opts.trends.is_empty() && app.opts.show_raw);
+        key(&mut app, KeyCode::Esc);
+        // Console control, several layers, side by side.
         key(&mut app, KeyCode::Char(':'));
-        type_str(&mut app, "trend(\"avg\"); side_by_side(true)");
+        type_str(&mut app, "trend(\"avg,p95\"); side_by_side(true)");
         key(&mut app, KeyCode::Enter);
-        assert_eq!(app.opts.trend, Some(TrendStyle::Avg));
+        assert_eq!(app.opts.trends, [TrendStyle::Avg, TrendStyle::P95]);
         let s = screen(&app);
         assert!(s.contains("· live") && s.contains("· trend"), "{s}");
         let cli = app.current_cli();
-        assert_eq!((cli.trend, cli.side_by_side), (Some(TrendStyle::Avg), true));
+        assert_eq!(cli.trend, [TrendStyle::Avg, TrendStyle::P95]);
+        assert!(cli.side_by_side);
     }
 
     #[test]

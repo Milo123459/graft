@@ -191,9 +191,11 @@ pub fn chart_opts(cli: &Cli, spec: &SourceSpec, analysis: Analysis) -> Result<Ch
         bins: cli.bins.max(1),
         split: cli.split,
         x_format: cli.x_format.clone(),
-        trend: cli
-            .trend
-            .or(cli.trend_only.then_some(crate::cli::TrendStyle::Fit)),
+        trends: if cli.trend.is_empty() && cli.trend_only {
+            vec![crate::cli::TrendStyle::Avg]
+        } else {
+            cli.trend.clone()
+        },
         trend_window: cli.trend_window,
         show_raw: !cli.trend_only,
         side_by_side: cli.side_by_side,

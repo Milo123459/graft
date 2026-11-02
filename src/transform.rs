@@ -236,6 +236,21 @@ impl Timeframe {
     }
 }
 
+/// Typical gap between samples (the median), so presets hold more than a couple of points.
+fn spacing(ds: &Dataset) -> f64 {
+    let mut gaps: Vec<f64> = ds
+        .series
+        .iter()
+        .flat_map(|s| s.points.windows(2).map(|w| w[1].0 - w[0].0))
+        .filter(|g| *g > 0.0)
+        .collect();
+    if gaps.is_empty() {
+        return 0.0;
+    }
+    gaps.sort_by(f64::total_cmp);
+    gaps[gaps.len() / 2]
+}
+
 /// Timeframe presets that make sense for a dataset (shorter than its span), smallest first.
 pub fn timeframe_presets(ds: &Dataset) -> Vec<Window> {
     let Some((a, b)) = ds.x_range() else {
@@ -243,6 +258,9 @@ pub fn timeframe_presets(ds: &Dataset) -> Vec<Window> {
     };
     match ds.x_kind {
         XKind::Time => [
+            60.0,
+            5.0 * 60.0,
+            15.0 * 60.0,
             3600.0,
             6.0 * 3600.0,
             86400.0,
@@ -252,7 +270,7 @@ pub fn timeframe_presets(ds: &Dataset) -> Vec<Window> {
             365.0 * 86400.0,
         ]
         .into_iter()
-        .filter(|d| *d < b - a)
+        .filter(|d| *d < b - a && *d >= 4.0 * spacing(ds))
         .map(Window::Span)
         .collect(),
         _ => {
@@ -445,8 +463,12 @@ mod tests {
         );
         let long = Dataset {
             x_kind: XKind::Time,
-            series: vec![s("a", &[0.0, 2.0 * 86400.0])],
+            series: vec![s(
+                "a",
+                &(0..=288).map(|i| i as f64 * 600.0).collect::<Vec<_>>(),
+            )],
         };
+        // Samples every 10 min: windows shorter than 4 samples aren't offered.
         assert_eq!(
             timeframe_presets(&long),
             [

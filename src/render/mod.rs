@@ -84,9 +84,9 @@ pub struct ChartOpts {
     pub analysis: Analysis,
     /// Project trends this far into the future.
     pub forecast: Option<Horizon>,
-    /// Draw trend lines (fit or moving average) over the data.
-    pub trend: Option<TrendStyle>,
-    /// Points in the moving average (default: about 1/30 of the data).
+    /// Trend lines drawn over the data (any combination).
+    pub trends: Vec<TrendStyle>,
+    /// Points in the rolling windows (default: 10% of the data, at least 10).
     pub trend_window: Option<usize>,
     /// Draw the raw data (off for "trend only").
     pub show_raw: bool,
@@ -113,7 +113,7 @@ impl Default for ChartOpts {
             x_format: None,
             analysis: Analysis::default(),
             forecast: None,
-            trend: None,
+            trends: Vec::new(),
             trend_window: None,
             show_raw: true,
             side_by_side: false,
@@ -127,36 +127,54 @@ impl ChartOpts {
         self.palette[idx % self.palette.len()]
     }
 
-    /// A series' trend line: the fitted curve over the data it was fitted to, or a
-    /// centred moving average.
-    pub fn trend_points(&self, s: &Series) -> Option<Vec<(f64, f64)>> {
-        match self.trend? {
+    /// Points in the rolling windows for a series of `n` points.
+    pub fn window_for(&self, n: usize) -> usize {
+        self.trend_window
+            .unwrap_or((n / 10).clamp(10, 500))
+            .clamp(1, n.max(1))
+    }
+
+    /// A trend layer for a series, evaluated at up to `max_out` points.
+    pub fn trend_points(
+        &self,
+        s: &Series,
+        style: TrendStyle,
+        max_out: usize,
+    ) -> Option<Vec<(f64, f64)>> {
+        match style {
             TrendStyle::Fit => {
                 let fit = self.analysis.fit(s)?;
                 Some(projection_points(&fit, fit.x_first, fit.x_last))
             }
-            TrendStyle::Avg => {
+            rolling => {
                 let n = s.points.len();
-                (n >= 2).then(|| {
-                    moving_average(&s.points, self.trend_window.unwrap_or((n / 30).max(3)))
-                })
+                (n >= 2).then(|| rolling_stat(&s.points, self.window_for(n), rolling, max_out))
             }
         }
     }
 
-    /// The trend's value at x (for the cursor readout).
-    pub fn trend_at(&self, s: &Series, x: f64) -> Option<f64> {
-        match self.trend? {
+    /// A trend layer's value at x (for the cursor readout).
+    pub fn trend_at(&self, s: &Series, style: TrendStyle, x: f64) -> Option<f64> {
+        match style {
             TrendStyle::Fit => {
                 let fit = self.analysis.fit(s)?;
                 (fit.x_first..=fit.x_last).contains(&x).then(|| fit.at(x))
             }
-            TrendStyle::Avg => {
-                let pts = self.trend_points(s)?;
-                let i = pts.partition_point(|p| p.0 < x).min(pts.len() - 1);
-                Some(pts[i].1)
+            rolling => {
+                let n = s.points.len();
+                if n < 2 || x < s.points[0].0 || x > s.points[n - 1].0 {
+                    return None;
+                }
+                let i = s.points.partition_point(|p| p.0 < x).min(n - 1);
+                Some(window_stat(&s.points, i, self.window_for(n), rolling))
             }
         }
+    }
+
+    /// The latest value of a trend layer.
+    pub fn trend_last(&self, s: &Series, style: TrendStyle) -> Option<f64> {
+        let last = s.points.last()?.0;
+        self.trend_at(s, style, last)
     }
 
     /// The projection for one series: its fit and how far ahead to draw it.
@@ -329,20 +347,88 @@ pub fn visible_points(s: &Series, x0: f64, x1: f64, buckets: usize) -> Vec<(f64,
     out
 }
 
-/// Centred moving average over `window` points (shrinking at the edges).
-pub fn moving_average(points: &[(f64, f64)], window: usize) -> Vec<(f64, f64)> {
+/// One trend line of a series: (series index, series, style, points).
+type TrendLayer<'a> = (usize, &'a Series, TrendStyle, Vec<(f64, f64)>);
+/// Points to draw, their style, and an optional legend label.
+type StyledLine = (Vec<(f64, f64)>, Style, Option<String>);
+
+/// A rolling statistic around index `i`.
+///
+/// Median and p95 look at the `window` points centred on `i`. The average is weighted
+/// towards the centre (a Gaussian with σ = window/3, reaching out one window each side):
+/// a plain boxcar mean jumps by spike/window every time a spike enters or leaves the
+/// window, which draws a staircase; weighting lets spikes fade in and out instead.
+fn window_stat(points: &[(f64, f64)], i: usize, window: usize, style: TrendStyle) -> f64 {
     let n = points.len();
-    let half = window.max(1) / 2;
-    let mut prefix = Vec::with_capacity(n + 1);
-    prefix.push(0.0);
-    for p in points {
-        prefix.push(prefix.last().copied().unwrap_or(0.0) + p.1);
-    }
-    (0..n)
-        .map(|i| {
+    let window = window.max(1);
+    match style {
+        TrendStyle::Median | TrendStyle::P95 => {
+            let half = window / 2;
             let (a, b) = (i.saturating_sub(half), (i + half + 1).min(n));
-            (points[i].0, (prefix[b] - prefix[a]) / (b - a) as f64)
-        })
+            let mut v: Vec<f64> = points[a..b].iter().map(|p| p.1).collect();
+            v.sort_by(f64::total_cmp);
+            crate::stats::percentile(&v, if style == TrendStyle::P95 { 0.95 } else { 0.5 })
+        }
+        _ => {
+            let sigma = (window as f64 / 3.0).max(0.5);
+            let (a, b) = (i.saturating_sub(window), (i + window + 1).min(n));
+            let (mut sum, mut weights) = (0.0, 0.0);
+            for (j, p) in points.iter().enumerate().take(b).skip(a) {
+                let d = (j as f64 - i as f64) / sigma;
+                let w = (-0.5 * d * d).exp();
+                sum += w * p.1;
+                weights += w;
+            }
+            sum / weights
+        }
+    }
+}
+
+/// A centred rolling statistic, evaluated at up to `max_out` evenly spaced points.
+pub fn rolling_stat(
+    points: &[(f64, f64)],
+    window: usize,
+    style: TrendStyle,
+    max_out: usize,
+) -> Vec<(f64, f64)> {
+    let n = points.len();
+    let step = (n / max_out.max(1)).max(1);
+    let mut out: Vec<(f64, f64)> = (0..n)
+        .step_by(step)
+        .map(|i| (points[i].0, window_stat(points, i, window, style)))
+        .collect();
+    if !(n - 1).is_multiple_of(step) {
+        out.push((points[n - 1].0, window_stat(points, n - 1, window, style)));
+    }
+    out
+}
+
+/// A lighter tint of a series colour (median / p95 lines).
+pub fn light_color(c: Color) -> Color {
+    match c {
+        Color::Indexed(81) => Color::Indexed(153),
+        Color::Indexed(213) => Color::Indexed(219),
+        Color::Indexed(221) => Color::Indexed(229),
+        Color::Indexed(114) => Color::Indexed(157),
+        Color::Indexed(209) => Color::Indexed(216),
+        Color::Indexed(141) => Color::Indexed(183),
+        Color::Indexed(203) => Color::Indexed(210),
+        Color::Indexed(43) => Color::Indexed(122),
+        Color::Indexed(33) => Color::Indexed(75),
+        Color::Indexed(186) => Color::Indexed(230),
+        Color::Indexed(168) => Color::Indexed(218),
+        Color::Rgb(r, g, b) => Color::Rgb(r / 2 + 128, g / 2 + 128, b / 2 + 128),
+        _ => Color::White,
+    }
+}
+
+/// Split a polyline into dashes: every other run of `run` points.
+fn dash_polyline(pts: &[(f64, f64)], run: usize) -> Vec<Vec<(f64, f64)>> {
+    let run = run.max(2);
+    pts.chunks(run)
+        .step_by(2)
+        .map(|c| c.to_vec())
+        .filter(|c| c.len() >= 2)
         .collect()
 }
 
@@ -885,10 +971,13 @@ impl<'a> ChartWidget<'a> {
             }
         }
 
-        // Trend lines (solid, in the series' colour), limited to the view.
-        let mut trends: Vec<Prepared> = Vec::new();
+        // Trend layers, limited to the view (each evaluated at ~2 points per column).
+        let mut trends: Vec<TrendLayer> = Vec::new();
         for &(i, s, _) in &lines {
-            if let Some(pts) = self.opts.trend_points(s) {
+            for &style in &self.opts.trends {
+                let Some(pts) = self.opts.trend_points(s, style, buckets * 4) else {
+                    continue;
+                };
                 let tmp = Series {
                     name: String::new(),
                     unit: s.unit.clone(),
@@ -896,7 +985,7 @@ impl<'a> ChartWidget<'a> {
                 };
                 let mut pts = visible_points(&tmp, x0, x1, buckets);
                 to_log(&mut pts);
-                trends.push((i, s, pts));
+                trends.push((i, s, style, pts));
             }
         }
         let raw_shown = self.opts.show_raw || trends.is_empty();
@@ -907,7 +996,7 @@ impl<'a> ChartWidget<'a> {
             .chain(
                 trends
                     .iter()
-                    .flat_map(|t| t.2.iter().filter(|p| p.0 >= x0 && p.0 <= x1).map(|p| p.1)),
+                    .flat_map(|t| t.3.iter().filter(|p| p.0 >= x0 && p.0 <= x1).map(|p| p.1)),
             )
             .chain(
                 projections
@@ -1060,22 +1149,66 @@ impl<'a> ChartWidget<'a> {
                     .graph_type(graph)
                     .marker(mk)
                     .style(style);
-                datasets.push(if trends.is_empty() {
-                    d.name(format!("{} {}", s.name, last_text(s)))
+                let label = if trends.is_empty() {
+                    format!("{} {}", s.name, last_text(s))
                 } else {
-                    d
-                });
+                    format!("{} live {}", s.name, last_text(s))
+                };
+                datasets.push(d.name(label));
             }
         }
-        for (i, s, pts) in &trends {
-            datasets.push(
-                RDataset::default()
-                    .name(format!("{} {}", s.name, last_text(s)))
-                    .data(pts)
-                    .graph_type(GraphType::Line)
-                    .marker(Marker::Braille)
-                    .style(Style::default().fg(self.opts.color(*i))),
-            );
+        // avg: bright, solid · median: light, solid · p95: light, dashed · trend: bright, dashed.
+        let mut trend_lines: Vec<StyledLine> = Vec::new();
+        for (i, s, style, pts) in &trends {
+            let color = self.opts.color(*i);
+            let color = match style {
+                TrendStyle::Median | TrendStyle::P95 => light_color(color),
+                _ => color,
+            };
+            let value = self
+                .opts
+                .trend_last(s, *style)
+                .map(|v| s.unit.format(v))
+                .unwrap_or_default();
+            let label = Some(format!("{} {} {value}", s.name, style.label()));
+            match style {
+                TrendStyle::Avg | TrendStyle::Median => {
+                    trend_lines.push((pts.clone(), Style::default().fg(color), label))
+                }
+                TrendStyle::P95 | TrendStyle::Fit => {
+                    let run = (pts.len() / ((cols as usize / 3).max(2))).max(2);
+                    let dashes = if *style == TrendStyle::Fit && pts.len() <= 49 {
+                        let (a, b) = (pts[0], pts[pts.len() - 1]);
+                        let pieces = (cols * (b.0 - a.0) / (x1 - x0) / 3.0) as usize;
+                        dashed(
+                            |x| a.1 + (b.1 - a.1) * (x - a.0) / (b.0 - a.0).max(f64::MIN_POSITIVE),
+                            a.0,
+                            b.0,
+                            pieces,
+                        )
+                    } else {
+                        dash_polyline(pts, run)
+                    };
+                    for (k, dash) in dashes.into_iter().enumerate() {
+                        trend_lines.push((
+                            dash,
+                            Style::default().fg(color),
+                            if k == 0 { label.clone() } else { None },
+                        ));
+                    }
+                }
+            }
+        }
+        for (pts, style, label) in &trend_lines {
+            let d = RDataset::default()
+                .data(pts)
+                .graph_type(GraphType::Line)
+                .marker(Marker::Braille)
+                .style(*style);
+            datasets.push(match label {
+                Some(l) => d.name(l.clone()),
+                None => d,
+            });
         }
 
         let block = self.block_titled(title);
@@ -1157,17 +1290,25 @@ impl<'a> ChartWidget<'a> {
         )];
         for &(i, s) in series {
             if let Some((v, projected)) = value_at(s, self.opts, x) {
-                let trend = (!projected).then(|| self.opts.trend_at(s, x)).flatten();
-                let text = match (projected, trend) {
-                    (true, _) => format!("≈{} (forecast)", s.unit.format(v)),
-                    (false, Some(t)) if !self.opts.show_raw => {
-                        format!("{} (trend)", s.unit.format(t))
+                // Live value (unless hidden), then each trend layer's value here.
+                let mut parts: Vec<String> = Vec::new();
+                if projected {
+                    parts.push(format!("≈{} (forecast)", s.unit.format(v)));
+                } else {
+                    if self.opts.show_raw || self.opts.trends.is_empty() {
+                        parts.push(if self.opts.trends.is_empty() {
+                            s.unit.format(v)
+                        } else {
+                            format!("live {}", s.unit.format(v))
+                        });
                     }
-                    (false, Some(t)) => {
-                        format!("{} · trend {}", s.unit.format(v), s.unit.format(t))
+                    for &style in &self.opts.trends {
+                        if let Some(t) = self.opts.trend_at(s, style, x) {
+                            parts.push(format!("{} {}", style.label(), s.unit.format(t)));
+                        }
                     }
-                    (false, None) => s.unit.format(v),
-                };
+                }
+                let text = parts.join(" · ");
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("{} ", s.name),
@@ -1449,14 +1590,19 @@ impl ChartWidget<'_> {
             ..self.opts.clone()
         };
         let live = ChartOpts {
-            trend: None,
+            trends: Vec::new(),
             show_raw: true,
             forecast: None,
             title: format!("{} · live", base.title),
             ..base.clone()
         };
         let trend = ChartOpts {
-            trend: Some(base.trend.unwrap_or(TrendStyle::Fit)),
+            // Nothing picked: the average and the typical (median) value.
+            trends: if base.trends.is_empty() {
+                vec![TrendStyle::Avg, TrendStyle::Median]
+            } else {
+                base.trends.clone()
+            },
             show_raw: false,
             title: format!("{} · trend", base.title),
             ..base

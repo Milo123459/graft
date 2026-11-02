@@ -199,9 +199,10 @@ Every part of this is configurable:
 | `--fit-window 12h` / `--fit-window 50` | fit only recent data (a duration or a number of points) |
 | `--per 1h` | the unit trends are expressed in (default: chosen from the data's span) |
 | `--forecast` / `--forecast=7d` | draw the projected trend (dashed) past the data |
-| `--trend` / `--trend=avg` | trend lines: the fitted line, or a moving average (`--trend-window N`). Each trend is drawn in its series' colour, with the raw data in a darker shade |
-| `--trend-only` | only the trend lines, not the raw data |
-| `--side-by-side` | two charts: the live data, and its trends (with any forecast) |
+| `--trend=avg,median,p95` | extra lines over the data, any mix: `avg` (moving average, weighted to the centre so it's smooth), `median` (the typical value: ignores spikes), `p95` (95% of values are below it), `line` (the straight fit forecasts use). `--trend` alone is `line`. Each is drawn in its series' colour, with the live data in a darker shade, and the legend shows each line's own value |
+| `--trend-window N` | points in the rolling window (default: a tenth of the data, at least 10) |
+| `--trend-only` | only the trend lines, not the live data |
+| `--side-by-side` | two charts: the live data, and its trends (average + median unless `--trend` says otherwise) |
 | `--no-targets` | don't draw target lines (they still drive forecasts and stats) |
 | `--last 7d` / `--since …` | fit and forecast from that timeframe only, e.g. just the last week |
 | `--stats-template '{name}: {trend} → {target} in {eta}'` | your own output line per series |
@@ -273,15 +274,23 @@ including over SSH from a phone.
 | drag the cursor line | scrub through the data, and past it into the forecast |
 | **measure**, then tap start and end (or drag across, or click then **shift+click**) | stats for just that stretch, including how much each series *changed*; tap again to clear |
 | scroll | zoom around the pointer (sideways or shift + scroll moves); never past your data |
-| toolbar / series chips | ◀ ▶ + − reset cursor measure stats **view** (raw / raw + trend / trend) **side by side** forecast split **all time**; `⋯` shows more: timeframe presets, trend, targets, chart type, log, follow, pause, format, console, export, mouse, help, quit |
+| toolbar / series chips | ◀ ▶ + − reset cursor measure stats **lines** (menu) **side by side** forecast split **all time ▾** (menu); `⋯` shows more: targets, chart type, log, follow, pause, format, console, export, mouse, help, quit |
 
-**Timeframe picker** (time series): tap **all time** to step through
-presets that are shorter than your data (`24h`, `6h`, `1h`, … then back to
-`all`), or tap a preset under `⋯`. Keys `[` / `]` go narrower or wider. The
-stats, trend fits and forecasts all use the chosen timeframe.
+**Timeframe** (anything on a time axis — log timestamps, or arrival times for
+live commands like `ping`): tap **all time ▾** (or press `R`) for a dropdown
+of ranges that fit your data (`last 1d`, `last 6h`, … `last 5m`, `last 1m`) and
+**custom…**, which opens the console with `range("` ready to type
+(`range("2h")`, `range("2026-11-01", "2026-11-02 12:00")`). In the dropdown ↑ ↓
+move; outside it `[` / `]` go narrower or wider. Stats, trends and forecasts
+all use the chosen timeframe.
 
-**Lines:** forecast (`f`), trend over the data (`T`) and target lines (`G`) can
-each be turned on or off. With all of them off you see just your data.
+**Lines:** tap **lines: live** (or press `T`) for a menu where you tick any mix
+of **live**, **average**, **median** and **p95**, and make the rolling window
+bigger or smaller (`+` / `−`, shown in points and time). Each line's value is in
+the legend and the cursor readout. Ping-style data (mostly low with spikes)
+shows why you might want several: the average is pulled up by the spikes, the
+median shows the typical value, p95 the bad-but-common case. Forecast (`f`) and
+target lines (`G`) are separate toggles.
 
 The **follow** button (key `o`) makes the cursor follow the pointer without
 clicking, in terminals that report mouse movement. **mouse** (key `M`) turns
@@ -299,13 +308,13 @@ mouse capture off, so your terminal's own text selection works.
 | `v` … `v` | measure a range from the keyboard |
 | `1`–`9` / `a` | toggle a series / show all |
 | `t` / `m` / `y` / `x` | chart type / marker / log scale / split panels |
-| `T` | view: raw → raw + trend → trend only |
+| `T` | lines menu (inside: `l` `a` `m` `p` toggle, `+` `-` window, Esc closes) |
 | `D` | side by side: live data next to its trends |
 | `f` / `G` | forecast / target lines on or off |
-| `[` / `]` | narrower / wider timeframe (the **all time** / **last 24h** button) |
+| `R` / `[` `]` | timeframe dropdown / narrower, wider timeframe |
 | `F` | change the format or source (builder) |
 | `s` | stats panel |
-| `space` | pause live updates |
+| `space` | pause the chart: the source keeps running and its data is kept, so resuming jumps to the latest |
 | `e` | export the current view to SVG |
 | `M` | mouse capture on/off |
 | `:` | Rhai console |
@@ -336,7 +345,7 @@ Available functions:
 - Viewer actions: `hline(v[, label])`, `clear_hlines()`, `zoom("6h")`,
   `reset()`, `show(name)`, `hide(name)`, `chart("bar")`,
   `target(name, v)`, `clear_target(name)`, `forecast("7d" | "auto" | "off")`,
-  `range("7d" | "500" | "all")`, `trend("line" | "avg" | "off")`, `raw(bool)`,
+  `range("7d" | "500" | "all")`, `trend("avg,median,p95" | "line" | "off")`, `raw(bool)`,
   `side_by_side(bool)`.
 - Output: `print(...)`.
 

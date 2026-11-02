@@ -190,9 +190,14 @@ fn xy(
             Some((i, super::projection_points(&fit, fit.x_last, x1)))
         })
         .collect();
-    let trends: Vec<(usize, Vec<(f64, f64)>)> = series
+    #[allow(clippy::type_complexity)]
+    let trends: Vec<(usize, crate::cli::TrendStyle, Vec<(f64, f64)>)> = series
         .iter()
-        .filter_map(|&(i, s)| Some((i, opts.trend_points(s)?)))
+        .flat_map(|&(i, s)| {
+            opts.trends
+                .iter()
+                .filter_map(move |&t| Some((i, t, opts.trend_points(s, t, 2000)?)))
+        })
         .collect();
     let raw_shown = opts.show_raw || trends.is_empty();
     let near = super::min_max(
@@ -353,8 +358,19 @@ fn xy(
             path.join(" ")
         );
     }
-    for (i, pts) in &trends {
-        let c = hex(opts.color(*i));
+    for (i, style, pts) in &trends {
+        use crate::cli::TrendStyle::{Fit, Median, P95};
+        let base = hex(opts.color(*i));
+        let c = if matches!(style, Median | P95) {
+            tint(&base, 0.35)
+        } else {
+            base
+        };
+        let dash = if matches!(style, P95 | Fit) {
+            r#" stroke-dasharray="7 4""#
+        } else {
+            ""
+        };
         let path: Vec<String> = pts
             .iter()
             .filter(|p| !log || p.1 > 0.0)
@@ -362,7 +378,7 @@ fn xy(
             .collect();
         let _ = writeln!(
             out,
-            r#"<polyline fill="none" stroke="{c}" stroke-width="2.4" stroke-linejoin="round" points="{}"/>"#,
+            r#"<polyline fill="none" stroke="{c}" stroke-width="2.4"{dash} stroke-linejoin="round" points="{}"/>"#,
             path.join(" ")
         );
     }

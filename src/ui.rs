@@ -29,6 +29,11 @@ impl<T: Clone> Hits<T> {
         self.0.borrow_mut().push((rect, t));
     }
 
+    /// Where the first region matching `f` was drawn.
+    pub fn find(&self, f: impl Fn(&T) -> bool) -> Option<Rect> {
+        self.0.borrow().iter().find(|(_, t)| f(t)).map(|(r, _)| *r)
+    }
+
     /// The topmost region containing the point (later pushes win).
     pub fn at(&self, col: u16, row: u16) -> Option<(Rect, T)> {
         self.0
