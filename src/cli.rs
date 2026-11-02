@@ -415,6 +415,22 @@ pub struct Cli {
     #[arg(long, value_name = "NAME[:UNIT] = EXPR", value_parser = parse_line, help_heading = "Series")]
     pub line: Vec<String>,
 
+    /// Start with these series hidden (comma-separated), e.g. the raw feeds behind a
+    /// combined line: `--hide coinbase,hyperliquid`. Tap a series chip (or 1-9) to
+    /// show it again.
+    #[arg(
+        long,
+        value_name = "NAMES",
+        value_delimiter = ',',
+        help_heading = "Chart"
+    )]
+    pub hide: Vec<String>,
+
+    /// A key that runs Rhai in the viewer, e.g. `--bind 'r = only("eth", "ema30")'`
+    /// or `--bind 'a = show_all()'`. Repeatable; bound keys win over built-in ones.
+    #[arg(long, value_name = "KEY = CODE", value_parser = parse_bind, help_heading = "Chart")]
+    pub bind: Vec<String>,
+
     /// Put a marker on the chart wherever a condition holds, e.g. a drop of more than
     /// 1 GB between two samples: `'delta < -1GB => dropped {delta}'`. Variables:
     /// value, prev, delta, pct, rate (per second), time, i, name. Repeatable.
@@ -591,6 +607,13 @@ impl Cli {
         for e in &self.alert {
             opt("--alert", Some(e.clone()));
         }
+        opt(
+            "--hide",
+            (!self.hide.is_empty()).then(|| self.hide.join(",")),
+        );
+        for b in &self.bind {
+            opt("--bind", Some(b.clone()));
+        }
         for l in &self.line {
             opt("--line", Some(l.clone()));
         }
@@ -710,6 +733,25 @@ impl Cli {
 
 fn parse_line(s: &str) -> Result<String, String> {
     crate::lines::CustomLine::parse(s).map(|l| l.to_spec())
+}
+
+/// `KEY = CODE` → (key, code).
+pub fn split_bind(s: &str) -> Result<(char, String), String> {
+    let (k, code) = s
+        .split_once('=')
+        .ok_or_else(|| format!("'{s}' should look like KEY = CODE, e.g. 'r = only(\"eth\")'"))?;
+    let k = k.trim();
+    let mut chars = k.chars();
+    match (chars.next(), chars.next(), code.trim().is_empty()) {
+        (Some(c), None, false) => Ok((c, code.trim().to_string())),
+        _ => Err(format!(
+            "'{s}': bind one key (a single character) to some code"
+        )),
+    }
+}
+
+fn parse_bind(s: &str) -> Result<String, String> {
+    split_bind(s).map(|(k, code)| format!("{k} = {code}"))
 }
 
 fn parse_mark(s: &str) -> Result<String, String> {

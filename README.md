@@ -236,6 +236,25 @@ In marker rules every series is also a variable — its value at that point
 (`ema30`) and at the point before (`ema30_prev`) — which is how the crossings
 above work.
 
+### Showing and hiding lines, and your own keys
+
+Tap a series chip under the chart (● coinbase ● hyperliquid ● eth…) to hide or
+show that line; keys `1`–`9` do the same, `a` shows them all. To start with
+some hidden — e.g. only the combined price, not the raw feeds behind it:
+`--hide coinbase,hyperliquid`.
+
+Bind keys of your own to any console code:
+
+```sh
+--bind 'r = only("eth", "ema30")'      # just the combined price and its EMA
+--bind 'R = show_all()'
+--bind 'c = toggle("coinbase")'
+```
+
+or while it runs: `:bind("r", "only(\"eth\")")` (works straight away). Bound
+keys win over built-in ones, are listed in `?`, and are kept when you save or
+copy the view.
+
 ### Markers
 
 Put a ▼ on the chart wherever something happens — a condition checked at every

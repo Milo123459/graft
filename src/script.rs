@@ -79,6 +79,10 @@ pub enum Action {
     Unmerge(String),
     /// Load a Rhai script file while running.
     Load(String),
+    /// Show only these series (hide the rest).
+    Only(Vec<String>),
+    Toggle(String),
+    ShowAll,
     /// The chart title.
     Title(String),
     /// The unit for values that don't carry one (`USD`, `ms`, `%`…); "" for none.
@@ -704,6 +708,30 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
     engine.register_fn("show", move |n: &str| push(&st, Action::Show(n.into())));
     let st = state.clone();
     engine.register_fn("hide", move |n: &str| push(&st, Action::Hide(n.into())));
+    let st = state.clone();
+    engine.register_fn("toggle", move |n: &str| push(&st, Action::Toggle(n.into())));
+    let st = state.clone();
+    engine.register_fn("show_all", move || push(&st, Action::ShowAll));
+    // only("eth"), only("eth", "ema30"), only(["eth", "ema30"])…
+    let st = state.clone();
+    engine.register_fn("only", move |names: Array| {
+        push(
+            &st,
+            Action::Only(names.iter().map(|d| d.to_string()).collect()),
+        )
+    });
+    let st = state.clone();
+    engine.register_fn("only", move |a: &str| {
+        push(&st, Action::Only(vec![a.into()]))
+    });
+    let st = state.clone();
+    engine.register_fn("only", move |a: &str, b: &str| {
+        push(&st, Action::Only(vec![a.into(), b.into()]))
+    });
+    let st = state.clone();
+    engine.register_fn("only", move |a: &str, b: &str, c: &str| {
+        push(&st, Action::Only(vec![a.into(), b.into(), c.into()]))
+    });
     let st = state.clone();
     engine.register_fn("chart", move |k: &str| push(&st, Action::Chart(k.into())));
     let st = state.clone();

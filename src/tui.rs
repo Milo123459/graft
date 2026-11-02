@@ -229,6 +229,14 @@ const CONSOLE_HELP: &[(&str, &str)] = &[
     ),
     ("undo()  redo()", "step back / forward through your changes"),
     (
+        "only(\"eth\", \"ema30\")",
+        "show just these lines (show_all(), toggle(\"coinbase\"))",
+    ),
+    (
+        "bind(\"r\", \"only(\\\"eth\\\")\")",
+        "a key of your own (also --bind 'r = …')",
+    ),
+    (
         "title(\"ETH\")  unit(\"USD\")",
         "the chart's title / the unit for plain numbers",
     ),
@@ -637,6 +645,12 @@ impl App {
             presets: Vec::new(),
         };
         app.start_merges();
+        app.hidden.extend(app.cli.hide.iter().cloned());
+        for spec in app.cli.bind.clone() {
+            if let Ok((k, code)) = crate::cli::split_bind(&spec) {
+                app.binds.insert(k, code);
+            }
+        }
         app.mark_rules = app
             .cli
             .mark
@@ -670,6 +684,9 @@ impl App {
         c.layout = self.opts.panes.as_ref().map(Panes::layout_expr);
         c.mark = self.mark_rules.iter().map(|r| r.to_spec()).collect();
         c.line = self.session.custom.iter().map(|l| l.to_spec()).collect();
+        let mut hidden: Vec<String> = self.hidden.iter().cloned().collect();
+        hidden.sort();
+        c.hide = hidden;
         c.side_by_side = self.opts.side_by_side;
         c.no_targets = !self.opts.show_targets;
         c.last = self.timeframe.last;
@@ -2539,12 +2556,23 @@ impl App {
             return;
         }
         let script = self.session.script.clone();
+        let binds_before = script.binds().len();
         script.set_data(self.full.clone(), self.focus());
         let result = script.eval(code);
         let printed = script.take_output();
         self.message = None;
         for action in script.take_actions() {
             self.apply(action);
+        }
+        // bind() from the console works straight away, and stays in the command line.
+        for (k, code) in script.binds().into_iter().skip(binds_before) {
+            if let Some(c) = k.chars().next() {
+                self.binds.insert(c, code.clone());
+                self.cli
+                    .bind
+                    .retain(|b| crate::cli::split_bind(b).map_or(true, |(bk, _)| bk != c));
+                self.cli.bind.push(format!("{c} = {code}"));
+            }
         }
         if self.session.script.has_new_mark_rules() {
             self.update_marks();
@@ -2591,6 +2619,32 @@ impl App {
             }
             Action::Show(n) => {
                 self.hidden.remove(&n);
+            }
+            Action::Toggle(n) => {
+                if !self.hidden.remove(&n) {
+                    self.hidden.insert(n);
+                }
+            }
+            Action::ShowAll => self.hidden.clear(),
+            Action::Only(names) => {
+                let unknown: Vec<&String> = names
+                    .iter()
+                    .filter(|n| !self.full.series.iter().any(|s| &&s.name == n))
+                    .collect();
+                if !unknown.is_empty() {
+                    let have: Vec<&str> = self.full.series.iter().map(|s| s.name.as_str()).collect();
+                    return self.say(
+                        format!("only: no series called {unknown:?} (have: {})", have.join(", ")),
+                        true,
+                    );
+                }
+                self.hidden = self
+                    .full
+                    .series
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .filter(|n| !names.contains(n))
+                    .collect();
             }
             Action::Hide(n) => {
                 self.hidden.insert(n);
@@ -5268,6 +5322,45 @@ mod tests {
         app.message = None;
         assert!(screen(&app).contains("m turns it back on"));
         assert_eq!(key(&mut app, KeyCode::Char('m')), Transition::Mouse(true));
+    }
+
+    #[test]
+    fn hide_only_and_custom_keybinds() {
+        let mut app = app(&[
+            "graft",
+            LOG,
+            "--line",
+            "avg = mean_of([\"node1\", \"node2\"])",
+            "--hide",
+            "node1,node2",
+            "--bind",
+            "z = show_all()",
+        ]);
+        let chips = |app: &App| screen(app);
+        assert!(app.hidden.contains("node1") && app.hidden.contains("node2"));
+        assert!(chips(&app).contains("○ node1") && chips(&app).contains("● avg"));
+        // A key bound on the command line.
+        key(&mut app, KeyCode::Char('z'));
+        assert!(app.hidden.is_empty());
+        // only(), toggle(), and a key bound from the console (works straight away).
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, r#"only("avg"); bind("r", "toggle(\"node2\")")"#);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.hidden.len(), 2);
+        key(&mut app, KeyCode::Char('r'));
+        assert!(!app.hidden.contains("node2"));
+        let cli = app.current_cli();
+        assert_eq!(cli.hide, ["node1"]);
+        assert_eq!(cli.bind, ["z = show_all()", "r = toggle(\"node2\")"]);
+        // Unknown names are reported.
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, r#"only("nope")"#);
+        key(&mut app, KeyCode::Enter);
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|m| m.error && m.text.contains("no series called"))
+        );
     }
 
     #[test]
