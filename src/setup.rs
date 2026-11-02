@@ -170,6 +170,24 @@ pub fn chart_opts(cli: &Cli, spec: &SourceSpec, analysis: Analysis) -> Result<Ch
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let mut trends = if cli.trend.is_empty() && cli.trend_only {
+        vec![crate::cli::TrendStyle::Avg]
+    } else {
+        cli.trend.clone()
+    };
+    let mut show_raw = !cli.trend_only;
+    // Side by side without --right-panel: the trends go right, the live data left.
+    let right = match &cli.right_panel {
+        Some(lines) => lines.clone(),
+        None if cli.side_by_side && !trends.is_empty() => {
+            show_raw = true;
+            crate::cli::Lines {
+                live: false,
+                trends: std::mem::take(&mut trends),
+            }
+        }
+        None => crate::cli::Lines::default_right(),
+    };
     Ok(ChartOpts {
         kind: cli.kind,
         marker: cli.marker,
@@ -191,14 +209,11 @@ pub fn chart_opts(cli: &Cli, spec: &SourceSpec, analysis: Analysis) -> Result<Ch
         bins: cli.bins.max(1),
         split: cli.split,
         x_format: cli.x_format.clone(),
-        trends: if cli.trend.is_empty() && cli.trend_only {
-            vec![crate::cli::TrendStyle::Avg]
-        } else {
-            cli.trend.clone()
-        },
+        trends,
         trend_window: cli.trend_window,
-        show_raw: !cli.trend_only,
-        side_by_side: cli.side_by_side,
+        show_raw,
+        side_by_side: cli.side_by_side || cli.right_panel.is_some(),
+        right,
         show_targets: !cli.no_targets,
         analysis,
         forecast: cli

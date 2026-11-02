@@ -44,8 +44,9 @@ pub enum Action {
     Range(Option<String>),
     /// Trend lines: a comma list ("avg,median,p95", "line"), or `None` for off.
     Trend(Option<String>),
-    /// Every line to show, including "live": "live,avg".
-    Lines(String),
+    /// Every line to show, including "live": "live,avg"; with a second list, the
+    /// right-hand chart of side by side (which turns it on).
+    Lines(String, Option<String>),
     /// Points in the rolling window (`None` = automatic).
     TrendWindow(Option<usize>),
     /// Timeframe as a number: seconds on a time axis, else a point count.
@@ -585,7 +586,11 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
     }
     let st = state.clone();
     engine.register_fn("lines", move |l: &str| {
-        push(&st, Action::Lines(l.to_string()))
+        push(&st, Action::Lines(l.to_string(), None))
+    });
+    let st = state.clone();
+    engine.register_fn("lines", move |l: &str, r: &str| {
+        push(&st, Action::Lines(l.to_string(), Some(r.to_string())))
     });
     let st = state.clone();
     engine.register_fn("window", move |w: Dynamic| -> FnResult<()> {

@@ -218,6 +218,15 @@ pub fn scenarios() -> Vec<(String, String)> {
     add("phone-lines-menu", screen(&app, 46, 34));
     app.test_keys("\x1bR");
     add("view-timeframe-menu", screen(&app, 150, 45));
+    let mut app = viewer(&[
+        month,
+        "-F",
+        FMT,
+        "--side-by-side",
+        "--right-panel=live,avg,p95",
+    ]);
+    app.test_keys("T");
+    add("view-lines-menu-side-by-side", screen(&app, 150, 45));
     add("phone-timeframe-menu", screen(&app, 46, 34));
     let app = viewer(&[cpu, "--kv", "--trend=avg"]);
     add("view-trend-avg-many", screen(&app, 150, 45));

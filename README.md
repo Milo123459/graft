@@ -203,6 +203,7 @@ Every part of this is configurable:
 | `--trend-window N` | points in the rolling window (default: a tenth of the data, at least 10) |
 | `--trend-only` | only the trend lines, not the live data |
 | `--side-by-side` | two charts: the live data, and its trends (average + median unless `--trend` says otherwise) |
+| `--right-panel live,p95` | choose the right-hand chart's lines (implies `--side-by-side`); the left one shows what `--trend` / `--trend-only` pick |
 | `--no-targets` | don't draw target lines (they still drive forecasts and stats) |
 | `--last 7d` / `--since …` | fit and forecast from that timeframe only, e.g. just the last week |
 | `--stats-template '{name}: {trend} → {target} in {eta}'` | your own output line per series |
@@ -290,7 +291,9 @@ bigger or smaller (`+` / `−`, shown in points and time). Each line's value is 
 the legend and the cursor readout. Ping-style data (mostly low with spikes)
 shows why you might want several: the average is pulled up by the spikes, the
 median shows the typical value, p95 the bad-but-common case. Forecast (`f`) and
-target lines (`G`) are separate toggles.
+target lines (`G`) are separate toggles. In side by side the menu has a **left** and a **right**
+column, so each chart gets its own lines (keys `l a m p` for the left,
+`L A M P` for the right); in the console, `lines("live", "avg,median")`.
 
 The **follow** button (key `o`) makes the cursor follow the pointer without
 clicking, in terminals that report mouse movement. **mouse** (key `M`) turns
@@ -347,7 +350,8 @@ Available functions:
   - `timeframe(1h)`, `timeframe("7d")`, `timeframe("500")` (points),
     `timeframe("all")`, `timeframe("2026-11-01", "2026-11-02 12:00")`
     (`""` as the end = until now); `range(…)` is the same
-  - `lines("live,avg,median,p95")` (any mix; `"line"` is the straight fit),
+  - `lines("live,avg,median,p95")` (any mix; `"line"` is the straight fit);
+    `lines("live", "avg,p95")` sets both charts of side by side,
     `window(50)` / `window("auto")` for the rolling window,
     `trend("avg,p95" | "off")` sets just the trend layers
   - on/off buttons: `live`, `side_by_side`, `stats`, `split`, `log`, `targets`,

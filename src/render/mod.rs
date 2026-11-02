@@ -92,6 +92,9 @@ pub struct ChartOpts {
     pub show_raw: bool,
     /// Live data and trends in two charts side by side.
     pub side_by_side: bool,
+    /// The right-hand chart's lines in side by side (the left uses `show_raw`/`trends`).
+    pub right: crate::cli::Lines,
+
     /// Draw explicit target lines.
     pub show_targets: bool,
 }
@@ -117,6 +120,7 @@ impl Default for ChartOpts {
             trend_window: None,
             show_raw: true,
             side_by_side: false,
+            right: crate::cli::Lines::default_right(),
             show_targets: true,
         }
     }
@@ -510,6 +514,16 @@ pub fn y_bounds(
 pub fn hline_near(v: f64, lo: f64, hi: f64) -> bool {
     let reach = (hi - lo).max(hi.abs().max(lo.abs()) * 0.25);
     v >= lo - reach && v <= hi + reach
+}
+
+/// A polyline's value at `x` (linear between its points), if `x` is within it.
+pub fn interpolate(pts: &[(f64, f64)], x: f64) -> Option<f64> {
+    let i = pts.partition_point(|p| p.0 < x);
+    match (i.checked_sub(1).and_then(|j| pts.get(j)), pts.get(i)) {
+        (_, Some(b)) if b.0 == x => Some(b.1),
+        (Some(a), Some(b)) if b.0 > a.0 => Some(a.1 + (b.1 - a.1) * (x - a.0) / (b.0 - a.0)),
+        _ => None,
+    }
 }
 
 /// Min/max of finite values.
@@ -989,15 +1003,18 @@ impl<'a> ChartWidget<'a> {
             }
         }
         let raw_shown = self.opts.show_raw || trends.is_empty();
+        // Points in view, plus where each line crosses the view's edges — zoomed in
+        // between two samples there may be no point inside at all.
+        let in_view = |pts: &[(f64, f64)]| {
+            let inside = pts.iter().filter(|p| p.0 >= x0 && p.0 <= x1).map(|p| p.1);
+            let edges = [x0, x1].into_iter().filter_map(|x| interpolate(pts, x));
+            inside.chain(edges).collect::<Vec<_>>()
+        };
         let in_range: Vec<f64> = lines
             .iter()
             .filter(|_| raw_shown)
-            .flat_map(|l| l.2.iter().filter(|p| p.0 >= x0 && p.0 <= x1).map(|p| p.1))
-            .chain(
-                trends
-                    .iter()
-                    .flat_map(|t| t.3.iter().filter(|p| p.0 >= x0 && p.0 <= x1).map(|p| p.1)),
-            )
+            .flat_map(|l| in_view(&l.2))
+            .chain(trends.iter().flat_map(|t| in_view(&t.3)))
             .chain(
                 projections
                     .iter()
@@ -1589,22 +1606,24 @@ impl ChartWidget<'_> {
             side_by_side: false,
             ..self.opts.clone()
         };
+        let left_lines = crate::cli::Lines {
+            live: base.show_raw || base.trends.is_empty(),
+            trends: base.trends.clone(),
+        };
+        let right_lines = if base.right.is_empty() {
+            crate::cli::Lines::default_right()
+        } else {
+            base.right.clone()
+        };
         let live = ChartOpts {
-            trends: Vec::new(),
-            show_raw: true,
             forecast: None,
-            title: format!("{} · live", base.title),
+            title: format!("{} · {}", base.title, left_lines.label()),
             ..base.clone()
         };
         let trend = ChartOpts {
-            // Nothing picked: the average and the typical (median) value.
-            trends: if base.trends.is_empty() {
-                vec![TrendStyle::Avg, TrendStyle::Median]
-            } else {
-                base.trends.clone()
-            },
-            show_raw: false,
-            title: format!("{} · trend", base.title),
+            show_raw: right_lines.live,
+            trends: right_lines.trends.clone(),
+            title: format!("{} · {}", base.title, right_lines.label()),
             ..base
         };
         let [a, b] = if area.width >= 100 {
@@ -1701,6 +1720,15 @@ mod tests {
         // A far target falls back to half the span.
         opts.analysis.targets = crate::stats::Targets::parse(&["a=-1000".into()], false).unwrap();
         assert_eq!(opts.projection(&ds.series[0]).unwrap().1, 5.0);
+    }
+
+    #[test]
+    fn interpolates_between_points() {
+        let pts = [(0.0, 10.0), (10.0, 20.0)];
+        assert_eq!(interpolate(&pts, 5.0), Some(15.0));
+        assert_eq!(interpolate(&pts, 0.0), Some(10.0));
+        assert_eq!(interpolate(&pts, 10.0), Some(20.0));
+        assert_eq!(interpolate(&pts, 11.0), None);
     }
 
     #[test]

@@ -281,7 +281,8 @@ enum Hit {
     /// A timeframe preset (`None` = all data).
     Range(Option<Window>),
     /// Lines menu: toggle a layer (`None` = live data), resize the window, close.
-    Layer(Option<TrendStyle>),
+    /// (layer, right-hand chart of side by side)
+    Layer(Option<TrendStyle>, bool),
     Window(bool),
     CloseMenu,
     /// Timeframe dropdown: type a range in the console.
@@ -436,6 +437,7 @@ impl App {
         c.trend = self.opts.trends.clone();
         c.trend_only = !self.opts.trends.is_empty() && !self.opts.show_raw;
         c.trend_window = self.opts.trend_window;
+        c.right_panel = self.opts.side_by_side.then(|| self.opts.right.clone());
         c.side_by_side = self.opts.side_by_side;
         c.no_targets = !self.opts.show_targets;
         c.last = self.timeframe.last;
@@ -707,6 +709,32 @@ impl App {
         }
     }
 
+    /// Turn a line on/off in the right-hand chart of side by side (one always stays).
+    fn toggle_right(&mut self, layer: Option<TrendStyle>) {
+        self.opts.right.toggle(layer);
+        if self.opts.right.is_empty() {
+            self.opts.right.toggle(layer);
+            self.say("each chart needs at least one line", true);
+        }
+    }
+
+    /// Side by side on: trends move to the right-hand chart, live data stays left.
+    /// Off: the right-hand trends come back over the live data.
+    fn toggle_side_by_side(&mut self) {
+        self.opts.side_by_side = !self.opts.side_by_side;
+        if self.opts.side_by_side {
+            if !self.opts.trends.is_empty() {
+                self.opts.right = crate::cli::Lines {
+                    live: false,
+                    trends: std::mem::take(&mut self.opts.trends),
+                };
+                self.opts.show_raw = true;
+            }
+        } else if self.opts.trends.is_empty() {
+            self.opts.trends = self.opts.right.trends.clone();
+        }
+    }
+
     /// Grow/shrink the rolling window (average, median, p95).
     fn change_window(&mut self, bigger: bool) {
         let n = self
@@ -861,6 +889,9 @@ impl App {
             parts.push("live");
         }
         parts.extend(self.opts.trends.iter().map(|t| t.label()));
+        if self.opts.side_by_side {
+            return format!("lines: {} / {}", parts.join(" + "), self.opts.right.label());
+        }
         format!("lines: {}", parts.join(" + "))
     }
 
@@ -882,14 +913,18 @@ impl App {
             KeyCode::Char('p') => self.toggle_layer(Some(TrendStyle::P95)),
             KeyCode::Char('+' | '=') => self.change_window(true),
             KeyCode::Char('-' | '_') => self.change_window(false),
-            KeyCode::Char('D') => self.opts.side_by_side = !self.opts.side_by_side,
+            KeyCode::Char('L') => self.toggle_right(None),
+            KeyCode::Char('A') => self.toggle_right(Some(TrendStyle::Avg)),
+            KeyCode::Char('M') => self.toggle_right(Some(TrendStyle::Median)),
+            KeyCode::Char('P') => self.toggle_right(Some(TrendStyle::P95)),
+            KeyCode::Char('D') => self.toggle_side_by_side(),
             _ => self.lines_menu = false,
         }
     }
 
     fn draw_lines_menu(&self, f: &mut Frame) {
         let area = f.area();
-        let w = 64.min(area.width);
+        let w = if self.opts.side_by_side { 72 } else { 64 }.min(area.width);
         let n = self
             .ds
             .series
@@ -923,7 +958,7 @@ impl App {
                 "straight fit (as used by forecast)",
             ));
         }
-        let h = (rows.len() as u16 + 7).min(area.height);
+        let h = (rows.len() as u16 + 7 + u16::from(self.opts.side_by_side)).min(area.height);
         let rect = Rect {
             x: (area.width - w) / 2,
             y: (area.height.saturating_sub(h)) / 2,
@@ -938,38 +973,109 @@ impl App {
         f.render_widget(block, rect);
         self.hits.push(rect, Hit::MenuBackground);
         let mut y = inner.y;
-        for (layer, name, desc) in rows {
-            if y >= inner.bottom() {
-                break;
-            }
-            let on = match layer {
-                None => self.opts.show_raw || self.opts.trends.is_empty(),
-                Some(t) => self.opts.trends.contains(&t),
-            };
-            let label = format!("{} {name}", if on { "☑" } else { "☐" });
-            let bw = 14.min(inner.width);
+        let sides = self.opts.side_by_side;
+        if sides {
+            f.render_widget(
+                Span::styled(
+                    "left     right    (side by side: pick lines for each chart)",
+                    Style::default().fg(Color::Gray),
+                ),
+                Rect {
+                    x: inner.x + 1,
+                    y,
+                    width: inner.width.saturating_sub(1),
+                    height: 1,
+                },
+            );
+            y += 1;
+        }
+        let toggle = |buf: &mut ratatui::buffer::Buffer,
+                      x: u16,
+                      y: u16,
+                      width: u16,
+                      label: String,
+                      on: bool,
+                      hit: Hit| {
             let style = if on {
                 Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White).bg(Color::DarkGray)
             };
+            let width = width.min(inner.right().saturating_sub(x));
             let r = Rect {
-                x: inner.x,
+                x,
                 y,
-                width: bw,
+                width,
                 height: 1,
             };
-            f.render_widget(Span::styled(format!(" {label:<12}"), style), r);
-            self.hits.push(r, Hit::Layer(layer));
-            f.render_widget(
-                Span::styled(desc, Style::default().fg(Color::Gray)),
-                Rect {
-                    x: inner.x + bw + 1,
-                    y,
-                    width: inner.width.saturating_sub(bw + 1),
-                    height: 1,
-                },
+            buf.set_stringn(
+                x,
+                y,
+                format!(" {label:<w$}", w = width.saturating_sub(1) as usize),
+                width as usize,
+                style,
             );
+            self.hits.push(r, hit);
+        };
+        let check = |on: bool| if on { "☑" } else { "☐" };
+        for (layer, name, desc) in rows {
+            if y >= inner.bottom() {
+                break;
+            }
+            let left_on = match layer {
+                None => self.opts.show_raw || self.opts.trends.is_empty(),
+                Some(t) => self.opts.trends.contains(&t),
+            };
+            let x_desc = if sides {
+                let right_on = self.opts.right.has(layer);
+                toggle(
+                    f.buffer_mut(),
+                    inner.x,
+                    y,
+                    8,
+                    check(left_on).to_string(),
+                    left_on,
+                    Hit::Layer(layer, false),
+                );
+                toggle(
+                    f.buffer_mut(),
+                    inner.x + 9,
+                    y,
+                    8,
+                    check(right_on).to_string(),
+                    right_on,
+                    Hit::Layer(layer, true),
+                );
+                let x = inner.x + 18;
+                f.buffer_mut().set_stringn(
+                    x,
+                    y,
+                    name,
+                    inner.right().saturating_sub(x) as usize,
+                    Style::default().add_modifier(Modifier::BOLD),
+                );
+                x + 11
+            } else {
+                toggle(
+                    f.buffer_mut(),
+                    inner.x,
+                    y,
+                    14,
+                    format!("{} {name}", check(left_on)),
+                    left_on,
+                    Hit::Layer(layer, false),
+                );
+                inner.x + 15
+            };
+            if x_desc < inner.right() {
+                f.buffer_mut().set_stringn(
+                    x_desc,
+                    y,
+                    desc,
+                    (inner.right() - x_desc) as usize,
+                    Style::default().fg(Color::Gray),
+                );
+            }
             y += 1;
         }
         y += 1;
@@ -1028,7 +1134,11 @@ impl App {
         if inner.bottom() > inner.y {
             f.render_widget(
                 Span::styled(
-                    "keys: l a m p toggle · + − window · Esc closes",
+                    if self.opts.side_by_side {
+                        "keys: l a m p left · L A M P right · + − window · Esc"
+                    } else {
+                        "keys: l a m p toggle · + − window · Esc closes"
+                    },
                     Style::default().fg(Color::DarkGray),
                 ),
                 Rect {
@@ -1176,7 +1286,7 @@ impl App {
                 self.lines_menu = !self.lines_menu;
                 self.range_menu = false;
             }
-            Cmd::SideBySide => self.opts.side_by_side = !self.opts.side_by_side,
+            Cmd::SideBySide => self.toggle_side_by_side(),
             Cmd::Targets => self.opts.show_targets = !self.opts.show_targets,
             Cmd::RangeStep(dir) => self.step_timeframe(dir),
             Cmd::RangeMenu => {
@@ -1280,27 +1390,19 @@ impl App {
                     Err(_) => self.say(format!("trend: use avg, median, p95 or line (comma separated), or \"off\" — not \"{list}\""), true),
                 },
             },
-            Action::Lines(list) => {
-                let mut live = false;
-                let mut trends = Vec::new();
-                for x in list.split(',').map(str::trim).filter(|x| !x.is_empty()) {
-                    match x {
-                        "live" | "raw" | "data" => live = true,
-                        other => match TrendStyle::from_str(other, true) {
-                            Ok(t) if !trends.contains(&t) => trends.push(t),
-                            Ok(_) => {}
-                            Err(_) => {
-                                return self.say(
-                                    format!("lines: use live, avg, median, p95 or line (comma separated) — not \"{other}\""),
-                                    true,
-                                );
-                            }
-                        },
+            Action::Lines(left, right) => {
+                let parse = |l: &str| crate::cli::Lines::parse(l).map_err(|e| format!("lines: {e}"));
+                match (parse(&left), right.as_deref().map(parse).transpose()) {
+                    (Ok(l), Ok(r)) => {
+                        self.opts.show_raw = l.live;
+                        self.opts.trends = l.trends;
+                        if let Some(r) = r {
+                            self.opts.right = r;
+                            self.opts.side_by_side = true;
+                        }
                     }
+                    (Err(e), _) | (_, Err(e)) => self.say(e, true),
                 }
-                trends.sort_by_key(|x| TrendStyle::ALL.iter().position(|a| a == x));
-                self.opts.show_raw = live || trends.is_empty();
-                self.opts.trends = trends;
             }
             Action::TrendWindow(n) => self.opts.trend_window = n,
             Action::RangeNumber(v) => {
@@ -1585,8 +1687,12 @@ impl App {
                             self.toggle_series(i);
                             Transition::None
                         }
-                        Hit::Layer(l) => {
-                            self.toggle_layer(l);
+                        Hit::Layer(l, right) => {
+                            if right {
+                                self.toggle_right(l);
+                            } else {
+                                self.toggle_layer(l);
+                            }
                             Transition::None
                         }
                         Hit::Window(bigger) => {
@@ -2531,6 +2637,18 @@ mod tests {
     }
 
     #[test]
+    fn zoomed_between_two_samples_the_y_axis_fits_the_line() {
+        let mut app = app(&["graft", LOG, "-s", "node1"]);
+        let (a, _) = app.ds.x_range().unwrap();
+        // Hourly samples; look at 10 minutes in the middle of the first hour.
+        app.set_view(a + 1200.0, a + 1800.0);
+        let s = screen(&app);
+        // A flat line: its value, a little above and below — not 0 to 1.
+        assert!(s.contains("60 GB│") && s.contains("59 GB│"), "{s}");
+        assert!(!s.contains(" 0 B") && !s.contains("│1 B"), "{s}");
+    }
+
+    #[test]
     fn zoom_and_pan_stay_inside_the_data() {
         let mut app = app(&["graft", LOG, "--forecast", "--target", "node1=50GB"]);
         screen(&app);
@@ -2676,12 +2794,34 @@ mod tests {
         key(&mut app, KeyCode::Char(':'));
         type_str(&mut app, "trend(\"avg,p95\"); side_by_side(true)");
         key(&mut app, KeyCode::Enter);
-        assert_eq!(app.opts.trends, [TrendStyle::Avg, TrendStyle::P95]);
+        // Side by side: the trends move to the right-hand chart, live stays left.
+        assert!(app.opts.trends.is_empty() && app.opts.show_raw);
+        assert_eq!(app.opts.right.trends, [TrendStyle::Avg, TrendStyle::P95]);
         let s = screen(&app);
-        assert!(s.contains("· live") && s.contains("· trend"), "{s}");
+        assert!(s.contains("· live ") && s.contains("· avg + p95"), "{s}");
         let cli = app.current_cli();
-        assert_eq!(cli.trend, [TrendStyle::Avg, TrendStyle::P95]);
-        assert!(cli.side_by_side);
+        assert!(cli.side_by_side && cli.trend.is_empty());
+        assert_eq!(cli.right_panel.unwrap().to_arg(), "avg,p95");
+        // Pick lines per side in the menu: median on the left, live on the right.
+        key(&mut app, KeyCode::Char('T'));
+        let s = screen(&app);
+        assert!(s.contains("left     right"), "{s}");
+        key(&mut app, KeyCode::Char('m'));
+        key(&mut app, KeyCode::Char('L'));
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.opts.trends, [TrendStyle::Median]);
+        assert!(app.opts.right.live);
+        assert!(screen(&app).contains("lines: live + median / live + avg + p95"));
+        // Or from the console, both at once.
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, "lines(\"live\", \"median,p95\")");
+        key(&mut app, KeyCode::Enter);
+        assert!(app.opts.trends.is_empty() && app.opts.show_raw);
+        assert_eq!(app.opts.right.to_arg(), "median,p95");
+        // Off again: the right-hand trends come back over the live data.
+        key(&mut app, KeyCode::Char('D'));
+        assert!(!app.opts.side_by_side);
+        assert_eq!(app.opts.trends, [TrendStyle::Median, TrendStyle::P95]);
     }
 
     #[test]

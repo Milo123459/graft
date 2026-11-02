@@ -348,6 +348,12 @@ pub struct Cli {
     #[arg(long, help_heading = "Chart")]
     pub side_by_side: bool,
 
+    /// Lines in the right-hand chart of --side-by-side (implies it), e.g. `avg,median` or
+    /// `live,p95`. The left chart shows what --trend / --trend-only choose. Default: the
+    /// trends from --trend, else avg,median.
+    #[arg(long, value_name = "LINES", value_parser = Lines::parse, help_heading = "Chart")]
+    pub right_panel: Option<Lines>,
+
     /// Don't draw target lines (targets still drive forecasts and stats).
     #[arg(long, help_heading = "Analysis")]
     pub no_targets: bool,
@@ -465,6 +471,10 @@ impl Cli {
         opt("--smooth", self.smooth.map(|n| n.to_string()));
         opt("--last", self.last.map(fmt_window));
         opt("--trend-window", self.trend_window.map(|n| n.to_string()));
+        opt(
+            "--right-panel",
+            self.right_panel.as_ref().map(Lines::to_arg),
+        );
         opt("--since", self.since.clone());
         opt("--until", self.until.clone());
         opt(
@@ -736,6 +746,16 @@ impl TrendStyle {
         TrendStyle::Fit,
     ];
 
+    /// The name --trend takes.
+    pub fn value_name(self) -> &'static str {
+        match self {
+            TrendStyle::Avg => "avg",
+            TrendStyle::Median => "median",
+            TrendStyle::P95 => "p95",
+            TrendStyle::Fit => "fit",
+        }
+    }
+
     /// Short name for legends and buttons.
     pub fn label(self) -> &'static str {
         match self {
@@ -743,6 +763,100 @@ impl TrendStyle {
             TrendStyle::Median => "median",
             TrendStyle::P95 => "p95",
             TrendStyle::Fit => "trend",
+        }
+    }
+}
+
+/// The lines drawn in one chart: the live data and/or trend layers.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Lines {
+    pub live: bool,
+    pub trends: Vec<TrendStyle>,
+}
+
+impl Lines {
+    /// The right-hand chart of side by side when nothing else is chosen.
+    pub fn default_right() -> Lines {
+        Lines {
+            live: false,
+            trends: vec![TrendStyle::Avg, TrendStyle::Median],
+        }
+    }
+
+    /// `"live,avg,median"` (any order; `line` is the straight fit).
+    pub fn parse(s: &str) -> Result<Lines, String> {
+        let mut out = Lines::default();
+        for x in s.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+            match x {
+                "live" | "raw" | "data" => out.live = true,
+                other => {
+                    let t = TrendStyle::from_str(other, true).map_err(|_| {
+                        format!(
+                            "use live, avg, median, p95 or line (comma separated) — not \"{other}\""
+                        )
+                    })?;
+                    if !out.trends.contains(&t) {
+                        out.trends.push(t);
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            return Err("name at least one line: live, avg, median, p95 or line".into());
+        }
+        out.trends
+            .sort_by_key(|x| TrendStyle::ALL.iter().position(|a| a == x));
+        Ok(out)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.live && self.trends.is_empty()
+    }
+
+    fn names(&self) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if self.live {
+            v.push("live");
+        }
+        v.extend(self.trends.iter().map(|t| t.value_name()));
+        v
+    }
+
+    /// `live,avg` — as given to --right-panel.
+    pub fn to_arg(&self) -> String {
+        self.names().join(",")
+    }
+
+    /// `live + avg` — for titles and buttons.
+    pub fn label(&self) -> String {
+        let mut v: Vec<&str> = Vec::new();
+        if self.live {
+            v.push("live");
+        }
+        v.extend(self.trends.iter().map(|t| t.label()));
+        v.join(" + ")
+    }
+
+    /// Turn one line on or off (`None` = the live data).
+    pub fn toggle(&mut self, layer: Option<TrendStyle>) {
+        match layer {
+            None => self.live = !self.live,
+            Some(t) => {
+                if let Some(i) = self.trends.iter().position(|x| *x == t) {
+                    self.trends.remove(i);
+                } else {
+                    self.trends.push(t);
+                    self.trends
+                        .sort_by_key(|x| TrendStyle::ALL.iter().position(|a| a == x));
+                }
+            }
+        }
+    }
+
+    pub fn has(&self, layer: Option<TrendStyle>) -> bool {
+        match layer {
+            None => self.live,
+            Some(t) => self.trends.contains(&t),
         }
     }
 }
@@ -906,6 +1020,7 @@ mod tests {
                 "--trend=avg,p95",
                 "--trend-only",
                 "--side-by-side",
+                "--right-panel=live,p95",
                 "--trend-window",
                 "9",
             ],
