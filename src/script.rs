@@ -740,11 +740,17 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
     });
 
     let st = state.clone();
-    engine.register_fn("percentile", move |name: &str, q: f64| -> FnResult<f64> {
-        let mut ys: Vec<f64> = points(&st, name)?.points.iter().map(|p| p.1).collect();
-        ys.sort_by(f64::total_cmp);
-        Ok(crate::stats::percentile(&ys, q / 100.0))
-    });
+    // (90 or 90.0: whole numbers are ints in Rhai.)
+    engine.register_fn(
+        "percentile",
+        move |name: &str, q: Dynamic| -> FnResult<f64> {
+            let q =
+                dyn_to_f64(&q).ok_or("percentile needs a number, e.g. percentile(\"x\", 90)")?;
+            let mut ys: Vec<f64> = points(&st, name)?.points.iter().map(|p| p.1).collect();
+            ys.sort_by(f64::total_cmp);
+            Ok(crate::stats::percentile(&ys, q / 100.0))
+        },
+    );
 
     // slope per duration: slope("node1", "1d")
     let st = state.clone();

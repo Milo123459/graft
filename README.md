@@ -666,6 +666,17 @@ viewer (cursor, split, forecast, timeframe, help, many series), the builder and
 the gallery, at desktop and phone sizes. `cat snaps/*.ans` shows them in your
 terminal.
 
+**Adding a feature? Add it to the tutorial too** (`src/tutorial.rs`): a key or
+button goes in a step's keys table, a flag or console command in its examples, a
+bigger feature gets a step of its own. The tests hold this up:
+
+- `the_tutorial_covers_every_feature` fails for any flag, toolbar button or console
+  function the tour doesn't mention, and says which;
+- `every_tutorial_example_works` runs every console example on the demo chart and
+  parses every flag example with the real argument parser;
+- `the_tutorial_walks_through_everything` does each step's task the way a user
+  would and checks it ticks off, at desktop and phone sizes.
+
 ## Shell integration
 
 ```sh

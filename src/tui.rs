@@ -1213,7 +1213,7 @@ impl App {
                     .map(|r| unicode_width::UnicodeWidthStr::width(r.0))
                     .max()
                     .unwrap_or(0);
-                let two = col <= 30 && w >= col + 26;
+                let two = w >= col + 30;
                 for (k, d) in rows {
                     if two {
                         let lines = wrap(d, w - col - 4);
@@ -7059,7 +7059,7 @@ mod tests {
             }
             // Flags and command lines parse (… stands for "the rest of your command").
             let line = ex.replace(" …", "").replace("graft … ", "graft ");
-            let line = if line.starts_with("--") {
+            let line = if line.starts_with('-') {
                 format!("graft app.log {line}")
             } else {
                 line
@@ -7077,5 +7077,117 @@ mod tests {
                 panic!("{ex}: {e}");
             }
         }
+    }
+
+    /// The tutorial covers every feature: each flag, toolbar button and console function
+    /// is mentioned in some step. Adding a feature? Add it to a step in src/tutorial.rs
+    /// (or, if it really doesn't belong in the tour, to the lists here with a reason).
+    #[test]
+    fn the_tutorial_covers_every_feature() {
+        use crate::tutorial::STEPS;
+        use clap::CommandFactory;
+        let mut corpus = String::new();
+        for s in STEPS {
+            for t in [
+                s.title,
+                s.text,
+                s.task.unwrap_or(""),
+                s.command.unwrap_or(""),
+            ] {
+                corpus.push_str(t);
+                corpus.push('\n');
+            }
+            for (a, b) in s.keys.iter().chain(s.examples) {
+                corpus.push_str(&format!("{a}\n{b}\n"));
+            }
+        }
+        // Buttons belong in a step's keys table, next to their keys.
+        let keys_column: String = STEPS
+            .iter()
+            .flat_map(|s| s.keys.iter().map(|k| format!("{}\n", k.0)))
+            .collect();
+        let mut missing = Vec::new();
+
+        // Flags: the long name, or the short form in an example.
+        const NOT_FLAGS: &[&str] = &[
+            "help",        // clap's own
+            "version",     // clap's own
+            "completions", // shell setup, in the README
+            "man",         // packaging, in the README
+        ];
+        let mentioned = |pat: &str| {
+            corpus.match_indices(pat).any(|(i, _)| {
+                corpus[i + pat.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '-'))
+            })
+        };
+        for arg in Cli::command().get_arguments() {
+            let Some(long) = arg.get_long() else {
+                continue;
+            };
+            let short = arg
+                .get_short()
+                .is_some_and(|c| mentioned(&format!(" -{c}")) || mentioned(&format!("\n-{c}")));
+            if !NOT_FLAGS.contains(&long) && !mentioned(&format!("--{long}")) && !short {
+                missing.push(format!("flag --{long}"));
+            }
+        }
+
+        // Toolbar buttons: all of them (⋯ open, with markers and alerts).
+        let mut app = tutorial_app();
+        app.toolbar_more = true;
+        run(&mut app, r#"alert("api > 1s")"#);
+        run(&mut app, r#"mark_when("value > 60ms", "x")"#);
+        for b in app.toolbar() {
+            let label = match b.action {
+                // Its label is the current chart type.
+                Hit::Cmd(Cmd::Kind) => "chart type".to_string(),
+                _ => {
+                    // "markers (1)" → markers, "lines: live" → lines, "all time ▾" → all time
+                    let l = b.label.split(" (").next().unwrap_or_default();
+                    let l = l.split(": ").next().unwrap_or_default();
+                    l.trim_end_matches(" ▾").to_string()
+                }
+            };
+            if !keys_column.contains(&label) {
+                missing.push(format!("toolbar button '{}' (in a keys table)", b.label));
+            }
+        }
+
+        // Console functions, as registered in src/script.rs.
+        const NOT_FUNCTIONS: &[&str] = &[
+            "help", // `:help` is in the tour (no brackets)
+            "raw",  // another name for live()
+        ];
+        let src = include_str!("script.rs");
+        let named = |re: &str| -> Vec<String> {
+            regex::Regex::new(re)
+                .unwrap()
+                .captures_iter(src)
+                .map(|c| c[1].to_string())
+                .collect()
+        };
+        let mut names = named(r#"register_fn\(\s*"([a-z_0-9]+)""#);
+        // Registered in loops: ("first", |s| …), ("values", false), FLAGS, range/timeframe.
+        names.extend(named(r#"\("([a-z_0-9]+)", (?:\|s\||false|true)"#));
+        names.extend(crate::script::FLAGS.iter().map(|f| f.0.to_string()));
+        names.extend(["range".to_string(), "timeframe".to_string()]);
+        names.sort();
+        names.dedup();
+        assert!(names.len() > 80, "only found {}: {names:?}", names.len());
+        for n in names {
+            if !NOT_FUNCTIONS.contains(&n.as_str()) && !corpus.contains(&format!("{n}(")) {
+                missing.push(format!("console function {n}()"));
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "not in the tutorial yet: add each to a step in src/tutorial.rs (its text, keys \
+             or examples):\n  {}",
+            missing.join("\n  ")
+        );
     }
 }

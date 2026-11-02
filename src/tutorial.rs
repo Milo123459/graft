@@ -5,6 +5,9 @@
 //! then and the API slowly gets slower, so there's something to find, mark, alert on
 //! and forecast. Each step says what a feature is for, asks you to try it, and ticks
 //! itself off when you have; the last steps are recipes for real use.
+//!
+//! New features belong here too: tests in `tui.rs` fail for any flag, toolbar button or
+//! console function no step mentions, and run every example (see CLAUDE.md).
 
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -110,18 +113,21 @@ Each step explains a feature, its keys and some examples, then asks you to try i
         text: r#"From the top: the chart, with a legend of each series' latest value; the series chips (● web ● api ● db); the toolbar, where every button also has a key; and the status line: live or paused, the time of the newest data, and messages.
 graft works the same with a mouse, a keyboard or a phone over ssh: tap where you'd click."#,
         keys: &[
-            ("?", "every key on one screen"),
-            (":", "the console: every button is a command too"),
+            ("? (button too)", "every key on one screen"),
             (
-                "space / p",
+                ": (button too)",
+                "the console: every button is a command too",
+            ),
+            (
+                "space / p / pause",
                 "pause the chart (data is still read; resume catches up)",
             ),
             (
-                "m",
+                "m / mouse",
                 "mouse on/off (off lets you select text in your terminal)",
             ),
-            ("⋯", "more buttons: chart type, log scale, export…"),
-            ("q", "quit (Esc never quits: it clears things)"),
+            ("⋯ / less", "more buttons: chart type, log scale, export…"),
+            ("q / quit", "quit (Esc never quits: it clears things)"),
         ],
         examples: &[
             ("graft app.log --kv --no-mouse", "start with the mouse off"),
@@ -143,7 +149,7 @@ graft works the same with a mouse, a keyboard or a phone over ssh: tap where you
             ("drag", "scrub through the data"),
             (", .  Shift ← →", "step one point at a time"),
             ("Home End", "the first / newest point"),
-            ("o", "the cursor follows the mouse, no clicking"),
+            ("o / follow", "the cursor follows the mouse, no clicking"),
             ("Esc", "let go of the cursor"),
         ],
         examples: &[
@@ -317,9 +323,12 @@ api is slowly getting slower here. Give it a target and the stats say when it ge
         title: "chart types",
         text: r#"line and scatter show change over time. bar shows the latest value of each series, for comparing; histogram how the values are spread (a latency distribution); sparkline a small chart per series; stat big-number tiles with change and a sparkline, for dashboards."#,
         keys: &[
-            ("t", "the next chart type (⋯ → chart type)"),
+            (
+                "t / chart type",
+                "the next chart type (the button under ⋯ shows the current one)",
+            ),
             ("b", "point style: braille, dots, blocks, bars"),
-            ("y", "log scale, for values spanning 10× or more"),
+            ("y / log", "log scale, for values spanning 10× or more"),
             ("x / split", "a panel per series, each with its own y axis"),
         ],
         examples: &[
@@ -476,8 +485,12 @@ The database spikes now and then: mark it."#,
         title: "keep it",
         text: r#"graft remembers each chart you open: graft on its own lists them, tap one to pick up where you left off. Save a view under a name to open it any time, or copy the command that recreates it exactly, for a script or a friend."#,
         keys: &[
-            ("C", "copy this view's command to your clipboard"),
-            ("e", "export the chart to SVG"),
+            ("C / copy cmd", "copy this view's command to your clipboard"),
+            ("e / svg", "export the chart to SVG"),
+            (
+                "save",
+                "name this view (the button under ⋯ starts save(\"…\"))",
+            ),
         ],
         examples: &[
             (
@@ -498,11 +511,349 @@ The database spikes now and then: mark it."#,
         ..BASE
     },
     Step {
+        title: "getting data in",
+        text: r#"Three kinds of source: a file (read once, or followed as it grows), a command (run every few seconds, like watch) or stdin (a pipe). Any of them can run on another machine with --ssh, and --merge adds more sources to the same chart.
+From here on the steps are a reference: read what's useful, skip the rest with Enter."#,
+        keys: &[(
+            "F",
+            "the builder: pick a source and a format, with suggestions and a preview",
+        )],
+        examples: &[
+            (
+                "graft app.log --kv -f",
+                "follow a log as it grows, like tail -f (--follow)",
+            ),
+            (
+                "graft -c 'cat /proc/loadavg' -n 2s --columns 1,2,3",
+                "run a command every 2 s (--cmd, --every)",
+            ),
+            (
+                "graft -c 'date +%S' --columns 1 --count 5 --once",
+                "stop after 5 runs (--count)",
+            ),
+            (
+                "graft --ssh pi@raspberrypi -c 'vcgencmd measure_temp' --regex 'temp=(?P<temp>[0-9.]+)'",
+                "a command on another machine (--ssh)",
+            ),
+            (
+                "graft app.log --kv --merge 'cpu'",
+                "add a preset's (or profile's) series to this chart",
+            ),
+            (
+                "graft -c 'curl -s …' --json --as btc",
+                "name a source's series after it, as --merge does (--as)",
+            ),
+            (
+                "graft app.log --kv --merge 'cpu' --no-sync",
+                "redraw on any new data, not once per round of sources",
+            ),
+            (
+                "graft --build",
+                "open the builder first (graft alone does too)",
+            ),
+        ],
+        ..BASE
+    },
+    Step {
+        title: "reading lines",
+        text: r#"You choose how lines are read: graft only guesses if you ask (--auto). Times on each line are found by themselves (ISO, syslog, access logs, epoch seconds or ms); without one, the time a line arrives is used. Numbers keep their units: 23ms, 4.2GB, 12%, $3.50.
+--explain shows exactly how each line was read, when something looks wrong."#,
+        keys: &[("F", "change this chart's format, with a live preview")],
+        examples: &[
+            (
+                "-F '{time} GET {path} {ms}'",
+                "a template: {name} is a number, {_} skips a word (--format)",
+            ),
+            (
+                "--regex 'took (?P<ms>[0-9.]+)ms'",
+                "a regex: named groups become series",
+            ),
+            (
+                "--regex '(?P<host>\\w+) (?P<value>[0-9.]+)' -g host",
+                "one series per host (--group-by)",
+            ),
+            ("--kv", "key=value or key: value pairs"),
+            (
+                "--csv --time-field date -d ';'",
+                "CSV with a header (--delimiter)",
+            ),
+            (
+                "--json --time-field ts",
+                "JSON lines; nested keys become a.b.c",
+            ),
+            (
+                "--columns 2,3 --names rx,tx",
+                "whitespace-separated columns, named",
+            ),
+            (
+                "-t '%d/%m/%Y %H:%M'",
+                "a time format it doesn't know (--time-format)",
+            ),
+            (
+                "--x index",
+                "x axis: line number (auto, time, index, arrival)",
+            ),
+            (
+                "-u ms -B",
+                "a unit for bare numbers; 1024-based KB/MB/GB (--unit, --binary-units)",
+            ),
+            (
+                "--parse-fn --script parse.rhai",
+                "parse lines yourself: parse(line) returns a map",
+            ),
+            (
+                "graft app.log --kv --explain",
+                "how each line was read, then exit",
+            ),
+        ],
+        ..BASE
+    },
+    Step {
+        title: "shaping series",
+        text: r#"Before charting, series can be picked, combined into new ones and transformed: counters into rates, values into differences, many points into one per minute."#,
+        examples: &[
+            (
+                "--select 'node*' --exclude node3",
+                "which series to keep (globs work)",
+            ),
+            (
+                "--series 'used:GB = total - free'",
+                "a new series from others, with a unit",
+            ),
+            (
+                "--rate",
+                "counters (bytes sent so far) into per-second rates",
+            ),
+            ("--delta", "the change between consecutive points"),
+            (
+                "--resample 1m:max",
+                "one point per minute: mean min max sum last count",
+            ),
+            (
+                "--smooth 10",
+                "a 10-point moving average, applied to the data itself",
+            ),
+            (
+                "--window 1h",
+                "keep only the last hour; older points are dropped",
+            ),
+        ],
+        ..BASE
+    },
+    Step {
+        title: "chart options",
+        text: r#"Most of these are buttons or keys too (⋯ for the rest); as flags they set how a chart starts."#,
+        keys: &[
+            ("y / log", "log scale"),
+            ("b", "point style"),
+            ("x", "split"),
+            ("D / side by side", "live data left, trends right"),
+        ],
+        examples: &[
+            ("--ymin 0 --ymax 100ms", "fixed y bounds (units work)"),
+            (
+                "--log --marker block",
+                "log scale; braille dot block half-block bar",
+            ),
+            ("--split", "a panel per series, each with its own y axis"),
+            ("--kind histogram --bins 40", "a finer histogram"),
+            (
+                "--colors cyan,#ff8800,203",
+                "series colours: names, hex or 256-colour numbers",
+            ),
+            ("--legend bottom-left", "legend position (or none)"),
+            ("--x-format '%H:%M'", "time axis labels"),
+            ("--hline 50ms:red:slow", "a reference line"),
+            (
+                "--side-by-side --right-panel avg,p95",
+                "two charts: live, and the trends you pick",
+            ),
+            (
+                "--no-targets",
+                "hide target lines (forecasts still use them)",
+            ),
+            (
+                "--width 80 --height 20 --once --no-color",
+                "a fixed size in plain text, for printing",
+            ),
+        ],
+        ..BASE
+    },
+    Step {
+        title: "printing and saving",
+        text: r#"Without a terminal (a pipe, cron, CI) graft prints the chart once and exits. Add stats, alerts or exports and it's a monitoring script."#,
+        examples: &[
+            (
+                "graft app.log --kv --no-chart --stats",
+                "just the numbers (--no-chart)",
+            ),
+            (
+                "graft app.log --kv -o chart.svg -o data.csv",
+                "export: .svg .csv .json, .png with the png feature",
+            ),
+            (
+                "graft app.log --kv --stats --per 1h --once",
+                "trends per hour (--per)",
+            ),
+            (
+                "graft app.log --kv --save-profile api",
+                "save these arguments as a profile",
+            ),
+            (
+                "graft -p dashboard --last 1h",
+                "open a profile or preset (--profile), plus flags",
+            ),
+            ("graft --list-profiles", "presets and saved profiles"),
+        ],
+        ..BASE
+    },
+    Step {
+        title: "the console's toolbox",
+        text: r#"Functions for the console, --alert, --mark, --line and scripts. They take a series name and use what's on screen (the timeframe, or a measured stretch)."#,
+        keys: &[
+            (
+                "last() first() min() max()",
+                "newest, oldest, smallest, largest value",
+            ),
+            (
+                "mean() avg() median() p95()",
+                "average, middle value, 95th percentile",
+            ),
+            (
+                "percentile() stddev() sum()",
+                "any percentile, spread, total",
+            ),
+            (
+                "count() span() series()",
+                "points, time covered, all series' names",
+            ),
+            (
+                "change() pct_change()",
+                "first to last, as a difference or %",
+            ),
+            (
+                "slope() r2() eta() forecast()",
+                "the trend: speed, fit, when, where",
+            ),
+            (
+                "values() xs() values_at()",
+                "a whole series as arrays, for add_line",
+            ),
+            (
+                "ema() sma() mean_of()",
+                "moving averages; several series averaged",
+            ),
+            (
+                "fmt() fmt_dur() fmt_time() bytes()",
+                "numbers, durations, times, byte counts as text",
+            ),
+        ],
+        examples: &[
+            (
+                r#":fmt_dur(eta("api", 60ms))"#,
+                "when api reaches 60 ms, in words",
+            ),
+            (r#":percentile("db", 99)"#, "the 99th percentile"),
+            (r#":fmt("api", mean("api"))"#, "the average, with its unit"),
+            (":series()", "the names of all series"),
+        ],
+        ..BASE
+    },
+    Step {
+        title: "every button as a command",
+        text: r#"Every button and key is a function too: for the console, key bindings (--bind) and scripts. Toggles flip with no argument and set with one: stats(true)."#,
+        keys: &[
+            ("stats() split() log() targets()", "toolbar toggles"),
+            (
+                "live() pause() follow() cursor()",
+                "more toggles, and measure() mouse() side_by_side()",
+            ),
+            (
+                "chart() lines() trend() window()",
+                "chart type, lines, the trend layer, the window",
+            ),
+            (
+                "timeframe() range() zoom() reset()",
+                "what's shown; zoom_in() zoom_out() pan()",
+            ),
+            ("show() hide() only() toggle() show_all()", "series"),
+            (
+                "hline() clear_hlines() target() clear_target()",
+                "reference lines and targets; forecast()",
+            ),
+            (
+                "title() unit() svg() format() quit()",
+                "title, unit, export, the builder, quit",
+            ),
+            (
+                "undo() redo() copy() save() load() bind()",
+                "undo, keep, scripts and keys",
+            ),
+            ("merge() unmerge()", "add or drop a source"),
+            ("mark() mark_when() clear_marks()", "markers"),
+            (
+                "alert() unalert() notify_to() notify_off()",
+                "alerts and where they go",
+            ),
+            ("add_line() remove_line()", "custom lines"),
+            (
+                "split_right() split_down() close_pane() single()",
+                "make panes; single() goes back to one",
+            ),
+            (
+                "focus_pane() move_pane() resize_pane() even_panes()",
+                "pick, move, size panes",
+            ),
+            (
+                "pane() pane_source() layout()",
+                "what a pane shows, its source, the arrangement",
+            ),
+        ],
+        examples: &[
+            (
+                r#":split_right()  :pane("db kind=histogram")"#,
+                "a pane with db's spread",
+            ),
+            (r#":single()"#, "back to one chart"),
+            (
+                r#":trend("median")  :window(60)"#,
+                "a median over 60 points",
+            ),
+            (
+                r#":pan("left")  :zoom_in()  :zoom_out()"#,
+                "like the ◀ + − buttons",
+            ),
+            (
+                r#":target("api", 60ms)  :forecast("1h")"#,
+                "a target, and a forecast an hour ahead",
+            ),
+            (r#":clear_target("api")  :clear_hlines()"#, "and away again"),
+            (
+                r#":title("latency")  :unit("ms")"#,
+                "title, and the unit for bare numbers",
+            ),
+            (
+                r#":notify_to("desktop")  :notify_off("desktop")"#,
+                "add or remove where notifications go",
+            ),
+            (
+                r#":add_line("x", "sma(values(`api`), 5)")  :remove_line("x")"#,
+                "add a line, and remove it",
+            ),
+            (
+                r#":alert("web > 1s")  :unalert("web > 1s")  :clear_marks()"#,
+                "the same for alerts; and every marker",
+            ),
+            (r#":bind("r", only("api"))"#, "press r for just api"),
+        ],
+        ..BASE
+    },
+    Step {
         title: "more to find",
         text: r#"F opens the format builder: change how lines are read, with live suggestions and a preview. Presets chart your machine in one word. --ssh runs anything on another machine, --merge combines sources into one chart.
 The next pages are recipes for real use: copy puts one on your clipboard."#,
         keys: &[
-            ("F", "the format builder"),
+            ("F / format", "the format builder"),
             ("?", "every key"),
             (":help", "every console command"),
         ],
