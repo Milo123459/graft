@@ -152,6 +152,22 @@ Values are normalised to bytes or seconds and displayed in readable units.
 To debug a format, `--explain` (or `--explain=N` for the first N lines) shows how each line was parsed and why any line
 was skipped.
 
+### Counting log lines
+
+Some logs don't have numbers worth charting, but *how often* something happens
+is: `--grep` counts the lines matching a regex in each time bucket.
+
+```sh
+graft /var/log/app.log --grep 'errors=ERROR|FATAL' --grep 'warnings=WARN'   # per minute
+graft /var/log/nginx/access.log --grep '5xx=" 5\d\d ' --grep-every 5m
+journalctl -f -o short-iso | graft --grep 'failed=(?i)fail'                  # live
+```
+
+`NAME=` names the series (else the regex is the name); `--grep lines=.` counts
+every line. Buckets with nothing in them count as 0, lines without a timestamp
+(stack traces) count with the entry above them, and live sources use arrival
+time. `{sum}` in `--stats-template` gives the total.
+
 ### Choosing and transforming series
 
 | | |
@@ -211,7 +227,7 @@ Every part of this is configurable:
 | `--stats-template '{name}: {trend} → {target} in {eta}'` | your own output line per series |
 | `--stats-format json` | machine-readable output |
 
-Template fields: `name n first last min max mean median stddev p95 change trend
+Template fields: `name n first last min max mean median stddev p95 sum change trend
 per r2 target eta eta_at direction model unit`. Add `:raw` (e.g. `{last:raw}`)
 for unformatted numbers.
 

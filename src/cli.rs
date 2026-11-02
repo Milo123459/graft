@@ -116,6 +116,22 @@ pub struct Cli {
     )]
     pub columns: Option<String>,
 
+    /// Count lines matching a regex, per time bucket (--grep-every), e.g. errors per
+    /// minute: `--grep ERROR`, `--grep 'errors=ERROR|FATAL'` (NAME=REGEX names the
+    /// series). Repeat for more series; `--grep lines=.` counts every line. Lines need
+    /// a timestamp (or come from a live source).
+    #[arg(
+        long,
+        value_name = "[NAME=]REGEX",
+        group = "parser",
+        help_heading = "Parsing"
+    )]
+    pub grep: Vec<String>,
+
+    /// Bucket size for --grep: `1m` (default), `10s`, `1h`…
+    #[arg(long, value_name = "DURATION", value_parser = parse_secs_arg, help_heading = "Parsing")]
+    pub grep_every: Option<f64>,
+
     /// Parse each line with the `parse(line)` function from --script (returns a map).
     #[arg(long, group = "parser", requires = "script", help_heading = "Parsing")]
     pub parse_fn: bool,
@@ -533,6 +549,10 @@ impl Cli {
         for e in &self.alert {
             opt("--alert", Some(e.clone()));
         }
+        for c in &self.grep {
+            opt("--grep", Some(c.clone()));
+        }
+        opt("--grep-every", self.grep_every.map(fmt_secs));
         for p in &self.pane {
             opt("--pane", Some(p.clone()));
         }
@@ -627,6 +647,20 @@ impl Cli {
             || self.json
             || self.columns.is_some()
             || self.parse_fn
+            || !self.grep.is_empty()
+    }
+
+    /// The bucket --grep sums into, in seconds.
+    pub fn grep_bucket(&self) -> f64 {
+        self.grep_every.unwrap_or(60.0)
+    }
+}
+
+fn parse_secs_arg(s: &str) -> Result<f64, String> {
+    match crate::time::parse_duration_secs(s) {
+        Ok(v) if v > 0.0 => Ok(v),
+        Ok(_) => Err("must be longer than 0".into()),
+        Err(e) => Err(e.to_string()),
     }
 }
 

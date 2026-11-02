@@ -191,7 +191,17 @@ pub fn chart_opts(cli: &Cli, spec: &SourceSpec, analysis: Analysis) -> Result<Ch
     Ok(ChartOpts {
         kind: cli.kind,
         marker: cli.marker,
-        title: cli.title.clone().unwrap_or_else(|| spec.describe()),
+        title: cli.title.clone().unwrap_or_else(|| {
+            if cli.grep.is_empty() {
+                spec.describe()
+            } else {
+                format!(
+                    "{} · lines per {}",
+                    spec.describe(),
+                    crate::time::fmt_duration_compact(cli.grep_bucket())
+                )
+            }
+        }),
         palette,
         legend: cli.legend,
         log: cli.log,

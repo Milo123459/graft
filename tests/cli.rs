@@ -295,3 +295,32 @@ fn a_format_is_required_and_suggested() {
             .success()
     );
 }
+
+#[test]
+fn grep_counts_matching_lines_per_bucket() {
+    let log = "2026-11-02 10:00:05 INFO ok\n\
+               2026-11-02 10:00:20 ERROR boom\n\
+               2026-11-02 10:00:40 ERROR again\n\
+               2026-11-02 10:03:10 ERROR later\n\
+               1.2.3.4 - - [02/Nov/2026:10:03:30 +0000] \"GET / HTTP/1.1\" 500\n";
+    let o = graft_stdin(
+        &[
+            "--grep",
+            "errors=ERROR| 500$",
+            "--grep",
+            "lines=.",
+            "--no-chart",
+            "--stats-template",
+            "{name} {n} {max} {sum}",
+        ],
+        log,
+    );
+    let out = stdout(&o);
+    // Buckets 10:00 (2 errors), 10:01 and 10:02 (none), 10:03 (2: ERROR and the 500).
+    assert!(
+        out.contains("errors 4 2 4"),
+        "{out}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(out.contains("lines 4 3 5"), "{out}");
+}

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::LazyLock;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde_json::Value;
 
@@ -98,6 +98,8 @@ pub fn build(cli: &Cli, script: Rc<ScriptHost>) -> Result<Box<dyn LineParser>> {
             time,
             binary,
         ))
+    } else if !cli.grep.is_empty() {
+        Box::new(CountParser::new(&cli.grep, time)?)
     } else if cli.parse_fn {
         Box::new(ScriptParser {
             host: script,
@@ -124,6 +126,74 @@ pub fn build(cli: &Cli, script: Rc<ScriptHost>) -> Result<Box<dyn LineParser>> {
             })
         }
     })
+}
+
+/// `--grep`: 1 when a line matches a pattern, 0 when it doesn't; summed per bucket
+/// later (see `transform::Pipeline`).
+pub struct CountParser {
+    patterns: Vec<(String, Regex)>,
+    time: TimeParser,
+    /// Lines without a timestamp (stack traces…) belong to the entry before them.
+    last_time: Option<f64>,
+}
+
+impl CountParser {
+    pub fn new(specs: &[String], time: TimeParser) -> Result<Self> {
+        let patterns = specs
+            .iter()
+            .map(|spec| {
+                let (name, re) = match spec.split_once('=') {
+                    Some((n, re))
+                        if !n.is_empty()
+                            && n.chars().all(|c| c.is_alphanumeric() || "_-.".contains(c)) =>
+                    {
+                        (n.to_string(), re)
+                    }
+                    _ => (spec.clone(), spec.as_str()),
+                };
+                let re = Regex::new(re).with_context(|| format!("--grep '{spec}'"))?;
+                Ok((name, re))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            patterns,
+            time,
+            last_time: None,
+        })
+    }
+
+    /// A timestamp at the start of the line, or just after a `[` (web server logs).
+    fn find_time(&self, line: &str) -> Option<f64> {
+        if let Some((t, _)) = self.time.detect(line) {
+            return Some(t);
+        }
+        line.match_indices('[')
+            .take(3)
+            .find_map(|(i, _)| self.time.detect(&line[i + 1..]).map(|(t, _)| t))
+    }
+}
+
+impl LineParser for CountParser {
+    fn parse(&mut self, line: &str) -> Result<Parsed, Skip> {
+        if line.trim().is_empty() {
+            return Err(Skip::NoValues);
+        }
+        let points = self
+            .patterns
+            .iter()
+            .map(|(name, re)| Point {
+                series: name.clone(),
+                value: if re.is_match(line) { 1.0 } else { 0.0 },
+                unit: Unit::default(),
+            })
+            .collect();
+        let t = self.find_time(line).or(self.last_time);
+        self.last_time = t;
+        Ok(Parsed {
+            x: t.map(XVal::Time),
+            points,
+        })
+    }
 }
 
 /// `all` → every numeric column; `1,3` → those columns (1-based).

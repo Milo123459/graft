@@ -25,6 +25,11 @@ static AUTO_PATTERNS: LazyLock<Vec<(Regex, AutoKind)>> = LazyLock::new(|| {
             r"^\s*\[?([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\]?",
             AutoKind::Syslog,
         ),
+        // 02/Nov/2026:10:03:30 +0000 (web server access logs)
+        p(
+            r"^\s*\[?(\d{2}/[A-Z][a-z]{2}/\d{4}:\d{2}:\d{2}:\d{2}(?:\s[+-]\d{4})?)\]?",
+            AutoKind::Clf,
+        ),
         // 08:00:01 (time of day only, e.g. `sar`, `vmstat -t`)
         p(
             r"^\s*\[?(\d{2}:\d{2}:\d{2}(?:\.\d+)?)\]?(?:\s|$)",
@@ -44,6 +49,7 @@ static AUTO_PATTERNS: LazyLock<Vec<(Regex, AutoKind)>> = LazyLock::new(|| {
 enum AutoKind {
     DateTime,
     Syslog,
+    Clf,
     TimeOfDay,
     Date,
     Epoch,
@@ -161,6 +167,14 @@ fn parse_auto(s: &str, kind: AutoKind) -> Option<f64> {
                 .ok()
                 .map(naive_secs)
         }
+        AutoKind::Clf => DateTime::parse_from_str(s, "%d/%b/%Y:%H:%M:%S %z")
+            .ok()
+            .map(aware_secs)
+            .or_else(|| {
+                NaiveDateTime::parse_from_str(s, "%d/%b/%Y:%H:%M:%S")
+                    .ok()
+                    .map(naive_secs)
+            }),
         AutoKind::TimeOfDay => {
             let t = NaiveTime::parse_from_str(s, "%H:%M:%S%.f").ok()?;
             Some(naive_secs(Local::now().date_naive().and_time(t)))
@@ -336,6 +350,16 @@ pub fn auto_per(span: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn access_log_timestamps() {
+        let t = TimeParser::default();
+        let (ts, len) = t.detect("[02/Nov/2026:10:03:30 +0000] GET /").unwrap();
+        assert_eq!(len, "[02/Nov/2026:10:03:30 +0000]".len());
+        let expected =
+            aware_secs(DateTime::parse_from_rfc3339("2026-11-02T10:03:30+00:00").unwrap());
+        assert_eq!(ts, expected);
+    }
 
     #[test]
     fn detects_iso_like_prefix() {

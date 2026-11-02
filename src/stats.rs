@@ -527,6 +527,7 @@ impl SeriesReport {
             "median" => num(st.median),
             "stddev" => num(st.stddev),
             "p95" => num(st.p95),
+            "sum" | "total" => num(st.sum),
             "change" => num(st.last - st.first),
             "trend" if raw => self
                 .fit

@@ -43,6 +43,8 @@ pub struct Pipeline {
     rate: bool,
     delta: bool,
     resample: Option<Resample>,
+    /// Counting (--grep): empty buckets are 0, not gaps.
+    fill: bool,
     smooth: Option<usize>,
 }
 
@@ -96,7 +98,14 @@ impl Pipeline {
             derived,
             rate: cli.rate,
             delta: cli.delta,
-            resample: cli.resample,
+            // --grep sums its 1s and 0s per bucket.
+            resample: cli.resample.or_else(|| {
+                (!cli.grep.is_empty()).then(|| Resample {
+                    width: cli.grep_bucket(),
+                    agg: Agg::Sum,
+                })
+            }),
+            fill: !cli.grep.is_empty(),
             smooth: cli.smooth,
         })
     }
@@ -125,6 +134,9 @@ impl Pipeline {
         for s in &mut ds.series {
             if let Some(r) = self.resample {
                 resample(s, r);
+                if self.fill && time {
+                    fill_gaps(s, r.width);
+                }
             }
             if let Some(n) = self.smooth {
                 smooth(s, n);
@@ -351,6 +363,30 @@ pub fn delta(s: &mut Series) {
         .windows(2)
         .map(|w| (w[1].0, w[1].1 - w[0].1))
         .collect();
+}
+
+/// Zeros for the buckets between points (nothing counted there).
+pub fn fill_gaps(s: &mut Series, width: f64) {
+    let (Some(&(first, _)), Some(&(last, _))) = (s.points.first(), s.points.last()) else {
+        return;
+    };
+    let n = ((last - first) / width).round() as usize + 1;
+    if n > 1_000_000 || n <= s.points.len() {
+        return;
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut it = s.points.iter().peekable();
+    for k in 0..n {
+        let x = first + k as f64 * width;
+        match it.peek() {
+            Some(&&(px, py)) if (px - x).abs() < width / 2.0 => {
+                out.push((px, py));
+                it.next();
+            }
+            _ => out.push((x, 0.0)),
+        }
+    }
+    s.points = out;
 }
 
 pub fn resample(s: &mut Series, r: Resample) {

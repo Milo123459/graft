@@ -18,6 +18,8 @@ pub struct Session {
     pub script: Rc<ScriptHost>,
     pub lines: u64,
     pub matched: u64,
+    /// --grep: lines with no timestamp at all are counted when they arrive.
+    arrival_time: bool,
 }
 
 impl Session {
@@ -32,13 +34,17 @@ impl Session {
             script,
             lines: 0,
             matched: 0,
+            arrival_time: !cli.grep.is_empty() && cli.x == crate::cli::XMode::Auto,
         })
     }
 
     /// Parse and store one line, returning the x it was placed at.
     pub fn feed(&mut self, line: &str, meta: &LineMeta) -> Result<f64, Skip> {
         self.lines += 1;
-        let parsed = self.parser.parse(line)?;
+        let mut parsed = self.parser.parse(line)?;
+        if self.arrival_time && parsed.x.is_none() {
+            parsed.x = Some(parse::XVal::Time(meta.arrival));
+        }
         let x = self.store.ingest(parsed, meta)?;
         self.matched += 1;
         Ok(x)
