@@ -1383,6 +1383,15 @@ impl<'a> ChartWidget<'a> {
                     (Color::Yellow, r.y)
                 }
             };
+            // Never over the legend or other text (not even a gap between words).
+            let beside_text = [col.checked_sub(1), Some(col + 1)]
+                .into_iter()
+                .flatten()
+                .filter(|&c| c >= r.x && c < r.right())
+                .any(|c| !free_cell(&buf[(c, row)]) && buf[(c, row)].symbol() != "▼");
+            if !free_cell(&buf[(col, row)]) || beside_text {
+                continue;
+            }
             buf[(col, row)]
                 .set_symbol("▼")
                 .set_fg(color)
@@ -1399,6 +1408,7 @@ impl<'a> ChartWidget<'a> {
                 !taken
                     .iter()
                     .any(|&(tr, a, b)| tr == row && x <= b && a <= x + w)
+                    && (x..x + w).all(|c| free_cell(&buf[(c, row)]))
             };
             let right = (col + 2 + w <= r.right())
                 .then_some(col + 2)
@@ -2156,6 +2166,14 @@ impl ChartWidget<'_> {
         }
         ChartWidget::new(&ds, &opts, overlay).render(rect, buf);
     }
+}
+
+/// Whether a marker may be drawn over this cell: blank, a plotted line (braille) or
+/// a marker guide — not text, the legend or the readout box.
+fn free_cell(cell: &ratatui::buffer::Cell) -> bool {
+    cell.symbol()
+        .chars()
+        .all(|c| c == ' ' || c == '┊' || ('\u{2800}'..='\u{28FF}').contains(&c))
 }
 
 /// Recolour a rectangle's border.

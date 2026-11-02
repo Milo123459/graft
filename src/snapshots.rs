@@ -415,3 +415,36 @@ fn write_dashboard_snapshot() {
         .unwrap();
     }
 }
+
+/// Render any command line after letting it run: `GRAFT_SNAPSHOT_ARGS` holds the
+/// arguments one per line, `GRAFT_SNAPSHOT_SECS` how long to run (default 5).
+#[test]
+#[ignore = "renders GRAFT_SNAPSHOT_ARGS into GRAFT_SNAPSHOTS"]
+fn write_custom_snapshot() {
+    let (Ok(dir), Ok(args)) = (
+        std::env::var("GRAFT_SNAPSHOTS"),
+        std::env::var("GRAFT_SNAPSHOT_ARGS"),
+    ) else {
+        return;
+    };
+    let secs: u64 = std::env::var("GRAFT_SNAPSHOT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let args: Vec<String> = std::iter::once("graft".to_string())
+        .chain(args.lines().map(String::from))
+        .collect();
+    let c = <Cli as clap::Parser>::parse_from(&args);
+    let spec = crate::setup::source_spec(&c, true).unwrap();
+    let setup = crate::setup::build(c, spec.clone(), false).unwrap();
+    let mut app = App::new(setup, Live::new(spec));
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < end {
+        app.tick();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, w, h) in [("custom", 150, 45), ("phone-custom", 46, 40)] {
+        std::fs::write(PathBuf::from(&dir).join(format!("{name}.ans")), screen(&app, w, h)).unwrap();
+    }
+}
