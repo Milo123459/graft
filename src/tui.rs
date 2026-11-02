@@ -221,6 +221,10 @@ const CONSOLE_HELP: &[(&str, &str)] = &[
         "svg(\"out.svg\")  format()  quit()",
         "export / change the format / quit",
     ),
+    (
+        "save(\"disks\")",
+        "save this view (source, format, panes…): graft -p disks",
+    ),
     ("— panes —", ""),
     (
         "split_right() split_down()",
@@ -304,6 +308,7 @@ enum Cmd {
     RangeStep(i8),
     RangeMenu,
     Panes,
+    Save,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1757,6 +1762,13 @@ impl App {
             Cmd::SideBySide => self.toggle_side_by_side(),
             Cmd::Targets => self.opts.show_targets = !self.opts.show_targets,
             Cmd::RangeStep(dir) => self.step_timeframe(dir),
+            Cmd::Save => {
+                self.console = Some(TextInput::new("save(\""));
+                self.say(
+                    "name this view, e.g. save(\"disks\") — then graft -p disks opens it",
+                    false,
+                );
+            }
             Cmd::Panes => {
                 self.pane_menu = !self.pane_menu;
                 if self.pane_menu {
@@ -1907,6 +1919,23 @@ impl App {
             Action::ZoomStep(zoom_in) => self.zoom_at(if zoom_in { 0.5 } else { 2.0 }, None),
             Action::Svg(path) => self.export_view(path),
             Action::Pane(a) => self.apply_pane_action(a),
+            Action::SaveProfile(name) => {
+                let name = name.trim().to_string();
+                if name.is_empty() || name.contains(char::is_whitespace) {
+                    return self.say("save: give a one-word name, e.g. save(\"disks\")", true);
+                }
+                let args: Vec<std::ffi::OsString> = std::iter::once("graft".to_string())
+                    .chain(self.current_cli().to_args())
+                    .map(Into::into)
+                    .collect();
+                match crate::profile::save(&name, &args) {
+                    Ok(path) => self.say(
+                        format!("saved '{name}' to {} — open it again with: graft -p {name}", path.display()),
+                        false,
+                    ),
+                    Err(e) => self.say(format!("save: {e:#}"), true),
+                }
+            }
             Action::Help => {
                 self.help = true;
                 self.help_scroll = 0;
@@ -2401,6 +2430,7 @@ impl App {
                 b("follow", Cmd::Follow).active(self.follow_pointer),
                 b(if self.paused { "resume" } else { "pause" }, Cmd::Pause).active(self.paused),
                 b("format", Cmd::Format),
+                b("save", Cmd::Save),
                 b(":", Cmd::Console),
                 b("svg", Cmd::Export),
                 b("mouse", Cmd::Mouse).active(self.mouse),
@@ -3572,6 +3602,30 @@ mod tests {
         }
         let app = app(&["graft", LOG, "--side-by-side", "-k", "bar"]);
         assert!(screen(&app).contains("node1 median"));
+    }
+
+    #[test]
+    fn save_the_view_as_a_profile() {
+        let dir = std::env::temp_dir().join(format!("graft-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("profiles.toml");
+        crate::profile::TEST_PROFILES.with(|t| *t.borrow_mut() = Some(file.clone()));
+        let mut app = app(&["graft", LOG, "--pane", "node1", "--pane", "node2 kind=bar"]);
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, "save(\"nodes\")");
+        key(&mut app, KeyCode::Enter);
+        let saved = std::fs::read_to_string(&file).unwrap();
+        crate::profile::TEST_PROFILES.with(|t| *t.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            saved.contains("[profiles.nodes]") && saved.contains("node2 kind=bar"),
+            "{saved}"
+        );
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|m| m.text.contains("graft -p nodes"))
+        );
     }
 
     #[test]

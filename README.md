@@ -389,7 +389,10 @@ Available functions:
     `clear_hlines()`
   - `zoom(6h)`, `zoom_in()`, `zoom_out()`, `pan("left" | "right" | -0.5)`,
     `reset()`
-  - `svg()` / `svg("out.svg")`, `format()` (open the builder), `quit()`
+  - `svg()` / `svg("out.svg")`, `format()` (open the builder), `quit()`,
+    `save("disks")` — saves the whole view (source, format, panes, lines,
+    timeframe…) as a profile; `graft -p disks` opens it again (also the
+    **save** button under `⋯`)
   - panes: `split_right()`, `split_down()`, `close_pane()`,
     `focus_pane(2 | "left")`, `move_pane("left")`, `resize_pane("right"[, 10])`,
     `even_panes()`, `layout("(1 | 2) / 3")`, `pane("node1 kind=bar lines=live,avg")`,

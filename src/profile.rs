@@ -213,7 +213,17 @@ pub fn saved() -> Vec<(String, Profile)> {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests point profiles at a file of their own without touching the environment.
+    pub static TEST_PROFILES: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 pub fn config_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(p) = TEST_PROFILES.with(|t| t.borrow().clone()) {
+        return Some(p);
+    }
     if let Some(p) = std::env::var_os("GRAFT_PROFILES") {
         return Some(PathBuf::from(p));
     }
