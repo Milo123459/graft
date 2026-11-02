@@ -269,11 +269,11 @@ including over SSH from a phone.
 |---|---|
 | tap | put the cursor there; a box beside it shows every series' value |
 | drag the cursor line | scrub through the data, and past it into the forecast |
-| drag anywhere else | select a range; the stats panel switches to it |
-| scroll | zoom around the pointer (shift + scroll pans) |
-| toolbar / series chips | ◀ ▶ + − reset cursor select stats forecast split **range**; `⋯` shows more: timeframe presets, trend, targets, chart type, log, follow, pause, format, console, export, mouse, help, quit |
+| **measure**, then tap start and end (or drag across) | stats for just that stretch, including how much each series *changed*; tap again to clear |
+| scroll | zoom around the pointer (sideways or shift + scroll moves); never past your data |
+| toolbar / series chips | ◀ ▶ + − reset cursor measure stats forecast split **all time**; `⋯` shows more: timeframe presets, trend, targets, chart type, log, follow, pause, format, console, export, mouse, help, quit |
 
-**Timeframe picker** (time series): tap **range: …** to step through
+**Timeframe picker** (time series): tap **all time** to step through
 presets that are shorter than your data (`24h`, `6h`, `1h`, … then back to
 `all`), or tap a preset under `⋯`. Keys `[` / `]` go narrower or wider. The
 stats, trend fits and forecasts all use the chosen timeframe.
@@ -287,17 +287,18 @@ mouse capture off, so your terminal's own text selection works.
 
 | Key | Action |
 |---|---|
-| `← →` / `h l` | pan; moves the cursor when it's on |
-| `H L` | pan by half a screen |
-| `+ -` | zoom in / out |
+| `← →` / `h l` | move left / right (when zoomed in) |
+| `↑ ↓` / `+ -` | zoom in / out |
+| `,` `.` / shift `← →` | step the cursor point by point |
+| `H L` | move by half a screen |
 | `0` / `r` | reset |
 | `c` / `o` | cursor / cursor follows the pointer |
 | `Home` / `End` | cursor to first / last point |
-| `v` … `v` | select a range from the keyboard |
+| `v` … `v` | measure a range from the keyboard |
 | `1`–`9` / `a` | toggle a series / show all |
 | `t` / `m` / `y` / `x` | chart type / marker / log scale / split panels |
 | `f` / `T` / `G` | forecast / trend line / target lines on or off |
-| `[` / `]` | narrower / wider timeframe |
+| `[` / `]` | narrower / wider timeframe (the **all time** / **last 24h** button) |
 | `F` | change the format or source (builder) |
 | `s` | stats panel |
 | `space` | pause live updates |

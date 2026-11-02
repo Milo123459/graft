@@ -31,44 +31,64 @@ use crate::transform::{Timeframe, timeframe_presets};
 use crate::ui::{Button, Hits, TextInput, flow_height, render_buttons};
 
 const HELP: &[(&str, &str)] = &[
+    ("— moving around —", ""),
+    ("← → / h l", "move left / right (when zoomed in)"),
+    ("↑ ↓ / + -", "zoom in / out"),
     (
-        "tap / click",
-        "put the cursor there (values show beside it)",
+        "scroll",
+        "zoom around the pointer; sideways scroll (or shift) moves",
+    ),
+    ("reset / 0", "show everything again"),
+    ("— looking at values —", ""),
+    (
+        "tap / cursor / c",
+        "a line showing every series' value at that point",
     ),
     (
-        "drag the cursor",
-        "scrub through the data (and into the forecast)",
+        "drag the line",
+        "scrub through the data, and into the forecast",
     ),
-    ("drag elsewhere", "select a range — stats switch to it"),
-    ("scroll", "zoom in / out around the pointer (shift: pan)"),
+    (", . / shift ← →", "step the cursor point by point"),
     (
-        "toolbar / chips",
-        "tap buttons and series names; ⋯ shows more",
+        "follow / o",
+        "the cursor follows the mouse without clicking",
     ),
-    ("← → / h l", "pan (moves the cursor when it's on)"),
-    ("H L", "pan by half a screen"),
-    ("+ / -", "zoom in / out"),
-    ("0 / r", "reset view"),
-    ("c / o", "toggle cursor / cursor follows the pointer"),
-    ("Home / End", "cursor to first / last point"),
-    ("v", "start / finish a range selection with the keyboard"),
+    ("— the toolbar —", ""),
+    (
+        "measure / v",
+        "tap the start, then the end: stats for just that stretch",
+    ),
+    ("", "(or drag across the chart); tap again to clear"),
+    (
+        "stats / s",
+        "table: trend per day, forecast, last, min, max…",
+    ),
+    (
+        "forecast / f",
+        "project each trend forward (targets: --target)",
+    ),
+    ("split / x", "one panel per series, each with its own scale"),
+    ("all time / [ ]", "only show recent data: last 24h, 6h, 1h…"),
+    (
+        "⋯",
+        "more: chart type, log scale, trend & target lines, pause,",
+    ),
+    (
+        "",
+        "format (change how lines are read), console, export, mouse",
+    ),
+    ("— other keys —", ""),
     ("1-9 / a", "show or hide a series / show all"),
-    ("t m y x", "chart type, marker, log scale, split panels"),
-    (
-        "f",
-        "toggle forecast (targets: --target or :target(\"s\", 50GB))",
-    ),
-    ("s / space", "stats panel / pause live updates"),
+    ("t m y", "chart type, marker, log scale"),
+    ("T / G", "trend line over the data / target lines"),
     (
         "F",
         "change the format or source (builder, with suggestions)",
     ),
-    ("e", "export the view to an SVG file"),
-    ("M", "toggle mouse capture (off = terminal text selection)"),
+    ("e / space", "export to SVG / pause live updates"),
+    ("M", "mouse on/off (off = select text in your terminal)"),
     (":", "Rhai console, e.g. :slope(\"node1\", \"1d\")"),
-    ("[ / ]", "narrower / wider timeframe (or tap range: …)"),
-    ("T / G", "trend line over the data / target lines on or off"),
-    ("q / Esc", "quit (Esc first clears a selection)"),
+    ("q / Esc", "quit (Esc first clears a measurement)"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +101,8 @@ enum Cmd {
     Cursor,
     Follow,
     Select,
+    CursorPrev,
+    CursorNext,
     Kind,
     Split,
     Log,
@@ -143,6 +165,8 @@ pub struct App {
     view: Option<(f64, f64)>,
     cursor: Option<f64>,
     anchor: Option<f64>,
+    /// "measure" is waiting for taps on the chart (start, then end).
+    measuring: bool,
     selection: Option<(f64, f64)>,
     hidden: HashSet<String>,
     show_stats: bool,
@@ -203,6 +227,7 @@ impl App {
             view: None,
             cursor: None,
             anchor: None,
+            measuring: false,
             selection: None,
             hidden: HashSet::new(),
             paused: false,
@@ -349,26 +374,51 @@ impl App {
         xs
     }
 
+    /// Everything there is to see: all data plus any forecast.
+    fn full_bounds(&self) -> (f64, f64) {
+        plot_x_bounds(&self.ds, &self.opts, None, Some(&self.hidden))
+    }
+
+    /// Show `[lo, hi]`, kept inside the data (and forecast) and no wider than it;
+    /// zooming all the way out goes back to showing everything.
+    fn set_view(&mut self, lo: f64, hi: f64) {
+        let (a, b) = self.full_bounds();
+        let full = b - a;
+        if full <= 0.0 {
+            return;
+        }
+        let span = (hi - lo).max(full / 5000.0);
+        if span >= full * 0.999 {
+            self.view = None;
+            return;
+        }
+        let lo = lo.clamp(a, b - span);
+        self.view = Some((lo, lo + span));
+    }
+
     fn zoom_at(&mut self, factor: f64, centre: Option<f64>) {
         let (x0, x1) = self.bounds();
-        let centre = centre.or(self.cursor).unwrap_or((x0 + x1) / 2.0);
-        let (lo, hi) = (
+        let centre = centre
+            .or(self.cursor)
+            .unwrap_or((x0 + x1) / 2.0)
+            .clamp(x0, x1);
+        self.set_view(
             centre - (centre - x0) * factor,
             centre + (x1 - centre) * factor,
         );
-        match self.ds.x_range() {
-            Some((a, b)) if factor > 1.0 && hi - lo >= b - a && self.opts.forecast.is_none() => {
-                self.view = None
-            }
-            _ if hi - lo > 1e-9 => self.view = Some((lo, hi)),
-            _ => {}
-        }
     }
 
     fn pan(&mut self, frac: f64) {
+        if self.view.is_none() {
+            self.say(
+                "everything is already in view: zoom in (↑, + or scroll) to move around",
+                false,
+            );
+            return;
+        }
         let (x0, x1) = self.bounds();
         let d = (x1 - x0) * frac;
-        self.view = Some((x0 + d, x1 + d));
+        self.set_view(x0 + d, x1 + d);
     }
 
     fn move_cursor(&mut self, dir: i32) {
@@ -387,7 +437,7 @@ impl App {
             self.cursor = Some(x);
             if x < x0 || x > x1 {
                 let half = (x1 - x0) / 2.0;
-                self.view = Some((x - half, x + half));
+                self.set_view(x - half, x + half);
             }
         }
     }
@@ -468,6 +518,7 @@ impl App {
         }
     }
 
+    /// Keyboard measuring: `v` at the start, move the cursor, `v` at the end.
     fn start_selection(&mut self) {
         if self.cursor.is_none() {
             let (a, b) = self.bounds();
@@ -478,24 +529,67 @@ impl App {
                 self.anchor = Some(c);
                 self.selection = None;
                 self.say(
-                    "selecting: move the cursor (or drag), then press v / tap select again",
+                    "measuring from here: move the cursor (, . or drag) and press v again",
                     false,
                 );
             }
-            (Some(a), Some(c)) => {
-                self.selection = Some((a.min(c), a.max(c)));
-                self.show_stats = true;
-            }
+            (Some(a), Some(c)) => self.finish_measure(a, c),
             _ => {}
+        }
+    }
+
+    fn finish_measure(&mut self, a: f64, b: f64) {
+        self.selection = Some((a.min(b), a.max(b)));
+        self.anchor = None;
+        self.measuring = false;
+        self.show_stats = true;
+        self.say(
+            "stats now cover only the measured stretch (see 'change'); tap measure or Esc to clear",
+            false,
+        );
+    }
+
+    /// The "measure" button: start measuring, or clear a measurement.
+    fn toggle_measure(&mut self) {
+        if self.measuring || self.anchor.is_some() || self.selection.is_some() {
+            self.measuring = false;
+            self.anchor = None;
+            self.selection = None;
+            self.say("measurement cleared", false);
+        } else {
+            self.measuring = true;
+            self.say(
+                "measure: tap where it starts, then where it ends (or drag across)",
+                false,
+            );
+        }
+    }
+
+    /// A tap on the chart at x: part of a measurement, or placing the cursor.
+    fn tap_at(&mut self, x: f64) {
+        if self.measuring {
+            match self.anchor {
+                None => {
+                    self.anchor = Some(x);
+                    self.cursor = Some(x);
+                    self.say("now tap where it ends", false);
+                }
+                Some(a) => {
+                    self.cursor = Some(x);
+                    self.finish_measure(a, x);
+                }
+            }
+        } else {
+            self.cursor = Some(x);
         }
     }
 
     fn run_cmd(&mut self, cmd: Cmd) -> Transition {
         match cmd {
-            Cmd::PanLeft if self.cursor.is_some() => self.move_cursor(-1),
-            Cmd::PanRight if self.cursor.is_some() => self.move_cursor(1),
-            Cmd::PanLeft => self.pan(-0.1),
-            Cmd::PanRight => self.pan(0.1),
+            Cmd::PanLeft => self.pan(-0.2),
+            Cmd::PanRight => self.pan(0.2),
+            Cmd::CursorPrev => self.move_cursor(-1),
+            Cmd::CursorNext => self.move_cursor(1),
             Cmd::ZoomIn => self.zoom_at(0.5, None),
             Cmd::ZoomOut => self.zoom_at(2.0, None),
             Cmd::Reset => {
@@ -520,7 +614,7 @@ impl App {
                     );
                 }
             }
-            Cmd::Select => self.start_selection(),
+            Cmd::Select => self.toggle_measure(),
             Cmd::Kind => self.opts.kind = self.opts.kind.next(),
             Cmd::Marker => self.opts.marker = self.opts.marker.next(),
             Cmd::Split => self.opts.split = !self.opts.split,
@@ -593,7 +687,7 @@ impl App {
             Action::ClearHLines => self.opts.hlines.clear(),
             Action::Zoom(span) => {
                 if let Some((_, b)) = self.ds.x_range() {
-                    self.view = Some((b - span, b));
+                    self.set_view(b - span, b);
                 }
             }
             Action::ResetView => {
@@ -684,16 +778,23 @@ impl App {
         }
         let cmd = match key.code {
             KeyCode::Char('q') => Cmd::Quit,
-            KeyCode::Esc if self.selection.is_some() || self.anchor.is_some() => {
+            KeyCode::Esc if self.selection.is_some() || self.anchor.is_some() || self.measuring => {
                 self.selection = None;
                 self.anchor = None;
+                self.measuring = false;
                 return Transition::None;
             }
             KeyCode::Esc => Cmd::Quit,
             KeyCode::Char('?') => Cmd::Help,
             KeyCode::Char(':') => Cmd::Console,
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => Cmd::CursorPrev,
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => Cmd::CursorNext,
+            KeyCode::Char(',' | '<') => Cmd::CursorPrev,
+            KeyCode::Char('.' | '>') => Cmd::CursorNext,
             KeyCode::Left | KeyCode::Char('h') => Cmd::PanLeft,
             KeyCode::Right | KeyCode::Char('l') => Cmd::PanRight,
+            KeyCode::Up | KeyCode::Char('k') => Cmd::ZoomIn,
+            KeyCode::Down | KeyCode::Char('j') => Cmd::ZoomOut,
             KeyCode::Char('H') => {
                 self.pan(-0.5);
                 return Transition::None;
@@ -718,7 +819,10 @@ impl App {
                 self.view = None;
                 return Transition::None;
             }
-            KeyCode::Char('v') => Cmd::Select,
+            KeyCode::Char('v') => {
+                self.start_selection();
+                return Transition::None;
+            }
             KeyCode::Char(d @ '1'..='9') => {
                 self.toggle_series(d as usize - '1' as usize);
                 return Transition::None;
@@ -814,11 +918,10 @@ impl App {
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => match self.drag.take() {
-                Some(Drag::Pending { x, .. }) => self.cursor = Some(x),
+                Some(Drag::Pending { x, .. }) => self.tap_at(x),
                 Some(Drag::Selecting) => {
                     if let (Some(a), Some(c)) = (self.anchor.take(), self.cursor) {
-                        self.selection = Some((a.min(c), a.max(c)));
-                        self.show_stats = true;
+                        self.finish_measure(a, c);
                     }
                 }
                 _ => {}
@@ -830,16 +933,17 @@ impl App {
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 if let Some(plot) = self.plot_at(col, row) {
+                    // Small steps: trackpads send many events per swipe.
                     let up = m.kind == MouseEventKind::ScrollUp;
                     if m.modifiers.contains(KeyModifiers::SHIFT) {
-                        self.pan(if up { -0.1 } else { 0.1 });
+                        self.pan(if up { -0.05 } else { 0.05 });
                     } else {
-                        self.zoom_at(if up { 0.8 } else { 1.25 }, Some(plot.x_at(col)));
+                        self.zoom_at(if up { 0.9 } else { 1.0 / 0.9 }, Some(plot.x_at(col)));
                     }
                 }
             }
-            MouseEventKind::ScrollLeft => self.pan(-0.1),
-            MouseEventKind::ScrollRight => self.pan(0.1),
+            MouseEventKind::ScrollLeft => self.pan(-0.05),
+            MouseEventKind::ScrollRight => self.pan(0.05),
             _ => {}
         }
         Transition::None
@@ -856,14 +960,28 @@ impl App {
             b("−", Cmd::ZoomOut),
             b("reset", Cmd::Reset).active(self.view.is_some()),
             b("cursor", Cmd::Cursor).active(self.cursor.is_some()),
-            b("select", Cmd::Select).active(self.anchor.is_some() || self.selection.is_some()),
+            b(
+                if self.selection.is_some() {
+                    "clear measure"
+                } else {
+                    "measure"
+                },
+                Cmd::Select,
+            )
+            .active(self.measuring || self.anchor.is_some() || self.selection.is_some()),
             b("stats", Cmd::Stats).active(self.show_stats),
             b("forecast", Cmd::Forecast).active(self.opts.forecast.is_some()),
             b("split", Cmd::Split).active(self.opts.split),
         ];
         // The timeframe picker (tap to step to a narrower range, wrapping to all).
         if !self.presets.is_empty() || !self.timeframe.is_all() {
-            let label = format!("range: {}", self.timeframe.label(&self.ds));
+            let label = if self.timeframe.is_all() {
+                "all time".to_string()
+            } else if self.timeframe.last.is_some() {
+                format!("last {}", self.timeframe.label(&self.ds))
+            } else {
+                self.timeframe.label(&self.ds)
+            };
             v.push(b(&label, Cmd::RangeStep(-1)).active(!self.timeframe.is_all()));
         }
         v.push(
@@ -1099,7 +1217,7 @@ impl App {
         } else {
             let points: usize = self.ds.series.iter().map(|s| s.points.len()).sum();
             let hint = if self.mouse {
-                "tap to inspect · drag to select · ? help"
+                "tap to inspect · drag to measure · ? help"
             } else {
                 "? help  : console  q quit"
             };
@@ -1144,6 +1262,7 @@ impl App {
             "series",
             delta.as_str(),
             "forecast",
+            "change",
             "last",
             "R²",
             "min",
@@ -1174,6 +1293,12 @@ impl App {
                         _ => trend,
                     },
                     r.forecast_cell(),
+                    // How much it moved across the measured (or visible) stretch.
+                    format!(
+                        "{}{}",
+                        if st.last < st.first { "-" } else { "+" },
+                        f((st.last - st.first).abs())
+                    ),
                     f(st.last),
                     r.fit.map_or("—".into(), |fit| format!("{:.2}", fit.r2)),
                     f(st.min),
@@ -1387,7 +1512,7 @@ mod tests {
         assert!(screen(&app).contains("2026-11-01 04:00  node1=59.9 GB  node2=422.6 GB"));
         key(&mut app, KeyCode::Char('v'));
         (0..6).for_each(|_| {
-            key(&mut app, KeyCode::Right);
+            key(&mut app, KeyCode::Char('.'));
         });
         key(&mut app, KeyCode::Char('v'));
         let (a, b) = app.selection.expect("selection");
@@ -1526,7 +1651,7 @@ mod tests {
             ]
         );
         // Tap "range: all" → steps to the widest preset.
-        let (x, y) = find(&app, "range: all");
+        let (x, y) = find(&app, "all time");
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
         assert_eq!(app.timeframe.last, Some(Window::Span(86400.0)));
         assert!(app.ds.series[0].points.len() < 29);
@@ -1588,6 +1713,62 @@ mod tests {
         );
         key(&mut app, KeyCode::Esc);
         assert!(app.console.is_none());
+    }
+
+    #[test]
+    fn zoom_and_pan_stay_inside_the_data() {
+        let mut app = app(&["graft", LOG, "--forecast", "--target", "node1=50GB"]);
+        screen(&app);
+        let plot = app.plots.borrow()[0];
+        let (col, row) = (plot.rect.x + plot.rect.width / 2, plot.rect.y + 2);
+        // A trackpad swipe: lots of scroll-downs. Zooming out stops at "everything".
+        for _ in 0..200 {
+            mouse(&mut app, MouseEventKind::ScrollDown, col, row);
+        }
+        assert_eq!(app.view, None);
+        assert!(!screen(&app).contains("EB"), "no runaway forecast scale");
+        // Arrows: ↑ zooms in, ← → move but never past the data (or forecast).
+        let (a, b) = app.full_bounds();
+        key(&mut app, KeyCode::Up);
+        key(&mut app, KeyCode::Up);
+        for _ in 0..50 {
+            key(&mut app, KeyCode::Left);
+        }
+        assert_eq!(app.view.unwrap().0, a);
+        for _ in 0..50 {
+            key(&mut app, KeyCode::Right);
+        }
+        assert!((app.view.unwrap().1 - b).abs() < 1e-6);
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.view, None);
+        // Panning with everything in view explains itself.
+        key(&mut app, KeyCode::Left);
+        assert!(app.message.as_ref().unwrap().text.contains("zoom in"));
+    }
+
+    #[test]
+    fn measure_by_tapping_start_and_end() {
+        let mut app = app(&["graft", LOG]);
+        screen(&app);
+        let plot = app.plots.borrow()[0];
+        let row = plot.rect.y + 2;
+        let tap = |app: &mut App, col: u16| {
+            mouse(app, MouseEventKind::Down(MouseButton::Left), col, row);
+            mouse(app, MouseEventKind::Up(MouseButton::Left), col, row);
+        };
+        let (x, y) = find(&app, " measure ");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert!(app.measuring);
+        tap(&mut app, plot.rect.x + 5);
+        tap(&mut app, plot.rect.x + 40);
+        let (a, b) = app.selection.expect("measured");
+        assert!(b > a && app.show_stats && !app.measuring);
+        let s = screen(&app);
+        assert!(s.contains("change") && s.contains("clear measure"), "{s}");
+        let (x, y) = find(&app, " clear measure ");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert!(app.selection.is_none());
     }
 
     #[test]

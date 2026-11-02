@@ -214,6 +214,9 @@ pub fn scenarios() -> Vec<(String, String)> {
     add("view-many-series", screen(&app, 150, 45));
     app.test_keys("?");
     add("view-help", screen(&app, 150, 45));
+    let mut app = viewer(&[month, "-F", FMT]);
+    app.test_keys("v.......................................v");
+    add("view-measured", screen(&app, 150, 45));
     let mut app = viewer(&[LOG, "-F", FMT]);
     app.test_keys(":");
     app.test_keys("slope(\"node2\", \"1d\")");

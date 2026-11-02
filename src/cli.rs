@@ -29,7 +29,7 @@ Format templates (-F): {name} captures a number (with optional unit) as series `
 (one per distinct value); {_} skips any text; {name:int}, {name:word} and {name:/regex/}
 change what is matched; spaces match any run of whitespace; {{ and }} are literal braces.
 
-Interactive: mouse/touch works everywhere (tap, drag to select, scroll to zoom);
+Interactive: mouse/touch works everywhere (tap, drag to measure, scroll to zoom);
 press ? inside the viewer for keys.";
 
 /// Graph anything: logs, command output, CSV or JSON — right in your terminal.

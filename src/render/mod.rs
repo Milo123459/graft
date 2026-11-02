@@ -991,6 +991,17 @@ impl<'a> ChartWidget<'a> {
             .hidden_legend_constraints((Constraint::Ratio(2, 3), Constraint::Ratio(2, 3)))
             .render(area, buf);
         let plot = PlotArea { rect: plot, x0, x1 };
+        // Shade a measured stretch.
+        if let Some((a, b)) = self.overlay.selection
+            && b > x0
+            && a < x1
+        {
+            for col in plot.col_of(a.max(x0))..=plot.col_of(b.min(x1)) {
+                for row in plot.rect.y..plot.rect.bottom() {
+                    buf[(col, row)].set_bg(Color::Indexed(236));
+                }
+            }
+        }
         draw_axis_labels(
             buf,
             inner,
