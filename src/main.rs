@@ -108,8 +108,18 @@ fn run() -> Result<ExitCode> {
         opts,
         report,
         spec,
+        timeframe,
     } = setup;
-    run_once(&cli, &mut session, rx, &opts, &report, &spec, color)
+    run_once(
+        &cli,
+        &mut session,
+        rx,
+        &opts,
+        &report,
+        &spec,
+        color,
+        timeframe,
+    )
 }
 
 use crate::setup::Setup;
@@ -125,6 +135,7 @@ fn terminal_size() -> Option<(u16, u16)> {
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_once(
     cli: &Cli,
     session: &mut Session,
@@ -133,6 +144,7 @@ fn run_once(
     report: &ReportOpts,
     spec: &SourceSpec,
     color: bool,
+    timeframe: transform::Timeframe,
 ) -> Result<ExitCode> {
     for ev in rx {
         match ev {
@@ -144,7 +156,8 @@ fn run_once(
             Event::Eof => break,
         }
     }
-    let full = session.full_dataset();
+    let mut full = session.full_dataset();
+    timeframe.apply(&mut full);
     let ds = session.select(&full);
     if ds.is_empty() {
         eprintln!(

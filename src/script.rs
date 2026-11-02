@@ -40,6 +40,8 @@ pub enum Action {
     Target(String, Option<f64>),
     /// Forecast horizon (`"auto"`, `"7d"`), or `None` to turn forecasting off.
     Forecast(Option<String>),
+    /// Timeframe (`"7d"`, `"500"`), or `None` for all data.
+    Range(Option<String>),
 }
 
 /// State shared between the host and registered functions.
@@ -511,6 +513,13 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
             ),
         );
         Ok(())
+    });
+    let st = state.clone();
+    engine.register_fn("range", move |r: &str| {
+        push(
+            &st,
+            Action::Range((!matches!(r, "all" | "off" | "none")).then(|| r.to_string())),
+        );
     });
     let st = state.clone();
     engine.register_fn("clear_target", move |n: &str| {

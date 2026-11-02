@@ -192,6 +192,19 @@ pub struct Cli {
     #[arg(long, value_name = "N", help_heading = "Series")]
     pub smooth: Option<usize>,
 
+    /// Timeframe: only use the most recent part of the data — a duration (`7d`, `12h`)
+    /// or a number of points. Unlike --window this is a view: the viewer can widen it again.
+    #[arg(short = 'L', long, value_name = "DURATION|N", value_parser = parse_window, help_heading = "Series")]
+    pub last: Option<Window>,
+
+    /// Timeframe start: a timestamp like `2026-10-15` or `2026-10-15 08:00` (or a number for numeric x).
+    #[arg(long, value_name = "TIME", help_heading = "Series")]
+    pub since: Option<String>,
+
+    /// Timeframe end (same forms as --since).
+    #[arg(long, value_name = "TIME", help_heading = "Series")]
+    pub until: Option<String>,
+
     // ───────────── Chart ─────────────
     /// Chart type.
     #[arg(short = 'k', long, value_enum, default_value_t = ChartKind::Line, help_heading = "Chart")]
@@ -310,6 +323,14 @@ pub struct Cli {
     #[arg(long, value_name = "HORIZON", num_args = 0..=1, require_equals = true, default_missing_value = "auto", help_heading = "Analysis")]
     pub forecast: Option<String>,
 
+    /// Draw the fitted trend line over the data.
+    #[arg(long, help_heading = "Analysis")]
+    pub trend: bool,
+
+    /// Don't draw target lines (targets still drive forecasts and stats).
+    #[arg(long, help_heading = "Analysis")]
+    pub no_targets: bool,
+
     /// Exit with status 3 if a Rhai condition holds, e.g. `node1 < 50GB` or `slope("node2") < 0`.
     #[arg(long, value_name = "EXPR", action = ArgAction::Append, help_heading = "Analysis")]
     pub alert: Vec<String>,
@@ -421,6 +442,9 @@ impl Cli {
                 .map(|r| format!("{}:{}", fmt_secs(r.width), value_name(r.agg))),
         );
         opt("--smooth", self.smooth.map(|n| n.to_string()));
+        opt("--last", self.last.map(fmt_window));
+        opt("--since", self.since.clone());
+        opt("--until", self.until.clone());
         opt(
             "--kind",
             (self.kind != d.kind).then(|| value_name(self.kind)),
@@ -488,6 +512,8 @@ impl Cli {
             (self.once, "--once"),
             (self.no_chart, "--no-chart"),
             (self.no_mouse, "--no-mouse"),
+            (self.trend, "--trend"),
+            (self.no_targets, "--no-targets"),
         ];
         a.extend(flags.iter().filter(|f| f.0).map(|f| f.1.to_string()));
         // Optional-value flags need `=`.

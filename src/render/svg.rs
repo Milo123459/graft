@@ -188,14 +188,38 @@ fn xy(
     let projections: Vec<(usize, Vec<(f64, f64)>)> = series
         .iter()
         .filter_map(|&(i, s)| {
-            let (fit, _) = opts.projection(s)?;
-            Some((i, super::projection_points(&fit, fit.x_first, x1)))
+            let (fit, from) = match opts.projection(s) {
+                Some((fit, _)) => (
+                    fit,
+                    if opts.show_trend {
+                        fit.x_first
+                    } else {
+                        fit.x_last
+                    },
+                ),
+                None if opts.show_trend => (opts.analysis.fit(s)?, opts.analysis.fit(s)?.x_first),
+                None => return None,
+            };
+            let to = if opts.forecast.is_some() {
+                x1
+            } else {
+                fit.x_last
+            };
+            Some((i, super::projection_points(&fit, from, to)))
         })
         .collect();
+    let near = super::min_max(
+        series
+            .iter()
+            .flat_map(|(_, s)| s.points.iter().map(|p| p.1))
+            .chain(projections.iter().flat_map(|p| p.1.iter().map(|p| p.1))),
+    );
     let targets: Vec<(usize, &str, f64)> = series
         .iter()
+        .filter(|_| opts.show_targets)
         .filter_map(|&(i, s)| Some((i, s.name.as_str(), opts.analysis.targets.explicit(&s.name)?)))
         .filter(|t| !log || t.2 > 0.0)
+        .filter(|t| near.is_none_or(|(lo, hi)| hline_near(t.2, lo, hi)))
         .collect();
     let values: Vec<f64> = series
         .iter()

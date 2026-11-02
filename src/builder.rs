@@ -99,6 +99,8 @@ enum Opt {
     Binary,
     Follow,
     Fit,
+    Trend,
+    Range,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -710,6 +712,21 @@ impl Builder {
                             FitModel::Linear
                         }
                     }
+                    Opt::Trend => c.trend = !c.trend,
+                    Opt::Range => {
+                        // all → 1h → 6h → 24h → 7d → 30d → all
+                        const STEPS: [f64; 5] = [3600.0, 21600.0, 86400.0, 604_800.0, 2_592_000.0];
+                        c.since = None;
+                        c.until = None;
+                        c.last = match c.last {
+                            None => Some(crate::cli::Window::Span(STEPS[0])),
+                            Some(crate::cli::Window::Span(d)) => STEPS
+                                .iter()
+                                .find(|s| **s > d)
+                                .map(|s| crate::cli::Window::Span(*s)),
+                            Some(crate::cli::Window::Points(_)) => None,
+                        };
+                    }
                 }
                 self.refresh();
             }
@@ -818,6 +835,19 @@ impl Builder {
                 format!("fit: {}", crate::cli::fit_name(c.fit)),
                 Hit::Opt(Opt::Fit),
             ),
+            Button::new("trend", Hit::Opt(Opt::Trend)).active(c.trend),
+            Button::new(
+                format!(
+                    "range: {}",
+                    match c.last {
+                        Some(crate::cli::Window::Span(d)) => crate::time::fmt_duration_compact(d),
+                        Some(crate::cli::Window::Points(n)) => format!("{n} pts"),
+                        None => "all".into(),
+                    }
+                ),
+                Hit::Opt(Opt::Range),
+            )
+            .active(c.last.is_some()),
             Button::new("log", Hit::Opt(Opt::Log)).active(c.log),
             Button::new("1024 units", Hit::Opt(Opt::Binary)).active(c.binary_units),
         ];

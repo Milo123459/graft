@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use regex::Regex;
 use rhai::AST;
 
-use crate::cli::{Agg, Cli, Resample};
+use crate::cli::{Agg, Cli, Resample, Window};
 use crate::data::{Dataset, Series, XKind};
 use crate::script::{ScriptHost, ident};
 use crate::units::Unit;
@@ -146,6 +146,108 @@ impl Pipeline {
     }
 }
 
+/// A timeframe: the part of the data that's shown and analysed.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Timeframe {
+    /// The most recent duration (relative to the newest point) or number of points.
+    pub last: Option<Window>,
+    pub since: Option<f64>,
+    pub until: Option<f64>,
+}
+
+impl Timeframe {
+    pub fn is_all(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn last(w: Window) -> Self {
+        Self {
+            last: Some(w),
+            ..Self::default()
+        }
+    }
+
+    /// Restrict every series to the timeframe.
+    pub fn apply(&self, ds: &mut Dataset) {
+        if self.is_all() {
+            return;
+        }
+        let newest = ds
+            .series
+            .iter()
+            .filter_map(|s| {
+                s.points
+                    .iter()
+                    .rev()
+                    .find(|p| self.until.is_none_or(|u| p.0 <= u))
+                    .map(|p| p.0)
+            })
+            .reduce(f64::max);
+        for s in &mut ds.series {
+            let a = self
+                .since
+                .map_or(0, |t| s.points.partition_point(|p| p.0 < t));
+            let b = self
+                .until
+                .map_or(s.points.len(), |t| s.points.partition_point(|p| p.0 <= t));
+            let mut pts = &s.points[a..b.max(a)];
+            match self.last {
+                Some(Window::Points(n)) => pts = &pts[pts.len().saturating_sub(n)..],
+                Some(Window::Span(d)) => {
+                    if let Some(newest) = newest {
+                        pts = &pts[pts.partition_point(|p| p.0 < newest - d)..];
+                    }
+                }
+                None => {}
+            }
+            s.points = pts.to_vec();
+        }
+    }
+
+    /// Short label, e.g. `7d`, `500 pts`, `since 10-15`, or `all`.
+    pub fn label(&self, ds: &Dataset) -> String {
+        let t = |x: f64| ds.fmt_x(x, 86400.0 * 10.0);
+        match (self.last, self.since, self.until) {
+            (Some(Window::Span(d)), ..) => crate::time::fmt_duration_compact(d),
+            (Some(Window::Points(n)), ..) => format!("{n} pts"),
+            (None, Some(a), Some(b)) => format!("{} → {}", t(a), t(b)),
+            (None, Some(a), None) => format!("since {}", t(a)),
+            (None, None, Some(b)) => format!("until {}", t(b)),
+            (None, None, None) => "all".into(),
+        }
+    }
+}
+
+/// Timeframe presets that make sense for a dataset (shorter than its span), smallest first.
+pub fn timeframe_presets(ds: &Dataset) -> Vec<Window> {
+    let Some((a, b)) = ds.x_range() else {
+        return Vec::new();
+    };
+    match ds.x_kind {
+        XKind::Time => [
+            3600.0,
+            6.0 * 3600.0,
+            86400.0,
+            7.0 * 86400.0,
+            30.0 * 86400.0,
+            90.0 * 86400.0,
+            365.0 * 86400.0,
+        ]
+        .into_iter()
+        .filter(|d| *d < b - a)
+        .map(Window::Span)
+        .collect(),
+        _ => {
+            let n = ds.series.iter().map(|s| s.points.len()).max().unwrap_or(0);
+            [50, 100, 500, 1000, 5000, 10_000]
+                .into_iter()
+                .filter(|p| *p < n)
+                .map(Window::Points)
+                .collect()
+        }
+    }
+}
+
 /// Evaluate a derived series at every x where its inputs line up.
 fn derive(ds: &Dataset, d: &Derived, script: &ScriptHost) -> Series {
     let mut rows: BTreeMap<u64, (f64, Vec<(String, f64)>)> = BTreeMap::new();
@@ -275,6 +377,65 @@ mod tests {
             unit: Unit::default(),
             points: pts.to_vec(),
         }
+    }
+
+    #[test]
+    fn timeframes() {
+        let s = |name: &str, xs: &[f64]| Series {
+            name: name.into(),
+            unit: Unit::default(),
+            points: xs.iter().map(|&x| (x, x)).collect(),
+        };
+        let ds = Dataset {
+            x_kind: XKind::Time,
+            series: vec![s("a", &[0.0, 10.0, 20.0, 30.0]), s("b", &[5.0, 25.0])],
+        };
+        let xs = |d: &Dataset| {
+            d.series
+                .iter()
+                .map(|s| s.points.iter().map(|p| p.0).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+        let mut d = ds.clone();
+        Timeframe::last(Window::Span(10.0)).apply(&mut d);
+        assert_eq!(
+            xs(&d),
+            [vec![20.0, 30.0], vec![25.0]],
+            "relative to the newest point overall"
+        );
+        let mut d = ds.clone();
+        Timeframe {
+            since: Some(5.0),
+            until: Some(25.0),
+            last: None,
+        }
+        .apply(&mut d);
+        assert_eq!(xs(&d), [vec![10.0, 20.0], vec![5.0, 25.0]]);
+        let mut d = ds.clone();
+        Timeframe {
+            last: Some(Window::Points(1)),
+            until: Some(20.0),
+            since: None,
+        }
+        .apply(&mut d);
+        assert_eq!(xs(&d), [vec![20.0], vec![5.0]]);
+        assert_eq!(
+            timeframe_presets(&ds),
+            Vec::<Window>::new(),
+            "30 s of data: no presets"
+        );
+        let long = Dataset {
+            x_kind: XKind::Time,
+            series: vec![s("a", &[0.0, 2.0 * 86400.0])],
+        };
+        assert_eq!(
+            timeframe_presets(&long),
+            [
+                Window::Span(3600.0),
+                Window::Span(21600.0),
+                Window::Span(86400.0)
+            ]
+        );
     }
 
     #[test]

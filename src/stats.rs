@@ -416,8 +416,8 @@ impl SeriesReport {
             return String::new();
         };
         match self.x_kind {
-            XKind::Time => format!("~{}", fmt_duration(dx)),
-            XKind::Index => format!("~{} samples", dx.ceil()),
+            XKind::Time => fmt_duration(dx),
+            XKind::Index => format!("{} samples", dx.ceil()),
             XKind::Number => format!("Δx {}", fmt_compact(dx)),
         }
     }
@@ -430,10 +430,17 @@ impl SeriesReport {
         }
     }
 
-    /// Short forecast cell for tables: `50 GB in ~4.4 days`.
+    /// Short forecast cell for tables: `50 GB in 4.4 days`, flagged when the fit is weak.
     pub fn forecast_cell(&self) -> String {
         match (self.target, self.eta) {
-            (Some(t), Some(_)) => format!("{} in {}", self.f(t), self.eta_text()),
+            (Some(t), Some(_)) => {
+                let weak = if self.fit.is_some_and(|f| f.r2 < 0.3) {
+                    " (weak fit)"
+                } else {
+                    ""
+                };
+                format!("{} in {}{weak}", self.f(t), self.eta_text())
+            }
             (Some(t), None) if self.fit.is_some() => format!("{}: not on course", self.f(t)),
             _ => String::new(),
         }
@@ -486,7 +493,7 @@ impl SeriesReport {
                 Some(_) => {
                     let _ = write!(
                         out,
-                        "; reaches {} in {} (around {})",
+                        "; reaches {} in about {} (around {})",
                         self.f(t),
                         self.eta_text(),
                         self.eta_at_text()
@@ -763,7 +770,7 @@ mod tests {
             text.starts_with("node2: falling by an average of 6 GB/day"),
             "{text}"
         );
-        assert!(text.contains("reaches 0 B in ~62.7 days"), "{text}");
+        assert!(text.contains("reaches 0 B in about 62.7 days"), "{text}");
     }
 
     #[test]
@@ -774,7 +781,7 @@ mod tests {
             .report(&ds, &ds.series[0])
             .unwrap();
         assert!(
-            r.sentence().contains("reaches 200 GB in ~29.3 days"),
+            r.sentence().contains("reaches 200 GB in about 29.3 days"),
             "{}",
             r.sentence()
         );

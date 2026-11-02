@@ -14,9 +14,12 @@ use crate::script::ScriptHost;
 use crate::session::Session;
 use crate::source::SourceSpec;
 use crate::stats::{Analysis, ReportOpts, Targets};
+use crate::time::TimeParser;
+use crate::transform::Timeframe;
 use crate::units::parse_value;
 
 pub struct Setup {
+    pub timeframe: Timeframe,
     pub cli: Cli,
     pub session: Session,
     pub opts: ChartOpts,
@@ -43,7 +46,9 @@ pub fn build(cli: Cli, spec: SourceSpec, color: bool) -> Result<Setup> {
         // Validate the template up front with a dummy report.
         validate_stats_template(t)?;
     }
+    let timeframe = timeframe(&cli)?;
     Ok(Setup {
+        timeframe,
         cli,
         session,
         opts,
@@ -109,6 +114,20 @@ fn parse_color(s: &str) -> Result<Color> {
     })
 }
 
+pub fn timeframe(cli: &Cli) -> Result<Timeframe> {
+    let tp = crate::time::TimeParser::new(cli.time_format.clone());
+    let at = |s: &Option<String>, what: &str| -> Result<Option<f64>> {
+        s.as_deref()
+            .map(|v| tp.parse(v).or_else(|| TimeParser::default().parse(v)).with_context(|| format!("{what}: can't read '{v}' as a time (try 2026-10-15 or \"2026-10-15 08:00\")")))
+            .transpose()
+    };
+    Ok(Timeframe {
+        last: cli.last,
+        since: at(&cli.since, "--since")?,
+        until: at(&cli.until, "--until")?,
+    })
+}
+
 pub fn analysis(cli: &Cli) -> Result<Analysis> {
     Ok(Analysis {
         model: cli.fit,
@@ -171,6 +190,8 @@ pub fn chart_opts(cli: &Cli, spec: &SourceSpec, analysis: Analysis) -> Result<Ch
         bins: cli.bins.max(1),
         split: cli.split,
         x_format: cli.x_format.clone(),
+        show_trend: cli.trend,
+        show_targets: !cli.no_targets,
         analysis,
         forecast: cli
             .forecast

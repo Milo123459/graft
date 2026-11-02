@@ -18,32 +18,32 @@ fitted to (`--fit-window`), forecast targets (`--target`) and the output format
 $ graft reclaimable.log --once --stats --split --forecast --target node1=50GB,node2=200GB
 ┌ reclaimable.log · node1 [forecast] ────────────────────────────────────────┐
 │60.4 GB   │⠒⠒⠲⣀                                         ┌──────────────────┐│
-│          │    ⠉⠉⠑⢆⣀⣀⡠⠤⠤⠤⠋                              │node1 target 50 GB││
-│          │              •••••••                        │node1 58.8 GB     ││
-│          │                     ••••••••••••            └──────────────────┘│
-│          │                                 •••••••••••••                   │
-│          │•••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••│
-│48.7 GB   │                                                          •••••••│
+│          │    ⠉⠉⠑⢆⣀⣀⡠⠤⠤⠤⠋⣀                             │node1 target 50 GB││
+│          │                ⠉⠁  ⠒⠤⠤⠄                     │node1 58.8 GB     ││
+│          │                          ⠉⠉⠉⠂  ⠤⠤⠤⡀         └──────────────────┘│
+│          │                                      ⠉⠉⠒⠂  ⠤⠤⣀⡀                 │
+│          │                                                 ⠈⠑⠒⠒  ⠠⢄⣀⡀      │
+│48.7 GB   │⠉⠉⠁ ⠉⠉⠁ ⠉⠉⠁⠈⠉⠉ ⠈⠉⠉ ⠈⠉⠉ ⠈⠉⠉ ⠈⠉⠉ ⠈⠉⠁ ⠉⠉⠁ ⠉⠉⠁ ⠉⠉⠁ ⠉⠉⠁ ⠉⠉⠁⠈⠉⠉ ⠈⠉⠉⠐⠒⠒⠢│
 │          └─────────────────────────────────────────────────────────────────│
 │11-01 04:00                   11-02 22:09     11-04 16:19        11-06 10:28│
 └────────────────────────────────────────────────────────────────────────────┘
 ┌ reclaimable.log · node2 [forecast] ────────────────────────────────────────┐
-│433.9 GB  │⠒⠒⠢⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤                             ┌───────────────────┐│
-│          │              ••••••••••••••••••••••••••••••│node2 target 200 GB││
-│          │                                            │node2 415.7 GB     ││
-│          │                                            └───────────────────┘│
-│          │                                                                 │
-│          │                                                                 │
-│188.9 GB  │•••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••│
+│424.9 GB  │⠒⠤⢄⣀⡀                                            ┌──────────────┐│
+│          │    ⠈⠑⠒⠢⠤⣀⣀⠤⠤⠤⠒⡀                                 │node2 415.7 GB││
+│          │               ⠈⠉⠁  ⠒⠤⠤⠄                         └──────────────┘│
+│          │                          ⠉⠉⠉⠂  ⠤⠤⠤⡀                             │
+│          │                                      ⠉⠉⠒⠂  ⠤⠤⣀⡀                 │
+│          │                                                 ⠈⠑⠒⠒  ⠠⢄⣀⡀      │
+│378.9 GB  │                                                          ⠈  ⠐⠒⠒⠢│
 │          └─────────────────────────────────────────────────────────────────│
 │11-01 04:00                   11-02 22:09     11-04 16:19        11-06 10:28│
 └────────────────────────────────────────────────────────────────────────────┘
 series   n      last       min      mean       max         σ  trend/day    R²  forecast
-node1   29   58.8 GB   57.5 GB   58.5 GB   59.9 GB  882.6 MB   -1.97 GB  0.61  50 GB in ~3.7 days
-node2   29  415.7 GB  412.2 GB  417.1 GB  422.8 GB   3.14 GB   -7.69 GB  0.73  200 GB in ~27.6 days
+node1   29   58.8 GB   57.5 GB   58.5 GB   59.9 GB  882.6 MB   -1.97 GB  0.61  50 GB in 3.7 days
+node2   29  415.7 GB  412.2 GB  417.1 GB  422.8 GB   3.14 GB   -7.69 GB  0.73  200 GB in 27.6 days
 
-• node1: falling by an average of 1.97 GB/day (R² 0.61); reaches 50 GB in ~3.7 days (around 2026-11-06 01:32)
-• node2: falling by an average of 7.69 GB/day (R² 0.73); reaches 200 GB in ~27.6 days (around 2026-11-29 23:09)
+• node1: falling by an average of 1.97 GB/day (R² 0.61); reaches 50 GB in about 3.7 days (around 2026-11-06 01:32)
+• node2: falling by an average of 7.69 GB/day (R² 0.73); reaches 200 GB in about 27.6 days (around 2026-11-29 23:09)
 ```
 
 ## Install
@@ -73,7 +73,8 @@ graft -p meminfo                       # run a profile (see --list-profiles)
 | File / stdin | `graft FILE`, `graft -`, or pipe into `graft` |
 | Follow a file | `-f, --follow` (handles truncation/rotation) |
 | Run a command repeatedly | `-c, --cmd 'COMMAND'`, `-n, --every 2s`, `--count N` |
-| Keep only recent data | `-w, --window 6h` or `--window 500` (points) |
+| Keep only recent data | `-w, --window 6h` or `--window 500` (points); older data is dropped from memory |
+| Timeframe | `-L, --last 7d` (or `--last 500` points), `--since 2026-10-15`, `--until "2026-10-20 12:00"`: what's shown **and** analysed. The viewer can change it |
 
 ### Parsing
 
@@ -168,8 +169,8 @@ was skipped.
 
 ```
 $ graft reclaimable.log --no-chart --stats --target node1=50GB,node2=200GB
-• node1: falling by an average of 1.97 GB/day (R² 0.61); reaches 50 GB in ~3.7 days (around 2026-11-06 01:32)
-• node2: falling by an average of 7.69 GB/day (R² 0.73); reaches 200 GB in ~27.6 days (around 2026-11-29 23:09)
+• node1: falling by an average of 1.97 GB/day (R² 0.61); reaches 50 GB in about 3.7 days (around 2026-11-06 01:32)
+• node2: falling by an average of 7.69 GB/day (R² 0.73); reaches 200 GB in about 27.6 days (around 2026-11-29 23:09)
 ```
 
 Every part of this is configurable:
@@ -180,7 +181,10 @@ Every part of this is configurable:
 | `--fit linear\|exp` | constant change per unit of time, or constant percentage change (growth/decay) |
 | `--fit-window 12h` / `--fit-window 50` | fit only recent data (a duration or a number of points) |
 | `--per 1h` | the unit trends are expressed in (default: chosen from the data's span) |
-| `--forecast` / `--forecast=7d` | draw the projected trend on the chart, plus target lines |
+| `--forecast` / `--forecast=7d` | draw the projected trend (dashed) past the data |
+| `--trend` | also draw the fitted trend line over the data |
+| `--no-targets` | don't draw target lines (they still drive forecasts and stats) |
+| `--last 7d` / `--since …` | fit and forecast from that timeframe only, e.g. just the last week |
 | `--stats-template '{name}: {trend} → {target} in {eta}'` | your own output line per series |
 | `--stats-format json` | machine-readable output |
 
@@ -225,7 +229,15 @@ including over SSH from a phone.
 | drag the cursor line | scrub through the data, and past it into the forecast |
 | drag anywhere else | select a range; the stats panel switches to it |
 | scroll | zoom around the pointer (shift + scroll pans) |
-| toolbar / series chips | ◀ ▶ + − reset cursor select stats forecast; `⋯` shows more: chart type, split, log, follow, pause, format, console, export, mouse, help, quit |
+| toolbar / series chips | ◀ ▶ + − reset cursor select stats forecast split **range**; `⋯` shows more: timeframe presets, trend, targets, chart type, log, follow, pause, format, console, export, mouse, help, quit |
+
+**Timeframe picker** (time series): tap **range: …** to step through
+presets that are shorter than your data (`24h`, `6h`, `1h`, … then back to
+`all`), or tap a preset under `⋯`. Keys `[` / `]` go narrower or wider. The
+stats, trend fits and forecasts all use the chosen timeframe.
+
+**Lines:** forecast (`f`), trend over the data (`T`) and target lines (`G`) can
+each be turned on or off. With all of them off you see just your data.
 
 The **follow** button (key `o`) makes the cursor follow the pointer without
 clicking, in terminals that report mouse movement. **mouse** (key `M`) turns
@@ -242,7 +254,8 @@ mouse capture off, so your terminal's own text selection works.
 | `v` … `v` | select a range from the keyboard |
 | `1`–`9` / `a` | toggle a series / show all |
 | `t` / `m` / `y` / `x` | chart type / marker / log scale / split panels |
-| `f` | forecast on/off |
+| `f` / `T` / `G` | forecast / trend line / target lines on or off |
+| `[` / `]` | narrower / wider timeframe |
 | `F` | change the format or source (builder) |
 | `s` | stats panel |
 | `space` | pause live updates |
@@ -274,7 +287,8 @@ Available functions:
 - Formatting: `fmt(name, v)`, `fmt_dur`, `fmt_time`, `bytes`.
 - Viewer actions: `hline(v[, label])`, `clear_hlines()`, `zoom("6h")`,
   `reset()`, `show(name)`, `hide(name)`, `chart("bar")`,
-  `target(name, v)`, `clear_target(name)`, `forecast("7d" | "auto" | "off")`.
+  `target(name, v)`, `clear_target(name)`, `forecast("7d" | "auto" | "off")`,
+  `range("7d" | "500" | "all")`.
 - Output: `print(...)`.
 
 Unit literals such as `50GB`, `200ms` and `1d` work in all expressions.

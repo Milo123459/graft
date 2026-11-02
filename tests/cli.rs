@@ -162,11 +162,11 @@ fn format_template_targets_and_custom_stats_output() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let out = stdout(&o);
     assert!(
-        out.starts_with("node1: -1.97 GB/day → 50 GB in ~3.7 days (2026-11-0"),
+        out.starts_with("node1: -1.97 GB/day → 50 GB in 3.7 days (2026-11-0"),
         "{out}"
     );
     assert!(
-        out.contains("node2: -7.69 GB/day → 200 GB in ~27.6 days"),
+        out.contains("node2: -7.69 GB/day → 200 GB in 27.6 days"),
         "{out}"
     );
 }
@@ -215,4 +215,30 @@ fn forecast_is_drawn_in_once_mode() {
 fn bad_template_is_reported() {
     let o = graft(&[LOG, "--once", "-F", "{time} {oops"]);
     assert!(String::from_utf8_lossy(&o.stderr).contains("unclosed '{'"));
+}
+
+#[test]
+fn timeframe_flags() {
+    let o = graft(&[
+        LOG,
+        "--no-chart",
+        "--stats-template",
+        "{name} {n}",
+        "--last",
+        "6h",
+    ]);
+    assert_eq!(stdout(&o), "node1 7\nnode2 7\n");
+    let o = graft(&[
+        LOG,
+        "--no-chart",
+        "--stats-template",
+        "{name} {n}",
+        "--since",
+        "2026-11-02",
+        "--until",
+        "2026-11-02 03:00",
+    ]);
+    assert_eq!(stdout(&o), "node1 4\nnode2 4\n");
+    let o = graft(&[LOG, "--no-chart", "--since", "yesterday"]);
+    assert!(String::from_utf8_lossy(&o.stderr).contains("--since: can't read 'yesterday'"));
 }

@@ -82,6 +82,10 @@ pub struct ChartOpts {
     pub analysis: Analysis,
     /// Project trends this far into the future.
     pub forecast: Option<Horizon>,
+    /// Draw the fitted trend over the data.
+    pub show_trend: bool,
+    /// Draw explicit target lines.
+    pub show_targets: bool,
 }
 
 impl Default for ChartOpts {
@@ -101,6 +105,8 @@ impl Default for ChartOpts {
             x_format: None,
             analysis: Analysis::default(),
             forecast: None,
+            show_trend: false,
+            show_targets: true,
         }
     }
 }
@@ -297,23 +303,54 @@ pub fn projection_points(fit: &Fit, from: f64, to: f64) -> Vec<(f64, f64)> {
         .collect()
 }
 
+/// Split a curve over `[from, to]` into dashes (every other piece of `pieces`).
+pub fn dashed(f: impl Fn(f64) -> f64, from: f64, to: f64, pieces: usize) -> Vec<Vec<(f64, f64)>> {
+    let pieces = pieces.max(2);
+    let step = (to - from) / pieces as f64;
+    (0..pieces)
+        .step_by(2)
+        .map(|k| {
+            let a = from + step * k as f64;
+            (0..=3)
+                .map(|j| a + step * j as f64 / 3.0)
+                .map(|x| (x, f(x)))
+                .collect()
+        })
+        .collect()
+}
+
+/// A cursor position rounded to what's meaningful for the data's span.
+pub fn round_x(ds: &Dataset, x: f64) -> f64 {
+    match (ds.x_kind, ds.x_range()) {
+        (XKind::Time, Some((a, b))) if b - a > 7200.0 => (x / 60.0).round() * 60.0,
+        (XKind::Time, _) => x.round(),
+        _ => x,
+    }
+}
+
 /// Padded y bounds for a set of values, honouring explicit overrides.
 pub fn y_bounds(
     values: impl Iterator<Item = f64>,
     ymin: Option<f64>,
     ymax: Option<f64>,
 ) -> (f64, f64) {
-    let (mut lo, mut hi) = min_max(values).unwrap_or((0.0, 1.0));
-    if hi - lo < f64::EPSILON * hi.abs().max(1.0) {
-        let pad = if lo == 0.0 { 1.0 } else { lo.abs() * 0.05 };
-        lo -= pad;
-        hi += pad;
+    let (data_lo, data_hi) = min_max(values).unwrap_or((0.0, 1.0));
+    let pad = if data_hi - data_lo < f64::EPSILON * data_hi.abs().max(1.0) {
+        if data_lo == 0.0 {
+            1.0
+        } else {
+            data_lo.abs() * 0.05
+        }
     } else {
-        let pad = (hi - lo) * 0.05;
-        lo -= pad;
-        hi += pad;
-    }
-    (ymin.unwrap_or(lo), ymax.unwrap_or(hi))
+        (data_hi - data_lo) * 0.05
+    };
+    // Don't pad non-negative data (sizes, counts, …) into negative territory.
+    let lo = if data_lo >= 0.0 {
+        (data_lo - pad).max(0.0)
+    } else {
+        data_lo - pad
+    };
+    (ymin.unwrap_or(lo), ymax.unwrap_or(data_hi + pad))
 }
 
 /// In split panels, only let a reference line stretch the y axis when it's near the
@@ -371,6 +408,8 @@ fn graph_area(inner: Rect, y_labels: &[Line], first_x_label: Option<&Line>) -> R
     }
 }
 
+/// A polyline in chart coordinates.
+type Line2 = Vec<(f64, f64)>;
 /// A series' prepared line: palette index, series, points (y possibly log-scaled).
 type Prepared<'a> = (usize, &'a Series, Vec<(f64, f64)>);
 /// Reference / cursor / selection / forecast lines: points, style, marker, legend label.
@@ -503,20 +542,34 @@ impl<'a> ChartWidget<'a> {
         }
 
         // Forecast projections and explicit targets, per series.
-        let mut projections: Vec<(usize, Vec<(f64, f64)>)> = Vec::new();
+        // Dashes ≈ every 3 columns of the projected stretch.
+        let cols = f64::from(area.width.saturating_sub(12).max(10));
+        let mut projections: Vec<(usize, Vec<Line2>)> = Vec::new();
         let mut targets: Vec<(usize, &str, f64)> = Vec::new();
         for &(i, s, _) in &lines {
-            if let Some((fit, _)) = self.opts.projection(s) {
-                // The fitted trend over the data it was fitted to, continued to the
-                // right edge so every series covers the same horizon.
-                let (from, to) = (fit.x_first.max(x0), x1);
+            // The trend over the data (optional), then the forecast to the right edge.
+            if self.opts.show_trend
+                && let Some(fit) = self.opts.analysis.fit(s)
+            {
+                let (from, to) = (fit.x_first.max(x0), fit.x_last.min(x1));
                 if to > from {
-                    let mut pts = projection_points(&fit, from, to);
-                    to_log(&mut pts);
-                    projections.push((i, pts));
+                    let pieces = (cols * (to - from) / (x1 - x0) / 3.0) as usize;
+                    let mut dashes = dashed(|x| fit.at(x), from, to, pieces);
+                    dashes.iter_mut().for_each(&to_log);
+                    projections.push((i, dashes));
+                }
+            }
+            if let Some((fit, _)) = self.opts.projection(s) {
+                let (from, to) = (fit.x_last.max(x0), x1);
+                if to > from {
+                    let pieces = (cols * (to - from) / (x1 - x0) / 3.0) as usize;
+                    let mut dashes = dashed(|x| fit.at(x), from, to, pieces);
+                    dashes.iter_mut().for_each(&to_log);
+                    projections.push((i, dashes));
                 }
             }
             if let Some(t) = self.opts.analysis.targets.explicit(&s.name)
+                && self.opts.show_targets
                 && (!log || t > 0.0)
             {
                 targets.push((i, &s.name, ty(t)));
@@ -526,9 +579,16 @@ impl<'a> ChartWidget<'a> {
         let in_range: Vec<f64> = lines
             .iter()
             .flat_map(|l| l.2.iter().filter(|p| p.0 >= x0 && p.0 <= x1).map(|p| p.1))
-            .chain(projections.iter().flat_map(|p| p.1.iter().map(|p| p.1)))
+            .chain(
+                projections
+                    .iter()
+                    .flat_map(|p| p.1.iter().flatten().map(|p| p.1)),
+            )
             .collect();
         let data = min_max(in_range.iter().copied());
+        // A distant target (not reached within the view) would only squash the data;
+        // it's still reported in the stats.
+        targets.retain(|t| data.is_none_or(|(lo, hi)| hline_near(t.2, lo, hi)));
         let hl = self
             .opts
             .hlines
@@ -586,12 +646,19 @@ impl<'a> ChartWidget<'a> {
                         t
                     }))
             );
-            overlays.push((
-                vec![(x0, t), (x1, t)],
-                Style::default().fg(self.opts.color(i)),
-                Marker::Dot,
-                Some(label),
-            ));
+            let style = Style::default().fg(self.opts.color(i));
+            // Short dashes; the first carries the legend label.
+            for (k, dash) in dashed(|_| t, x0, x1, (cols / 2.0) as usize)
+                .into_iter()
+                .enumerate()
+            {
+                overlays.push((
+                    dash,
+                    style,
+                    Marker::Braille,
+                    (k == 0).then(|| label.clone()),
+                ));
+            }
         }
         if let Some((a, b)) = self.overlay.selection {
             for x in [a, b] {
@@ -603,13 +670,15 @@ impl<'a> ChartWidget<'a> {
                 ));
             }
         }
-        for (i, pts) in &projections {
-            overlays.push((
-                pts.clone(),
-                Style::default().fg(self.opts.color(*i)),
-                Marker::Dot,
-                None,
-            ));
+        for (i, dashes) in &projections {
+            for dash in dashes {
+                overlays.push((
+                    dash.clone(),
+                    Style::default().fg(self.opts.color(*i)),
+                    Marker::Braille,
+                    None,
+                ));
+            }
         }
         if let Some(c) = self.overlay.cursor {
             overlays.push((
@@ -708,7 +777,7 @@ impl<'a> ChartWidget<'a> {
         series: &[(usize, &Series)],
     ) {
         let mut lines = vec![Line::styled(
-            self.ds.fmt_x_full(x),
+            self.ds.fmt_x_full(round_x(self.ds, x)),
             Style::default().add_modifier(Modifier::BOLD),
         )];
         for &(i, s) in series {

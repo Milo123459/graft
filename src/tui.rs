@@ -17,7 +17,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, Widget, Wrap};
 
-use crate::cli::{ChartKind, Cli};
+use crate::cli::{ChartKind, Cli, Window, parse_window};
 use crate::data::Dataset;
 use crate::interactive::{Live, Transition};
 use crate::render::{
@@ -27,6 +27,7 @@ use crate::script::{Action, display};
 use crate::session::Session;
 use crate::setup::Setup;
 use crate::stats::SeriesReport;
+use crate::transform::{Timeframe, timeframe_presets};
 use crate::ui::{Button, Hits, TextInput, flow_height, render_buttons};
 
 const HELP: &[(&str, &str)] = &[
@@ -65,6 +66,8 @@ const HELP: &[(&str, &str)] = &[
     ("e", "export the view to an SVG file"),
     ("M", "toggle mouse capture (off = terminal text selection)"),
     (":", "Rhai console, e.g. :slope(\"node1\", \"1d\")"),
+    ("[ / ]", "narrower / wider timeframe (or tap range: …)"),
+    ("T / G", "trend line over the data / target lines on or off"),
     ("q / Esc", "quit (Esc first clears a selection)"),
 ];
 
@@ -92,12 +95,18 @@ enum Cmd {
     More,
     Marker,
     Mouse,
+    Trend,
+    Targets,
+    /// Step through timeframe presets (-1 narrower, +1 wider).
+    RangeStep(i8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Hit {
     Cmd(Cmd),
     Series(usize),
+    /// A timeframe preset (`None` = all data).
+    Range(Option<Window>),
 }
 
 /// What a mouse press on the chart turned into.
@@ -153,6 +162,10 @@ pub struct App {
     horizon: Horizon,
     hits: Hits<Hit>,
     plots: RefCell<Vec<PlotArea>>,
+    /// The part of the data shown and analysed.
+    timeframe: Timeframe,
+    /// Timeframes shorter than the data, for the picker.
+    presets: Vec<Window>,
 }
 
 impl App {
@@ -161,6 +174,7 @@ impl App {
             cli,
             mut session,
             opts,
+            timeframe,
             ..
         } = setup;
         // Re-parse history kept from a previous configuration.
@@ -205,6 +219,8 @@ impl App {
             horizon,
             hits: Hits::default(),
             plots: RefCell::new(Vec::new()),
+            timeframe,
+            presets: Vec::new(),
         };
         app.rebuild(true);
         app
@@ -220,6 +236,15 @@ impl App {
         c.stats = self.show_stats;
         c.no_mouse = !self.mouse;
         c.target = self.opts.analysis.targets.to_specs();
+        c.trend = self.opts.show_trend;
+        c.no_targets = !self.opts.show_targets;
+        c.last = self.timeframe.last;
+        if self.timeframe.since.is_none() {
+            c.since = None;
+        }
+        if self.timeframe.until.is_none() {
+            c.until = None;
+        }
         c.forecast = self.opts.forecast.map(|h| match h {
             Horizon::Auto => "auto".into(),
             Horizon::Span(s) => crate::time::fmt_duration_compact(s),
@@ -269,6 +294,8 @@ impl App {
         }
         let old_max = self.ds.x_range().map(|r| r.1);
         self.full = self.session.full_dataset();
+        self.presets = timeframe_presets(&self.full);
+        self.timeframe.apply(&mut self.full);
         self.ds = self.session.select(&self.full);
         self.built_rev = rev;
         self.last_build = Instant::now();
@@ -397,6 +424,37 @@ impl App {
         }
     }
 
+    fn set_timeframe(&mut self, tf: Timeframe) {
+        self.timeframe = tf;
+        self.view = None;
+        self.selection = None;
+        self.anchor = None;
+        self.rebuild(true);
+        let label = self.timeframe.label(&self.ds);
+        self.say(
+            format!("timeframe: {label} — stats, trends and forecasts use this range"),
+            false,
+        );
+    }
+
+    /// Move through [presets…, all] (wrapping).
+    fn step_timeframe(&mut self, dir: i8) {
+        let mut options: Vec<Option<Window>> = self.presets.iter().copied().map(Some).collect();
+        options.push(None);
+        let current = if self.timeframe.since.is_some() || self.timeframe.until.is_some() {
+            None
+        } else {
+            self.timeframe.last
+        };
+        let i = options
+            .iter()
+            .position(|o| *o == current)
+            .unwrap_or(options.len() - 1) as isize;
+        let n = options.len() as isize;
+        let next = options[((i + dir as isize) % n + n) as usize % options.len()];
+        self.set_timeframe(next.map_or_else(Timeframe::default, Timeframe::last));
+    }
+
     fn toggle_forecast(&mut self) {
         self.opts.forecast = match self.opts.forecast {
             Some(h) => {
@@ -481,6 +539,9 @@ impl App {
             Cmd::Help => self.help = !self.help,
             Cmd::Quit => return Transition::Quit,
             Cmd::More => self.toolbar_more = !self.toolbar_more,
+            Cmd::Trend => self.opts.show_trend = !self.opts.show_trend,
+            Cmd::Targets => self.opts.show_targets = !self.opts.show_targets,
+            Cmd::RangeStep(dir) => self.step_timeframe(dir),
             Cmd::Mouse => {
                 self.mouse = !self.mouse;
                 self.say(
@@ -553,6 +614,10 @@ impl App {
             Action::Forecast(h) => match h.map(|h| Horizon::parse(&h)).transpose() {
                 Ok(h) => self.opts.forecast = h,
                 Err(e) => self.say(format!("forecast: {e}"), true),
+            },
+            Action::Range(r) => match r.map(|r| parse_window(&r)).transpose() {
+                Ok(w) => self.set_timeframe(w.map_or_else(Timeframe::default, Timeframe::last)),
+                Err(e) => self.say(format!("range: {e}"), true),
             },
         }
     }
@@ -670,6 +735,10 @@ impl App {
             KeyCode::Char('f') => Cmd::Forecast,
             KeyCode::Char('F') => Cmd::Format,
             KeyCode::Char('M') => Cmd::Mouse,
+            KeyCode::Char('T') => Cmd::Trend,
+            KeyCode::Char('G') => Cmd::Targets,
+            KeyCode::Char('[') => Cmd::RangeStep(-1),
+            KeyCode::Char(']') => Cmd::RangeStep(1),
             KeyCode::Char(' ' | 'p') => Cmd::Pause,
             KeyCode::Char('e') => Cmd::Export,
             _ => return Transition::None,
@@ -703,6 +772,10 @@ impl App {
                 if let Some((_, hit)) = self.hits.at(col, row) {
                     return match hit {
                         Hit::Cmd(cmd) => self.run_cmd(cmd),
+                        Hit::Range(w) => {
+                            self.set_timeframe(w.map_or_else(Timeframe::default, Timeframe::last));
+                            Transition::None
+                        }
                         Hit::Series(i) => {
                             self.toggle_series(i);
                             Transition::None
@@ -786,12 +859,32 @@ impl App {
             b("select", Cmd::Select).active(self.anchor.is_some() || self.selection.is_some()),
             b("stats", Cmd::Stats).active(self.show_stats),
             b("forecast", Cmd::Forecast).active(self.opts.forecast.is_some()),
-            b(if self.toolbar_more { "less" } else { "⋯" }, Cmd::More).active(self.toolbar_more),
+            b("split", Cmd::Split).active(self.opts.split),
         ];
+        // The timeframe picker (tap to step to a narrower range, wrapping to all).
+        if !self.presets.is_empty() || !self.timeframe.is_all() {
+            let label = format!("range: {}", self.timeframe.label(&self.ds));
+            v.push(b(&label, Cmd::RangeStep(-1)).active(!self.timeframe.is_all()));
+        }
+        v.push(
+            b(if self.toolbar_more { "less" } else { "⋯" }, Cmd::More).active(self.toolbar_more),
+        );
         if self.toolbar_more {
+            let current = (self.timeframe.since.is_none() && self.timeframe.until.is_none())
+                .then_some(self.timeframe.last)
+                .flatten();
+            v.push(Button::new("all", Hit::Range(None)).active(self.timeframe.is_all()));
+            for w in &self.presets {
+                let label = match w {
+                    Window::Span(d) => crate::time::fmt_duration_compact(*d),
+                    Window::Points(n) => format!("{n} pts"),
+                };
+                v.push(Button::new(label, Hit::Range(Some(*w))).active(current == Some(*w)));
+            }
             v.extend([
+                b("trend", Cmd::Trend).active(self.opts.show_trend),
+                b("targets", Cmd::Targets).active(self.opts.show_targets),
                 b(self.opts.kind.name(), Cmd::Kind),
-                b("split", Cmd::Split).active(self.opts.split),
                 b("log", Cmd::Log).active(self.opts.log),
                 b("follow", Cmd::Follow).active(self.follow_pointer),
                 b(if self.paused { "resume" } else { "pause" }, Cmd::Pause).active(self.paused),
@@ -902,13 +995,24 @@ impl App {
                 y: area.y + r.y,
                 ..r
             };
+            // No backgrounds: a coloured marker and the name, dimmed when hidden.
             let color = self.opts.color(i);
-            let style = if chip.active {
-                Style::default().fg(Color::Black).bg(color)
+            let (mark, name) = chip.label.split_once(' ').unwrap_or(("●", &chip.label));
+            let line = if chip.active {
+                Line::from(vec![
+                    Span::styled(format!(" {mark} "), Style::default().fg(color)),
+                    Span::styled(
+                        format!("{name} "),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                ])
             } else {
-                Style::default().fg(color).bg(Color::Rgb(30, 30, 30))
+                Line::from(Span::styled(
+                    format!(" {mark} {name} "),
+                    Style::default().fg(Color::DarkGray),
+                ))
             };
-            f.render_widget(Span::styled(format!(" {} ", chip.label), style), rect);
+            f.render_widget(line, rect);
             self.hits.push(rect, chip.action);
         }
     }
@@ -939,7 +1043,7 @@ impl App {
             .filter(|m| m.at.elapsed() < Duration::from_secs(8) || m.error);
         if let Some(c) = self.cursor {
             spans.push(Span::styled(
-                self.ds.fmt_x_full(c),
+                self.ds.fmt_x_full(crate::render::round_x(&self.ds, c)),
                 Style::default().add_modifier(Modifier::BOLD),
             ));
             for (i, s) in self
@@ -1345,7 +1449,7 @@ mod tests {
         key(&mut app, KeyCode::Char('s'));
         let s = screen(&app);
         assert!(
-            s.contains("50 GB in ~3.7 days") && s.contains("200 GB in ~27.6 days"),
+            s.contains("50 GB in 3.7 days") && s.contains("200 GB in 27.6 days"),
             "{s}"
         );
         // Past the data, the cursor shows projected values.
@@ -1366,6 +1470,48 @@ mod tests {
             "{:?}",
             app.current_cli().target
         );
+    }
+
+    #[test]
+    fn timeframe_picker_and_line_toggles() {
+        let mut app = app(&["graft", LOG, "--forecast", "--target", "node1=50GB"]);
+        // 28 h of data → presets 1h, 6h, 24h.
+        assert_eq!(
+            app.presets,
+            [
+                Window::Span(3600.0),
+                Window::Span(21600.0),
+                Window::Span(86400.0)
+            ]
+        );
+        // Tap "range: all" → steps to the widest preset.
+        let (x, y) = find(&app, "range: all");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert_eq!(app.timeframe.last, Some(Window::Span(86400.0)));
+        assert!(app.ds.series[0].points.len() < 29);
+        key(&mut app, KeyCode::Char('['));
+        assert_eq!(app.timeframe.last, Some(Window::Span(21600.0)));
+        assert_eq!(app.ds.series[0].points.len(), 7, "02:00..08:00");
+        key(&mut app, KeyCode::Char(']'));
+        key(&mut app, KeyCode::Char(']'));
+        assert!(app.timeframe.is_all());
+        // Preset buttons under ⋯, and the console.
+        let (x, y) = find(&app, " ⋯ ");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        let (x, y) = find(&app, " 6h ");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert_eq!(app.timeframe.last, Some(Window::Span(21600.0)));
+        assert_eq!(app.current_cli().last, Some(Window::Span(21600.0)));
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, "range(\"all\")");
+        key(&mut app, KeyCode::Enter);
+        assert!(app.timeframe.is_all());
+        // Line toggles.
+        assert!(screen(&app).contains("node1 target 50 GB"));
+        key(&mut app, KeyCode::Char('G'));
+        assert!(!screen(&app).contains("node1 target"));
+        key(&mut app, KeyCode::Char('T'));
+        assert!(app.opts.show_trend && app.current_cli().trend);
     }
 
     #[test]
