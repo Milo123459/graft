@@ -1512,10 +1512,10 @@ impl<'a> ChartWidget<'a> {
 
     /// Latest value of each series as a horizontal bar, with the value after it.
     fn render_bar(self, area: Rect, buf: &mut Buffer) {
-        let latest: Vec<(usize, &Series, f64)> = self
-            .visible()
-            .into_iter()
-            .filter_map(|(i, s)| s.in_view(self.overlay.view).last().map(|p| (i, s, p.1)))
+        let tiles = self.tiles();
+        let latest: Vec<(Color, String, &Series, f64)> = tiles
+            .iter()
+            .filter_map(|t| Some((t.color, t.name(), t.series, self.summarise(t)?.value)))
             .collect();
         if latest.is_empty() {
             return self.render_empty(area, buf, "waiting for data…");
@@ -1525,29 +1525,29 @@ impl<'a> ChartWidget<'a> {
         block.render(area, buf);
         let max = latest
             .iter()
-            .map(|l| l.2.abs())
+            .map(|l| l.3.abs())
             .fold(0.0, f64::max)
             .max(f64::MIN_POSITIVE);
         let name_w = (latest
             .iter()
-            .map(|l| l.1.name.chars().count())
+            .map(|l| l.1.chars().count())
             .max()
             .unwrap_or(0) as u16)
             .min(inner.width / 3);
         let value_w = latest
             .iter()
-            .map(|l| l.1.unit.format(l.2).chars().count())
+            .map(|l| l.2.unit.format(l.3).chars().count())
             .max()
             .unwrap_or(0) as u16;
         let bar_w = inner.width.saturating_sub(name_w + value_w + 3);
         let gap = u16::from(latest.len() as u16 * 2 <= inner.height);
-        for (k, &(i, s, v)) in latest.iter().enumerate() {
+        for (k, (color, label, s, v)) in latest.iter().enumerate() {
+            let (color, v) = (*color, *v);
             let row = inner.y + k as u16 * (1 + gap);
             if row >= inner.bottom() {
                 break;
             }
-            let color = self.opts.color(i);
-            let name: String = s.name.chars().take(name_w as usize).collect();
+            let name: String = label.chars().take(name_w as usize).collect();
             buf.set_string(inner.x, row, &name, Style::default().fg(color));
             let len = v.max(0.0) / max * f64::from(bar_w);
             let bar = eighths_bar(len);
@@ -1749,6 +1749,99 @@ impl<'a> ChartWidget<'a> {
     }
 }
 
+/// One value a bar or stat tile shows: a series' live data or one of its trend lines.
+struct Tile<'s> {
+    series: &'s Series,
+    style: Option<TrendStyle>,
+    color: Color,
+}
+
+impl Tile<'_> {
+    fn name(&self) -> String {
+        match self.style {
+            None => self.series.name.clone(),
+            Some(t) => format!("{} {}", self.series.name, t.label()),
+        }
+    }
+}
+
+/// What a tile summarises: its value, the points behind it (for sparklines and the
+/// change), and the selected range when there is one.
+struct Summary {
+    value: f64,
+    points: Vec<(f64, f64)>,
+    selected: Option<(f64, f64)>,
+}
+
+impl ChartWidget<'_> {
+    /// The live data, plus a tile per trend line (lighter when shown next to live).
+    fn tiles(&self) -> Vec<Tile<'_>> {
+        let live = self.opts.show_raw || self.opts.trends.is_empty();
+        let mut out = Vec::new();
+        for (i, s) in self.visible() {
+            let c = self.opts.color(i);
+            if live {
+                out.push(Tile {
+                    series: s,
+                    style: None,
+                    color: c,
+                });
+            }
+            for &t in &self.opts.trends {
+                out.push(Tile {
+                    series: s,
+                    style: Some(t),
+                    color: if live { light_color(c) } else { c },
+                });
+            }
+        }
+        out
+    }
+
+    /// The latest value (or trend value) in view — or, with a range selected, that
+    /// stretch: live shows the value at its end, a trend its statistic over the range.
+    fn summarise(&self, t: &Tile) -> Option<Summary> {
+        let s = t.series;
+        let selected = self.overlay.selection.filter(|(a, b)| b > a);
+        let raw = match selected {
+            Some((a, b)) => s.range(a, b),
+            None => s.in_view(self.overlay.view),
+        };
+        let &(x_last, last) = raw.last()?;
+        let Some(style) = t.style else {
+            return Some(Summary {
+                value: last,
+                points: raw.to_vec(),
+                selected,
+            });
+        };
+        let value = match (selected, style) {
+            (Some(_), TrendStyle::Fit) => self.opts.analysis.fit(s)?.at(x_last),
+            (Some(_), TrendStyle::Avg) => raw.iter().map(|p| p.1).sum::<f64>() / raw.len() as f64,
+            (Some(_), _) => {
+                let mut v: Vec<f64> = raw.iter().map(|p| p.1).collect();
+                v.sort_by(f64::total_cmp);
+                crate::stats::percentile(&v, if style == TrendStyle::P95 { 0.95 } else { 0.5 })
+            }
+            (None, _) => self.opts.trend_at(s, style, x_last)?,
+        };
+        // The trend line over the same stretch, for the sparkline and change.
+        let (x0, x1) = (raw[0].0, x_last);
+        let points = self
+            .opts
+            .trend_points(s, style, 400)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.0 >= x0 && p.0 <= x1)
+            .collect();
+        Some(Summary {
+            value,
+            points,
+            selected,
+        })
+    }
+}
+
 /// 3×5 pixel digits, drawn 3 rows tall with half blocks.
 fn glyph(c: char) -> Option<&'static [&'static str; 5]> {
     Some(match c {
@@ -1809,40 +1902,53 @@ impl ChartWidget<'_> {
     /// A tile per series: name, the latest value in big digits, its change over the
     /// view, a sparkline and (with a target) when it gets there.
     fn render_stat_tiles(self, area: Rect, buf: &mut Buffer) {
-        let visible = self.visible();
-        if visible.is_empty() {
+        let tiles = self.tiles();
+        if tiles.is_empty() {
             return self.render_empty(area, buf, "waiting for data…");
         }
-        let n = visible.len();
+        let n = tiles.len();
         let cols = ((area.width / 26).max(1) as usize).min(n);
         let rows = n.div_ceil(cols);
         let row_areas = Layout::vertical(vec![Constraint::Ratio(1, rows as u32); rows]).split(area);
-        for (k, &(i, s)) in visible.iter().enumerate() {
+        for (k, t) in tiles.iter().enumerate() {
             let (r, c) = (k / cols, k % cols);
             let in_row = if r + 1 == rows { n - r * cols } else { cols };
             let cells = Layout::horizontal(vec![Constraint::Ratio(1, in_row as u32); in_row])
                 .split(row_areas[r]);
-            self.render_stat_tile(cells[c], buf, i, s);
+            self.render_stat_tile(cells[c], buf, t);
         }
     }
 
-    fn render_stat_tile(&self, area: Rect, buf: &mut Buffer, i: usize, s: &Series) {
-        let color = self.opts.color(i);
+    fn render_stat_tile(&self, area: Rect, buf: &mut Buffer, t: &Tile) {
+        let (s, color) = (t.series, t.color);
+        let Some(sum) = self.summarise(t) else {
+            return;
+        };
+        let mut title = vec![Span::styled(
+            format!(" {} ", t.name()),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )];
+        if let Some((a, b)) = sum.selected {
+            let span = match self.ds.x_kind {
+                XKind::Time => crate::time::fmt_duration(b - a),
+                _ => format!("{} points", sum.points.len()),
+            };
+            title.push(Span::styled(
+                format!("selected {span} "),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
         let block = Block::bordered()
             .border_style(Style::default().fg(Color::DarkGray))
-            .title(Span::styled(
-                format!(" {} ", s.name),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ));
+            .title(Line::from(title));
         let inner = block.inner(area);
         block.render(area, buf);
         if inner.width < 4 || inner.height < 1 {
             return;
         }
-        let pts = s.in_view(self.overlay.view);
-        let Some(&(x_last, last)) = pts.last() else {
-            return;
-        };
+        let pts = &sum.points;
+        let last = sum.value;
+        let x_last = pts.last().map_or(0.0, |p| p.0);
         let mut y = inner.y;
         let put = |buf: &mut Buffer, y: u16, line: Line| {
             if y < inner.bottom() {
@@ -2209,8 +2315,10 @@ impl Widget for ChartWidget<'_> {
         if self.opts.side_by_side {
             return self.render_side_by_side(area, buf);
         }
-        if !matches!(self.opts.kind, ChartKind::Line | ChartKind::Scatter)
-            && !self.opts.trends.is_empty()
+        if !matches!(
+            self.opts.kind,
+            ChartKind::Line | ChartKind::Scatter | ChartKind::Bar | ChartKind::Stat
+        ) && !self.opts.trends.is_empty()
         {
             let (ds, opts) = with_trend_series(self.ds, self.opts);
             return ChartWidget::new(&ds, &opts, self.overlay).render(area, buf);

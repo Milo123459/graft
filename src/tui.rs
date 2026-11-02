@@ -2208,6 +2208,11 @@ impl App {
                 }
             }
         } else {
+            // A tap outside a measured stretch lets go of it.
+            if self.selection.is_some_and(|(a, b)| x < a || x > b) {
+                self.selection = None;
+                self.say("range cleared", false);
+            }
             self.cursor = Some(x);
         }
     }
@@ -4516,6 +4521,57 @@ mod tests {
             s.contains("node1 median") && !s.contains("node1 live"),
             "{s}"
         );
+    }
+
+    #[test]
+    fn a_selected_range_drives_the_other_panes() {
+        let mut app = app(&[
+            "graft",
+            LOG,
+            "-s",
+            "node1",
+            "--pane",
+            "* kind=stat lines=median",
+            "--pane",
+            "* lines=live",
+            "--layout",
+            "1 / 2",
+        ]);
+        screen(&app);
+        let pts = app.ds.series[0].points.clone();
+        // Measure the first six hours: the tile shows the median of just that stretch.
+        let (a, b) = (pts[0].0, pts[6].0);
+        app.anchor = None;
+        app.finish_measure(a, b);
+        let s = screen(&app);
+        let mut v: Vec<f64> = pts[..=6].iter().map(|p| p.1).collect();
+        v.sort_by(f64::total_cmp);
+        let median =
+            crate::units::Unit::new(crate::units::Dim::Bytes { binary: false }).format(v[3]);
+        assert!(s.contains("selected 6 hours"), "{s}");
+        let (num, _) = median.split_once(' ').unwrap();
+        let big = crate::render::big_text(num).unwrap();
+        assert!(
+            s.contains(&big[0]),
+            "median {median} of the range in big digits:\n{s}"
+        );
+        // A tap outside the range lets go of it.
+        let plot = *app.plots.borrow().last().unwrap();
+        let col = plot.col_of(pts[20].0);
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            col,
+            plot.rect.y + 2,
+        );
+        mouse(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            col,
+            plot.rect.y + 2,
+        );
+        assert!(app.selection.is_none());
+        assert!(!screen(&app).contains("selected 6 hours"));
     }
 
     #[test]
