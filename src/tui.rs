@@ -425,6 +425,14 @@ enum Hit {
     MenuBackground,
 }
 
+/// The tutorial panel's parts, laid out for a width.
+#[derive(Default)]
+struct TutorialContent {
+    body: Vec<Line<'static>>,
+    footer: Vec<Line<'static>>,
+    buttons: Vec<Button<Hit>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum TutorialHit {
     Next,
@@ -640,6 +648,7 @@ pub struct App {
     clipboard: Option<String>,
     /// `--tutorial`: the guided tour, shown above the chart.
     tutorial: Option<crate::tutorial::Tutorial>,
+    tutorial_rect: std::cell::Cell<Rect>,
     /// Sources of panes with `source=` (presets, profiles, recent charts).
     subs: Vec<crate::sources::Sub>,
     /// Their latest data, as drawn.
@@ -752,6 +761,7 @@ impl App {
             pane_menu: false,
             clipboard: None,
             tutorial,
+            tutorial_rect: std::cell::Cell::new(Rect::default()),
             subs: Vec::new(),
             mark_rules: Vec::new(),
             manual_marks: Vec::new(),
@@ -1161,43 +1171,94 @@ impl App {
         Transition::None
     }
 
-    /// The panel's text rows at this width, and its buttons.
-    fn tutorial_content(&self, width: u16) -> (Vec<Line<'static>>, Vec<Button<Hit>>) {
+    /// The panel at this width: the explanation, keys and examples (scrollable), what
+    /// to try (always shown), and its buttons.
+    fn tutorial_content(&self, width: u16) -> TutorialContent {
         let Some(t) = &self.tutorial else {
-            return (Vec::new(), Vec::new());
+            return TutorialContent::default();
         };
         let step = t.current();
         let w = width.saturating_sub(2).max(10) as usize;
-        let mut lines: Vec<Line> = Vec::new();
+        let mut body: Vec<Line<'static>> = Vec::new();
         let text = Style::default().fg(Color::White);
-        for (i, para) in step.text.split('\n').enumerate() {
-            if i > 0 {
-                lines.push(Line::raw(""));
+        let dim = Style::default().fg(Color::Gray);
+        let head = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        let code = Style::default().fg(Color::Cyan);
+        for para in step.text.split('\n') {
+            // Indented lines are shown as they are (sample input).
+            if para.starts_with("  ") {
+                for l in wrap(para.trim_start(), w.saturating_sub(2)) {
+                    body.push(Line::styled(format!("  {l}"), code));
+                }
+            } else {
+                body.extend(wrap(para, w).into_iter().map(|l| Line::styled(l, text)));
             }
-            lines.extend(wrap(para, w).into_iter().map(|l| Line::styled(l, text)));
         }
         if let Some(c) = step.command {
             for l in wrap(c, w.saturating_sub(2)) {
-                lines.push(Line::styled(
-                    format!("  {l}"),
-                    Style::default().fg(Color::Cyan),
-                ));
+                body.push(Line::styled(format!("  {l}"), code));
             }
         }
+        // Two columns when there's room, else the description under the key.
+        let table =
+            |body: &mut Vec<Line<'static>>, title: &str, rows: &[(&str, &str)], style: Style| {
+                if rows.is_empty() {
+                    return;
+                }
+                body.push(Line::styled(title.to_string(), head));
+                let col = rows
+                    .iter()
+                    .map(|r| unicode_width::UnicodeWidthStr::width(r.0))
+                    .max()
+                    .unwrap_or(0);
+                let two = col <= 30 && w >= col + 26;
+                for (k, d) in rows {
+                    if two {
+                        let lines = wrap(d, w - col - 4);
+                        for (i, l) in lines.into_iter().enumerate() {
+                            let key = if i == 0 { *k } else { "" };
+                            let pad = col - unicode_width::UnicodeWidthStr::width(key);
+                            body.push(Line::from(vec![
+                                Span::styled(format!("  {key}{}", " ".repeat(pad)), style),
+                                Span::styled(format!("  {l}"), dim),
+                            ]));
+                        }
+                    } else {
+                        for l in wrap(k, w.saturating_sub(2)) {
+                            body.push(Line::styled(format!("  {l}"), style));
+                        }
+                        for l in wrap(d, w.saturating_sub(4)) {
+                            body.push(Line::styled(format!("    {l}"), dim));
+                        }
+                    }
+                }
+            };
+        table(
+            &mut body,
+            "keys",
+            step.keys,
+            Style::default().fg(Color::Yellow),
+        );
+        table(&mut body, "examples", step.examples, code);
+        let mut footer = Vec::new();
         if let Some(task) = step.task {
             if t.is_done() {
-                lines.push(Line::styled(
+                footer.push(Line::styled(
                     "✓ done! Enter or tap next to go on",
                     Style::default()
                         .fg(Color::LightGreen)
                         .add_modifier(Modifier::BOLD),
                 ));
             } else {
-                for (i, l) in wrap(task, w.saturating_sub(6)).into_iter().enumerate() {
+                for (i, l) in wrap(task, w.saturating_sub(7)).into_iter().enumerate() {
                     let lead = if i == 0 { "▸ try: " } else { "       " };
-                    lines.push(Line::styled(
+                    footer.push(Line::styled(
                         format!("{lead}{l}"),
-                        Style::default().fg(Color::Yellow),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
                     ));
                 }
             }
@@ -1221,7 +1282,11 @@ impl App {
         if !last {
             buttons.push(Button::new("end tour", Hit::Tutorial(TutorialHit::End)));
         }
-        (lines, buttons)
+        TutorialContent {
+            body,
+            footer,
+            buttons,
+        }
     }
 
     fn tutorial_height(&self, width: u16, height: u16) -> u16 {
@@ -1231,17 +1296,37 @@ impl App {
         if t.folded {
             return 1;
         }
-        let (lines, buttons) = self.tutorial_content(width);
-        let want = lines.len() as u16 + flow_height(&buttons, width.saturating_sub(2)) + 2;
-        // Leave the chart most of the screen.
-        want.min(height.saturating_sub(10).max(4))
-            .min(height / 2 + 2)
+        let c = self.tutorial_content(width);
+        let want = (c.body.len() + c.footer.len()) as u16
+            + flow_height(&c.buttons, width.saturating_sub(2))
+            + 2;
+        // Up to about half the screen: the chart needs the rest (longer steps scroll).
+        want.min((height * 11 / 20).max(8))
+            .min(height.saturating_sub(6))
+    }
+
+    /// Scroll the panel by `rows` (negative: up).
+    fn scroll_tutorial(&mut self, rows: i32) {
+        let size = ratatui::layout::Size::from(self.tutorial_rect.get());
+        let Some(t) = &self.tutorial else {
+            return;
+        };
+        let c = self.tutorial_content(size.width);
+        let fixed =
+            c.footer.len() as u16 + flow_height(&c.buttons, size.width.saturating_sub(2)) + 2;
+        let room = size.height.saturating_sub(fixed);
+        let max = (c.body.len() as u16).saturating_sub(room);
+        let to = (t.scroll as i32 + rows).clamp(0, max as i32) as u16;
+        if let Some(t) = self.tutorial.as_mut() {
+            t.scroll = to;
+        }
     }
 
     fn draw_tutorial(&self, f: &mut Frame, area: Rect) {
         let Some(t) = &self.tutorial else {
             return;
         };
+        self.tutorial_rect.set(area);
         let n = crate::tutorial::STEPS.len();
         let step = t.current();
         let progress = format!("tutorial {}/{n}", t.step + 1);
@@ -1265,7 +1350,8 @@ impl App {
             return;
         }
         Clear.render(area, f.buffer_mut());
-        let block = Block::bordered()
+        let c = self.tutorial_content(area.width);
+        let mut block = Block::bordered()
             .border_style(Style::default().fg(Color::Yellow))
             .title(Line::from(vec![
                 Span::styled(format!(" {progress} "), Style::default().fg(Color::Yellow)),
@@ -1277,27 +1363,46 @@ impl App {
                 ),
             ]));
         let inner = block.inner(area);
+        let bh = flow_height(&c.buttons, inner.width);
+        let footer_h = c.footer.len() as u16;
+        let body_h = inner.height.saturating_sub(bh + footer_h);
+        let max_scroll = (c.body.len() as u16).saturating_sub(body_h);
+        let scroll = t.scroll.min(max_scroll);
+        // Say when there's more to read, and how to get to it.
+        let more = match (scroll > 0, scroll < max_scroll) {
+            (true, true) => Some(" ↑↓ more · scroll / PgUp PgDn "),
+            (false, true) => Some(" ↓ more · scroll / PgDn "),
+            (true, false) => Some(" ↑ PgUp "),
+            (false, false) => None,
+        };
+        if let Some(m) = more {
+            block = block
+                .title_bottom(Line::styled(m, Style::default().fg(Color::Yellow)).right_aligned());
+        }
         f.render_widget(block, area);
         // Taps on the panel's background do nothing (not the chart under it).
         self.hits.push(area, Hit::MenuBackground);
-        let (lines, buttons) = self.tutorial_content(area.width);
-        let bh = flow_height(&buttons, inner.width);
-        let text_h = inner.height.saturating_sub(bh);
-        let shown = lines.len().min(text_h as usize);
-        // Too little room: the task (at the end) matters most, so keep the end.
-        let skip = lines.len() - shown;
         f.render_widget(
-            Paragraph::new(lines[skip..].to_vec()),
+            Paragraph::new(c.body).scroll((scroll, 0)),
             Rect {
-                height: text_h,
+                height: body_h,
                 ..inner
             },
         );
-        render_buttons(
-            &buttons,
+        f.render_widget(
+            Paragraph::new(c.footer),
             Rect {
-                y: inner.y + text_h,
-                height: bh.min(inner.height),
+                y: inner.y + body_h,
+                height: footer_h.min(inner.height.saturating_sub(body_h)),
+                ..inner
+            },
+        );
+        let by = inner.y + body_h + footer_h;
+        render_buttons(
+            &c.buttons,
+            Rect {
+                y: by,
+                height: inner.bottom().saturating_sub(by),
                 ..inner
             },
             f.buffer_mut(),
@@ -4042,6 +4147,14 @@ impl App {
             match key.code {
                 KeyCode::Enter => return self.tutorial_hit(TutorialHit::Next),
                 KeyCode::Backspace => return self.tutorial_hit(TutorialHit::Back),
+                KeyCode::PageDown => {
+                    self.scroll_tutorial(5);
+                    return Transition::None;
+                }
+                KeyCode::PageUp => {
+                    self.scroll_tutorial(-5);
+                    return Transition::None;
+                }
                 _ => {}
             }
         }
@@ -4492,6 +4605,19 @@ impl App {
                 if let Some(plot) = self.plot_at(col, row) {
                     self.cursor = Some(plot.x_at(col));
                 }
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                if self.tutorial.is_some()
+                    && self
+                        .tutorial_rect
+                        .get()
+                        .contains(ratatui::layout::Position { x: col, y: row }) =>
+            {
+                self.scroll_tutorial(if m.kind == MouseEventKind::ScrollUp {
+                    -2
+                } else {
+                    2
+                });
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 // A menu drawn over the chart: the scroll is meant for it, not the chart.
@@ -6871,6 +6997,27 @@ mod tests {
         let s = screen(&app);
         assert!(s.lines().next().unwrap().contains("tutorial 2/"), "{s}");
         app.tutorial_hit(TutorialHit::Fold);
+        // Long steps scroll on a phone: the examples are further down.
+        let (setup, live) = crate::tutorial::start().unwrap();
+        let mut phone = App::new(setup, live);
+        while phone.tutorial.as_ref().unwrap().current().title != "trend lines" {
+            key(&mut phone, KeyCode::Enter);
+        }
+        let s = screen_sized(&phone, 46, 40);
+        assert!(s.contains("↓ more") && !s.contains("--trend-only"), "{s}");
+        for _ in 0..4 {
+            key(&mut phone, KeyCode::PageDown);
+            screen_sized(&phone, 46, 40);
+        }
+        let s = screen_sized(&phone, 46, 40);
+        assert!(s.contains("--trend-only") && s.contains("▸ try:"), "{s}");
+        key(&mut phone, KeyCode::PageUp);
+        key(&mut phone, KeyCode::Enter);
+        assert_eq!(
+            phone.tutorial.as_ref().unwrap().scroll,
+            0,
+            "a new step starts at the top"
+        );
         // Tapping next ▶ moves on, like Enter.
         let (col, row) = find(&app, "next ▶");
         mouse(
@@ -6882,5 +7029,53 @@ mod tests {
         assert_eq!(app.tutorial.as_ref().unwrap().step, 2);
         app.tutorial_hit(TutorialHit::End);
         assert!(app.tutorial.is_none() && !screen(&app).contains("tutorial 3/"));
+    }
+
+    #[test]
+    fn every_tutorial_example_works() {
+        use crate::tutorial::STEPS;
+        let examples = STEPS
+            .iter()
+            .flat_map(|s| s.examples.iter().map(|e| e.0))
+            .chain(STEPS.iter().filter_map(|s| s.command));
+        for ex in examples {
+            if let Some(code) = ex.strip_prefix(':') {
+                // Console examples run on the demo chart without an error. (Several on a
+                // line, like `:undo()  :redo()`, run one by one.)
+                let mut app = tutorial_app();
+                for part in code.split("  :") {
+                    if part == "help" || part.starts_with("load(") || part.starts_with("save(") {
+                        continue;
+                    }
+                    app.message = None;
+                    run(&mut app, part);
+                    assert!(
+                        app.message.as_ref().is_none_or(|m| !m.error),
+                        "{ex}: {}",
+                        app.message.as_ref().unwrap().text
+                    );
+                }
+                continue;
+            }
+            // Flags and command lines parse (… stands for "the rest of your command").
+            let line = ex.replace(" …", "").replace("graft … ", "graft ");
+            let line = if line.starts_with("--") {
+                format!("graft app.log {line}")
+            } else {
+                line
+            };
+            // `tail -f app.log | graft --kv`: the graft part.
+            let cmd = match line.find(" | graft ") {
+                Some(i) if !line.starts_with("graft") => &line[i + 3..],
+                _ => line.as_str(),
+            };
+            let args = crate::sources::split_args(cmd).unwrap_or_else(|e| panic!("{ex}: {e}"));
+            assert_eq!(args[0], "graft", "{ex}");
+            let args = crate::profile::expand(args.iter().map(Into::into).collect())
+                .unwrap_or_else(|e| panic!("{ex}: {e}"));
+            if let Err(e) = <Cli as clap::Parser>::try_parse_from(&args) {
+                panic!("{ex}: {e}");
+            }
+        }
     }
 }
