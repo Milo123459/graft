@@ -10,7 +10,7 @@ use crate::time::parse_duration;
 
 const EXAMPLES: &str = "\
 Examples:
-  graft                                         open the builder: pick a source, get format suggestions
+  graft                                         quick start: ready-made charts, or build your own
   graft reclaimable.log                         no format given: opens the builder with suggestions
   graft reclaimable.log -F '{time} node1: {node1} node2: {node2}'   graph it with this format
   graft reclaimable.log -F '{key}: {value}' --stats --once           print chart + stats, then exit
@@ -21,7 +21,8 @@ Examples:
   graft -c 'df -B1' -F '{key} {_} {used} {avail} {_}' -s '*.avail'
   graft data.csv --csv --resample 1h:max --smooth 3
   graft reclaimable.log --kv --alert 'node1 < 50GB' --once --no-chart && echo ok
-  graft -p meminfo                              run a saved (or built-in) profile
+  graft -p cpu                                  run a preset (cpu, memory, load, network, disk,
+                                                temperature, ping, processes) or a saved profile
 
 Format templates (-F): {name} captures a number (with optional unit) as series `name`;
 {time} or {time:%d/%m %H:%M} a timestamp; {x} a numeric x; {key} names the series
@@ -177,7 +178,8 @@ pub struct Cli {
     )]
     pub exclude: Vec<String>,
 
-    /// Add a derived series using a Rhai expression, e.g. `used = MemTotal - MemAvailable`.
+    /// Add a derived series using a Rhai expression, e.g. `used = MemTotal - MemAvailable`
+    /// or with a unit, `busy:% = user / total * 100`. Computed after --rate/--delta.
     #[arg(long = "series", value_name = "NAME=EXPR", action = ArgAction::Append, help_heading = "Series")]
     pub derived: Vec<String>,
 

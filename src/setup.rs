@@ -41,6 +41,7 @@ pub fn build(cli: Cli, spec: SourceSpec, color: bool) -> Result<Setup> {
         color,
         format: cli.stats_format,
         template: cli.stats_template.clone(),
+        width: None,
     };
     if let Some(t) = &report.template {
         // Validate the template up front with a dummy report.

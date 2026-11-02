@@ -12,6 +12,8 @@ mod render;
 mod script;
 mod session;
 mod setup;
+#[cfg(test)]
+mod snapshots;
 mod source;
 mod stats;
 mod suggest;
@@ -243,7 +245,15 @@ fn run_once(
     }
     // A stats template or JSON format implies --stats.
     if cli.stats || cli.stats_template.is_some() || cli.stats_format == cli::StatsFormat::Json {
-        out.write_all(stats::report(&ds, report)?.as_bytes())?;
+        let width = cli
+            .width
+            .map(usize::from)
+            .or(terminal_size().map(|t| usize::from(t.0)));
+        let report = ReportOpts {
+            width,
+            ..report.clone()
+        };
+        out.write_all(stats::report(&ds, &report)?.as_bytes())?;
     }
     out.flush()?;
     for path in &cli.export {

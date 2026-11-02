@@ -13,8 +13,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Bar, BarChart, Block, Chart, Clear, Dataset as RDataset, GraphType, LegendPosition,
-    Paragraph, Sparkline, Widget,
+    Axis, Block, Chart, Clear, Dataset as RDataset, GraphType, LegendPosition, Paragraph,
+    Sparkline, Widget,
 };
 
 use crate::cli::{ChartKind, FitModel, LegendPos, MarkerKind};
@@ -22,19 +22,21 @@ use crate::data::{Dataset, Series, XKind};
 use crate::stats::{Analysis, Fit};
 use crate::units::Unit;
 
+/// Series colours from the 256-colour palette: vivid on dark backgrounds and not
+/// remapped by terminal themes (the basic 16 colours often are, sometimes to dim tones).
 pub const DEFAULT_PALETTE: [Color; 12] = [
-    Color::Cyan,
-    Color::Magenta,
-    Color::Yellow,
-    Color::Green,
-    Color::LightRed,
-    Color::LightBlue,
-    Color::LightCyan,
-    Color::LightMagenta,
-    Color::LightYellow,
-    Color::LightGreen,
-    Color::Red,
-    Color::Blue,
+    Color::Indexed(81),  // sky blue
+    Color::Indexed(213), // pink
+    Color::Indexed(221), // gold
+    Color::Indexed(114), // green
+    Color::Indexed(209), // orange
+    Color::Indexed(141), // lavender
+    Color::Indexed(203), // red
+    Color::Indexed(43),  // teal
+    Color::Indexed(33),  // blue
+    Color::Indexed(186), // khaki
+    Color::Indexed(168), // rose
+    Color::Indexed(250), // grey
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -114,14 +116,6 @@ impl Default for ChartOpts {
 impl ChartOpts {
     pub fn color(&self, idx: usize) -> Color {
         self.palette[idx % self.palette.len()]
-    }
-
-    /// Format an x value for an axis label.
-    pub fn fmt_x(&self, ds: &Dataset, x: f64, span: f64) -> String {
-        match (&self.x_format, ds.x_kind) {
-            (Some(f), XKind::Time) => crate::time::format_time_with(x, f),
-            _ => ds.fmt_x(x, span),
-        }
     }
 
     /// The projection for one series: its fit and how far ahead to draw it.
@@ -303,6 +297,20 @@ pub fn projection_points(fit: &Fit, from: f64, to: f64) -> Vec<(f64, f64)> {
         .collect()
 }
 
+/// A horizontal bar of `len` cells, with eighth-block precision at the end.
+fn eighths_bar(len: f64) -> String {
+    let full = len.floor() as usize;
+    let rest = ((len - full as f64) * 8.0).round() as usize;
+    let mut s = "█".repeat(full);
+    if rest > 0 {
+        s.push(['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'][rest - 1]);
+    }
+    if s.is_empty() {
+        s.push('▏');
+    }
+    s
+}
+
 /// Split a curve over `[from, to]` into dashes (every other piece of `pieces`).
 pub fn dashed(f: impl Fn(f64) -> f64, from: f64, to: f64, pieces: usize) -> Vec<Vec<(f64, f64)>> {
     let pieces = pieces.max(2);
@@ -393,6 +401,235 @@ pub fn value_at(s: &Series, opts: &ChartOpts, x: f64) -> Option<(f64, bool)> {
         .filter_map(|i| s.points.get(i))
         .min_by(|a, b| (a.0 - x).abs().total_cmp(&(b.0 - x).abs()))
         .map(|p| (p.1, false))
+}
+
+/// "Nice" tick values covering `[lo, hi]` with roughly `target` steps.
+pub fn nice_ticks(lo: f64, hi: f64, target: usize) -> Vec<f64> {
+    let span = hi - lo;
+    if span <= 0.0 || !span.is_finite() {
+        return vec![lo];
+    }
+    let raw = span / target.max(1) as f64;
+    let mag = 10f64.powf(raw.log10().floor());
+    let step = [1.0, 2.0, 2.5, 5.0, 10.0]
+        .iter()
+        .map(|m| m * mag)
+        .find(|s| span / s <= target as f64)
+        .unwrap_or(10.0 * mag);
+    let mut t = (lo / step).ceil() * step;
+    let mut out = Vec::new();
+    while t <= hi + step * 1e-9 {
+        out.push(if t.abs() < step * 1e-9 { 0.0 } else { t });
+        t += step;
+    }
+    out
+}
+
+/// Round y ticks in the unit they're displayed in (`100 GB`, `250 ms`, ...).
+pub fn y_ticks(y0: f64, y1: f64, target: usize, unit: &Unit, log: bool) -> Vec<(f64, String)> {
+    if log {
+        let decades: Vec<f64> = (y0.ceil() as i64..=y1.floor() as i64)
+            .map(|e| e as f64)
+            .collect();
+        let ticks = if decades.len() >= 2 {
+            decades
+        } else {
+            spaced(y0, y1, target)
+        };
+        return ticks
+            .into_iter()
+            .map(|t| (t, unit.format(10f64.powf(t))))
+            .collect();
+    }
+    let scale = unit.tick_scale(y0.abs().max(y1.abs()));
+    // At least two labels: use a finer step when the range only holds one round value.
+    let mut ticks = nice_ticks(y0 / scale, y1 / scale, target);
+    let mut t = target;
+    while ticks.len() < 2 && t < target * 8 {
+        t += 1;
+        ticks = nice_ticks(y0 / scale, y1 / scale, t);
+    }
+    ticks
+        .into_iter()
+        .map(|t| (t * scale, unit.format(t * scale)))
+        .collect()
+}
+
+/// Round x ticks: calendar-aligned for time (midnights, hours, months), nice numbers otherwise.
+pub fn x_ticks(
+    ds: &Dataset,
+    opts: &ChartOpts,
+    x0: f64,
+    x1: f64,
+    max_labels: usize,
+) -> Vec<(f64, String)> {
+    let span = x1 - x0;
+    let max_labels = max_labels.max(2);
+    if ds.x_kind != XKind::Time {
+        return nice_ticks(x0, x1, max_labels)
+            .into_iter()
+            .map(|t| (t, crate::units::fmt_compact(t)))
+            .collect();
+    }
+    const STEPS: [f64; 22] = [
+        1.0,
+        2.0,
+        5.0,
+        10.0,
+        15.0,
+        30.0,
+        60.0,
+        120.0,
+        300.0,
+        600.0,
+        900.0,
+        1800.0,
+        3600.0,
+        7200.0,
+        10800.0,
+        21600.0,
+        43200.0,
+        86400.0,
+        172_800.0,
+        604_800.0,
+        1_209_600.0,
+        2_592_000.0,
+    ];
+    let step = STEPS
+        .iter()
+        .copied()
+        .find(|s| span / s <= max_labels as f64)
+        .unwrap_or(f64::INFINITY);
+    let to_dt = |x: f64| chrono::DateTime::from_timestamp(x as i64, 0).map(|d| d.naive_utc());
+    // (format_time_with tolerates invalid user formats instead of panicking)
+    let fmt = |x: f64, f: &str| crate::time::format_time_with(x, f);
+    let label = |x: f64| -> String {
+        if let Some(f) = &opts.x_format {
+            return fmt(x, f);
+        }
+        let midnight = x.rem_euclid(86400.0) == 0.0;
+        match step {
+            s if s >= 2_592_000.0 => fmt(
+                x,
+                if span > 86400.0 * 400.0 {
+                    "%Y-%m"
+                } else {
+                    "%b"
+                },
+            ),
+            s if s >= 86400.0 => fmt(
+                x,
+                if span > 86400.0 * 300.0 {
+                    "%Y-%m-%d"
+                } else {
+                    "%m-%d"
+                },
+            ),
+            _ if midnight => fmt(x, "%m-%d"),
+            s if s >= 60.0 => fmt(x, "%H:%M"),
+            _ => fmt(x, "%H:%M:%S"),
+        }
+    };
+    let mut ticks = Vec::new();
+    if step.is_infinite() || step >= 2_592_000.0 {
+        // Month starts (every 1, 2, 3, 6 or 12 months).
+        use chrono::Datelike;
+        let months = [1, 2, 3, 6, 12]
+            .into_iter()
+            .find(|m| span / (2_592_000.0 * *m as f64) <= max_labels as f64)
+            .unwrap_or(12);
+        let Some(start) = to_dt(x0) else { return ticks };
+        let (mut y, mut m) = (start.year(), start.month0() as i32);
+        m = (m / months + 1) * months;
+        loop {
+            let (yy, mm) = (y + m / 12, (m % 12) as u32 + 1);
+            let Some(t) =
+                chrono::NaiveDate::from_ymd_opt(yy, mm, 1).and_then(|d| d.and_hms_opt(0, 0, 0))
+            else {
+                break;
+            };
+            let x = t.and_utc().timestamp() as f64;
+            if x > x1 {
+                break;
+            }
+            ticks.push((x, label(x)));
+            m += months;
+            if m > 12 * 400 {
+                break;
+            }
+        }
+        let _ = &mut y;
+        return ticks;
+    }
+    // Weeks start on Monday (the epoch was a Thursday).
+    let offset = if step >= 604_800.0 {
+        4.0 * 86400.0
+    } else {
+        0.0
+    };
+    let mut t = ((x0 - offset) / step).ceil() * step + offset;
+    while t <= x1 {
+        ticks.push((t, label(t)));
+        t += step;
+    }
+    ticks
+}
+
+/// Write axis labels at their true positions (ratatui spaces its own evenly).
+/// Ticks for both axes: (value, label).
+struct Ticks<'a> {
+    x: &'a [(f64, String)],
+    y: &'a [(f64, String)],
+}
+
+fn draw_axis_labels(
+    buf: &mut Buffer,
+    inner: Rect,
+    area: PlotArea,
+    (y0, y1): (f64, f64),
+    ticks: Ticks,
+) {
+    let (plot, x0, x1, yt, xt) = (area.rect, area.x0, area.x1, ticks.y, ticks.x);
+    let style = Style::default().fg(Color::Gray);
+    // y: right-aligned in the gutter left of the axis.
+    let gutter = plot.x.saturating_sub(inner.x + 1);
+    let mut last_row: Option<u16> = None;
+    for (v, text) in yt {
+        let frac = (v - y0) / (y1 - y0);
+        if !(-1e-9..=1.0 + 1e-9).contains(&frac) || plot.height == 0 {
+            continue;
+        }
+        let row = plot.y + ((1.0 - frac) * f64::from(plot.height - 1)).round() as u16;
+        if last_row.is_some_and(|r| r.abs_diff(row) < 2) {
+            continue;
+        }
+        let w = text.chars().count() as u16;
+        if w > gutter {
+            continue;
+        }
+        buf.set_string(inner.x + gutter - w, row, text, style);
+        last_row = Some(row);
+    }
+    // x: centred under their position on the label row, without overlaps.
+    let row = inner.bottom().saturating_sub(1);
+    let mut next_free = inner.x;
+    for (v, text) in xt {
+        let frac = (v - x0) / (x1 - x0);
+        if !(0.0..=1.0).contains(&frac) {
+            continue;
+        }
+        let col = plot.x + (frac * f64::from(plot.width.saturating_sub(1))).round() as u16;
+        let w = text.chars().count() as u16;
+        let start = col
+            .saturating_sub(w / 2)
+            .max(inner.x)
+            .min(inner.right().saturating_sub(w));
+        if start < next_free {
+            continue;
+        }
+        buf.set_string(start, row, text, style);
+        next_free = start + w + 2;
+    }
 }
 
 /// Where ratatui's Chart puts the plotting area (mirrors its layout rules).
@@ -608,18 +845,17 @@ impl<'a> ChartWidget<'a> {
         );
 
         let unit = common_unit(lines.iter().map(|l| l.1));
-        let fmt_y = |v: f64| unit.format(if log { 10f64.powf(v) } else { v });
-        let span = x1 - x0;
-        let nx = (area.width as usize / 18).clamp(2, 7);
         let ny = (area.height as usize / 4).clamp(2, 6);
-        let x_labels: Vec<Line> = spaced(x0, x1, nx)
-            .into_iter()
-            .map(|x| Line::from(self.opts.fmt_x(self.ds, x, span)))
-            .collect();
-        let y_labels: Vec<Line> = spaced(y0, y1, ny)
-            .into_iter()
-            .map(|y| Line::from(fmt_y(y)))
-            .collect();
+        let y_tick_list = y_ticks(y0, y1, ny, &unit, log);
+        // ratatui reserves the label gutter and row; the labels themselves are drawn
+        // afterwards at their exact positions.
+        let gutter = y_tick_list
+            .iter()
+            .map(|t| t.1.chars().count())
+            .max()
+            .unwrap_or(1);
+        let y_labels: Vec<Line> = vec![Line::from(" ".repeat(gutter)); 2];
+        let x_labels: Vec<Line> = vec![Line::from(""); 2];
 
         // Overlay lines first so data is drawn on top.
         let mut overlays: Vec<OverlayLine> = Vec::new();
@@ -727,7 +963,9 @@ impl<'a> ChartWidget<'a> {
         }
 
         let block = self.block_titled(title);
-        let plot = graph_area(block.inner(area), &y_labels, x_labels.first());
+        let inner = block.inner(area);
+        let plot = graph_area(inner, &y_labels, x_labels.first());
+        let x_tick_list = x_ticks(self.ds, self.opts, x0, x1, (plot.width as usize / 9).max(2));
         let axis_style = Style::default().fg(Color::Gray);
         Chart::new(datasets)
             .block(block)
@@ -743,16 +981,26 @@ impl<'a> ChartWidget<'a> {
                     .labels(y_labels)
                     .style(axis_style),
             )
-            // With a cursor, its readout box takes the legend's place.
-            .legend_position(if self.overlay.cursor.is_some() {
+            // With a cursor, its readout box takes the legend's place; narrow charts
+            // skip the legend so it doesn't cover the data.
+            .legend_position(if self.overlay.cursor.is_some() || plot.width < 56 {
                 None
             } else {
                 legend(self.opts.legend)
             })
             .hidden_legend_constraints((Constraint::Ratio(2, 3), Constraint::Ratio(2, 3)))
             .render(area, buf);
-
         let plot = PlotArea { rect: plot, x0, x1 };
+        draw_axis_labels(
+            buf,
+            inner,
+            plot,
+            (y0, y1),
+            Ticks {
+                x: &x_tick_list,
+                y: &y_tick_list,
+            },
+        );
         if let Some(plots) = self.overlay.plots {
             plots.borrow_mut().push(plot);
         }
@@ -796,10 +1044,10 @@ impl<'a> ChartWidget<'a> {
                 ]));
             }
         }
-        let w =
-            (lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16 + 2).min(plot.rect.width);
-        let h = (lines.len() as u16).min(plot.rect.height);
-        if w < 4 || h == 0 {
+        let w = lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16 + 2;
+        let h = lines.len() as u16;
+        // In small panels the box would hide the data; the status line has the values.
+        if w * 2 > plot.rect.width || h + 3 > plot.rect.height {
             return;
         }
         let col = plot.col_of(x);
@@ -821,6 +1069,7 @@ impl<'a> ChartWidget<'a> {
             .render(rect, buf);
     }
 
+    /// Latest value of each series as a horizontal bar, with the value after it.
     fn render_bar(self, area: Rect, buf: &mut Buffer) {
         let latest: Vec<(usize, &Series, f64)> = self
             .visible()
@@ -830,33 +1079,51 @@ impl<'a> ChartWidget<'a> {
         if latest.is_empty() {
             return self.render_empty(area, buf, "waiting for data…");
         }
+        let block = self.block();
+        let inner = block.inner(area);
+        block.render(area, buf);
         let max = latest
             .iter()
             .map(|l| l.2.abs())
             .fold(0.0, f64::max)
             .max(f64::MIN_POSITIVE);
-        let inner_h = area.height.saturating_sub(2) as usize;
-        let bars: Vec<Bar> = latest
+        let name_w = (latest
             .iter()
-            .map(|&(i, s, v)| {
-                let color = self.opts.color(i);
-                Bar::default()
-                    .label(Line::from(s.name.clone()))
-                    .value((v.max(0.0) / max * 1e6) as u64)
-                    .text_value(s.unit.format(v))
-                    .style(Style::default().fg(color))
-                    .value_style(Style::default().fg(Color::Black).bg(color))
-            })
-            .collect();
-        let gap = u16::from(latest.len() * 2 <= inner_h);
-        BarChart::horizontal(bars)
-            .block(self.block())
-            .bar_width(1)
-            .bar_gap(gap)
-            .max(1_000_000)
-            .render(area, buf);
+            .map(|l| l.1.name.chars().count())
+            .max()
+            .unwrap_or(0) as u16)
+            .min(inner.width / 3);
+        let value_w = latest
+            .iter()
+            .map(|l| l.1.unit.format(l.2).chars().count())
+            .max()
+            .unwrap_or(0) as u16;
+        let bar_w = inner.width.saturating_sub(name_w + value_w + 3);
+        let gap = u16::from(latest.len() as u16 * 2 <= inner.height);
+        for (k, &(i, s, v)) in latest.iter().enumerate() {
+            let row = inner.y + k as u16 * (1 + gap);
+            if row >= inner.bottom() {
+                break;
+            }
+            let color = self.opts.color(i);
+            let name: String = s.name.chars().take(name_w as usize).collect();
+            buf.set_string(inner.x, row, &name, Style::default().fg(color));
+            let len = v.max(0.0) / max * f64::from(bar_w);
+            let bar = eighths_bar(len);
+            let x = inner.x + name_w + 1;
+            buf.set_string(x, row, &bar, Style::default().fg(color));
+            let text = s.unit.format(v);
+            buf.set_string(
+                x + bar.chars().count() as u16 + 1,
+                row,
+                &text,
+                Style::default().fg(Color::White),
+            );
+        }
     }
 
+    /// Distribution of the first visible series: bins fill the width, with count and
+    /// value axes.
     fn render_histogram(self, area: Rect, buf: &mut Buffer) {
         let Some((i, s)) = self.visible().into_iter().next() else {
             return self.render_empty(area, buf, "waiting for data…");
@@ -865,53 +1132,11 @@ impl<'a> ChartWidget<'a> {
         if values.is_empty() {
             return self.render_empty(area, buf, "no data in view");
         }
-        let inner_w = area.width.saturating_sub(2) as usize;
-        let (lo, hi) = values
-            .iter()
-            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
-                (lo.min(v), hi.max(v))
-            });
-        let bins = if hi > lo {
-            self.opts.bins.clamp(1, (inner_w / 2).max(1))
-        } else {
-            1
-        };
-        let width = (hi - lo) / bins as f64;
-        let mut counts = vec![0u64; bins];
-        for v in &values {
-            let b = if width > 0.0 {
-                (((v - lo) / width) as usize).min(bins - 1)
-            } else {
-                0
-            };
-            counts[b] += 1;
-        }
-        let gap = u16::from(inner_w >= bins * 3);
-        let bar_width =
-            (((inner_w + gap as usize) / bins).saturating_sub(gap as usize)).max(1) as u16;
-        let color = self.opts.color(i);
-        let bars: Vec<Bar> = counts
-            .iter()
-            .enumerate()
-            .map(|(b, &c)| {
-                let label = if bar_width >= 7 {
-                    s.unit.format(lo + width * (b as f64 + 0.5))
-                } else {
-                    String::new()
-                };
-                Bar::default()
-                    .value(c)
-                    .label(Line::from(label))
-                    .style(Style::default().fg(color))
-                    .value_style(Style::default().fg(Color::Black).bg(color))
-            })
-            .collect();
+        let (lo, hi) = min_max(values.iter().copied()).unwrap_or((0.0, 1.0));
         let title = format!(
-            " {} · histogram of {} · {} … {} · n={} ",
+            " {} · distribution of {} · n={} ",
             self.opts.title,
             s.name,
-            s.unit.format(lo),
-            s.unit.format(hi),
             values.len()
         );
         let block = Block::bordered()
@@ -920,11 +1145,100 @@ impl<'a> ChartWidget<'a> {
                 title,
                 Style::default().add_modifier(Modifier::BOLD),
             ));
-        BarChart::vertical(bars)
-            .block(block)
-            .bar_width(bar_width)
-            .bar_gap(gap)
-            .render(area, buf);
+        let inner = block.inner(area);
+        block.render(area, buf);
+        if inner.height < 3 || inner.width < 10 {
+            return;
+        }
+        let mut counts = vec![0usize; 1];
+        let gutter = 6u16;
+        let plot = Rect {
+            x: inner.x + gutter,
+            y: inner.y,
+            width: inner.width - gutter,
+            height: inner.height - 2,
+        };
+        let bins = if hi > lo {
+            self.opts.bins.clamp(1, plot.width as usize)
+        } else {
+            1
+        };
+        counts.resize(bins, 0);
+        let width = (hi - lo) / bins as f64;
+        for v in &values {
+            let b = if width > 0.0 {
+                (((v - lo) / width) as usize).min(bins - 1)
+            } else {
+                0
+            };
+            counts[b] += 1;
+        }
+        let max = *counts.iter().max().unwrap_or(&1) as f64;
+        let color = self.opts.color(i);
+        let per_bin = f64::from(plot.width) / bins as f64;
+        for col in 0..plot.width {
+            let b = ((f64::from(col) / per_bin) as usize).min(bins - 1);
+            // Leave a gap column at the end of each wide bin.
+            if per_bin >= 3.0 && b + 1 < bins && ((f64::from(col + 1) / per_bin) as usize) != b {
+                continue;
+            }
+            let height = counts[b] as f64 / max * f64::from(plot.height);
+            for r in 0..plot.height {
+                let fill = (height - f64::from(r)).clamp(0.0, 1.0);
+                if fill <= 0.0 {
+                    break;
+                }
+                let ch = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']
+                    [((fill * 8.0).ceil() as usize).clamp(1, 8) - 1];
+                buf[(plot.x + col, plot.bottom() - 1 - r)]
+                    .set_char(ch)
+                    .set_style(Style::default().fg(color));
+            }
+        }
+        let axis = Style::default().fg(Color::Gray);
+        // Count axis.
+        for (frac, label) in [
+            (1.0, format!("{max}")),
+            (0.5, format!("{}", (max / 2.0).round())),
+            (0.0, "0".into()),
+        ] {
+            let row = plot.y + ((1.0 - frac) * f64::from(plot.height - 1)).round() as u16;
+            let w = label.chars().count() as u16;
+            if w < gutter {
+                buf.set_string(inner.x + gutter - 1 - w, row, &label, axis);
+            }
+        }
+        // Value axis with round ticks.
+        let base = inner.bottom() - 2;
+        buf.set_string(
+            plot.x,
+            base,
+            "─".repeat(plot.width as usize),
+            Style::default().fg(Color::DarkGray),
+        );
+        let ticks = y_ticks(
+            lo,
+            if hi > lo { hi } else { lo + 1.0 },
+            (plot.width as usize / 14).max(2),
+            &s.unit,
+            false,
+        );
+        let mut next_free = inner.x;
+        for (v, text) in ticks {
+            let frac = (v - lo) / (hi - lo).max(f64::MIN_POSITIVE);
+            let col = plot.x + (frac.clamp(0.0, 1.0) * f64::from(plot.width - 1)).round() as u16;
+            let w = text.chars().count() as u16;
+            let start = col
+                .saturating_sub(w / 2)
+                .max(inner.x)
+                .min(inner.right().saturating_sub(w));
+            if start < next_free {
+                continue;
+            }
+            buf.set_string(start, base + 1, &text, axis);
+            buf[(col, base)].set_char('┴');
+            next_free = start + w + 2;
+        }
     }
 
     fn render_sparklines(self, area: Rect, buf: &mut Buffer) {
@@ -965,12 +1279,17 @@ impl<'a> ChartWidget<'a> {
             if row.height < 2 || pts.is_empty() {
                 continue;
             }
+            // One column per cell across the full width: averages when there are more
+            // points than columns, the nearest point when there are fewer.
             let w = row.width as usize;
-            let chunk = pts.len().div_ceil(w).max(1);
+            let n = pts.len();
             let range = (hi - lo).max(f64::MIN_POSITIVE);
-            let data: Vec<u64> = pts
-                .chunks(chunk)
-                .map(|c| c.iter().map(|p| p.1).sum::<f64>() / c.len() as f64)
+            let data: Vec<u64> = (0..w)
+                .map(|c| {
+                    let (a, b) = (c * n / w, ((c + 1) * n / w).max(c * n / w + 1).min(n));
+                    let chunk = &pts[a.min(n - 1)..b.max(a.min(n - 1) + 1)];
+                    chunk.iter().map(|p| p.1).sum::<f64>() / chunk.len() as f64
+                })
                 .map(|v| ((v - lo) / range * 99.0) as u64 + 1)
                 .collect();
             Sparkline::default()

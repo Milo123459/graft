@@ -18,30 +18,30 @@ targets (`--target`) and the output format (`--stats-template`,
 ```
 $ graft reclaimable.log -F '{time} node1: {node1} node2: {node2}' --once --stats --split --forecast --target node1=50GB,node2=200GB
 ┌ reclaimable.log · node1 [forecast] ────────────────────────────────────────┐
-│60.4 GB   │⠒⠒⠲⣀                                         ┌──────────────────┐│
-│          │    ⠉⠉⠑⢆⣀⣀⡠⠤⠤⠤⠋⣀                             │node1 target 50 GB││
-│          │                ⠉⠁  ⠒⠤⠤⠄                     │node1 58.8 GB     ││
-│          │                          ⠉⠉⠉⠂  ⠤⠤⠤⡀         └──────────────────┘│
-│          │                                      ⠉⠉⠒⠂  ⠤⠤⣀⡀                 │
-│          │                                                 ⠈⠑⠒⠒  ⠠⢄⣀⡀      │
-│48.7 GB   │⠉⠉⠁ ⠉⠉⠁ ⠉⠉⠁⠈⠉⠉ ⠈⠉⠉ ⠈⠉⠉ ⠈⠉⠉ ⠈⠉⠉ ⠈⠉⠁ ⠉⠉⠁ ⠉⠉⠁ ⠉⠉⠁ ⠉⠉⠁ ⠉⠉⠁⠈⠉⠉ ⠈⠉⠉⠐⠒⠒⠢│
-│          └─────────────────────────────────────────────────────────────────│
-│11-01 04:00                   11-02 22:09     11-04 16:19        11-06 10:28│
+│60 GB│⠒⠒⠒⢄⡀                                             ┌──────────────────┐│
+│     │    ⠈⠉⠉⠲⣀⣀⣀⡠⠤⠤⠤⠋⣀⡀                                │node1 target 50 GB││
+│     │                 ⠈⠉   ⠒⠤⠤⠄                        │node1 58.8 GB     ││
+│     │                            ⠉⠉⠉⠒  ⠠⠤⠤⢄            └──────────────────┘│
+│     │                                         ⠉⠉⠒⠂  ⠤⠤⢄⣀                   │
+│50 GB│                                                     ⠈⠑⠒⠒⠂  ⠤⣀⣀       │
+│     │⠉⠉⠁ ⠉⠉⠉ ⠈⠉⠉ ⠈⠉⠉  ⠉⠉⠁ ⠉⠉⠁ ⠈⠉⠉ ⠈⠉⠉ ⠈⠉⠉⠁ ⠉⠉⠁ ⠉⠉⠁ ⠈⠉⠉ ⠈⠉⠉  ⠉⠉⠁ ⠉⠉⠁ ⠁⠉⠉⠐⠒⠒⠢│
+│     └──────────────────────────────────────────────────────────────────────│
+│               11-02        11-03        11-04        11-05        11-06    │
 └────────────────────────────────────────────────────────────────────────────┘
 ┌ reclaimable.log · node2 [forecast] ────────────────────────────────────────┐
-│424.9 GB  │⠒⠤⢄⣀⡀                                            ┌──────────────┐│
-│          │    ⠈⠑⠒⠢⠤⣀⣀⠤⠤⠤⠒⡀                                 │node2 415.7 GB││
-│          │               ⠈⠉⠁  ⠒⠤⠤⠄                         └──────────────┘│
-│          │                          ⠉⠉⠉⠂  ⠤⠤⠤⡀                             │
-│          │                                      ⠉⠉⠒⠂  ⠤⠤⣀⡀                 │
-│          │                                                 ⠈⠑⠒⠒  ⠠⢄⣀⡀      │
-│378.9 GB  │                                                          ⠈  ⠐⠒⠒⠢│
-│          └─────────────────────────────────────────────────────────────────│
-│11-01 04:00                   11-02 22:09     11-04 16:19        11-06 10:28│
+│      │⠒⠤⢄⣀⣀                                                ┌──────────────┐│
+│420 GB│     ⠉⠒⠒⠤⢄⣀⣀⠤⠤⠔⠂                                     │node2 415.7 GB││
+│      │                ⠉⠉⠉  ⠐⠢⠤⠤                            └──────────────┘│
+│400 GB│                           ⠈⠉⠉⠉⠂  ⠤⠤⠤⡀                               │
+│      │                                        ⠈⠉⠑⠒  ⠠⠤⢄⣀                   │
+│      │                                                     ⠉⠒⠒⠂  ⠤⣀⣀       │
+│380 GB│                                                              ⠁  ⠐⠒⠒⠢│
+│      └─────────────────────────────────────────────────────────────────────│
+│                11-02        11-03        11-04       11-05        11-06    │
 └────────────────────────────────────────────────────────────────────────────┘
-series   n      last       min      mean       max         σ  trend/day    R²  forecast
-node1   29   58.8 GB   57.5 GB   58.5 GB   59.9 GB  882.6 MB   -1.97 GB  0.61  50 GB in 3.7 days
-node2   29  415.7 GB  412.2 GB  417.1 GB  422.8 GB   3.14 GB   -7.69 GB  0.73  200 GB in 27.6 days
+series   n      last       min      mean  trend/day    R²  forecast
+node1   29   58.8 GB   57.5 GB   58.5 GB   -1.97 GB  0.61  50 GB in 3.7 days
+node2   29  415.7 GB  412.2 GB  417.1 GB   -7.69 GB  0.73  200 GB in 27.6 days
 
 • node1: falling by an average of 1.97 GB/day (R² 0.61); reaches 50 GB in about 3.7 days (around 2026-11-06 01:32)
 • node2: falling by an average of 7.69 GB/day (R² 0.73); reaches 200 GB in about 27.6 days (around 2026-11-29 23:09)
@@ -64,7 +64,7 @@ graft app.log -F '…' --once            # print the chart and exit (also used w
 graft -c 'cat /proc/meminfo' -n 1s -B -F '{key}: {value}'   # run a command every second
 some-command | graft --columns all     # graph stdin
 graft app.log --kv -f                  # follow a growing file like tail -f
-graft -p meminfo                       # run a profile (see --list-profiles)
+graft -p cpu                           # a preset: cpu, memory, load, network, disk, temperature, ping, processes
 ```
 
 ### Getting data in
@@ -157,7 +157,7 @@ was skipped.
 | | |
 |---|---|
 | `-s, --select 'Mem*,Cached'` / `-e, --exclude lo` | choose series (globs allowed) |
-| `--series 'used = MemTotal - MemAvailable'` | derived series (Rhai expression, units allowed) |
+| `--series 'used = MemTotal - MemAvailable'` | derived series (Rhai expression, unit literals allowed); `--series 'busy:% = …'` sets its unit. Computed after `--rate`/`--delta`, so ratios of rates work |
 | `--rate` | counter → per-second rate |
 | `--delta` | change between points |
 | `--resample 1h:max` | bucket (mean, min, max, sum, last, count) |
@@ -216,6 +216,27 @@ so graft works in cron jobs and scripts:
 graft /var/log/reclaimable.log -F '{key}: {value}' --no-chart \
   --alert 'node1 < 50GB' --alert 'slope("node2", "1d") < -10GB' || notify-send "disk"
 ```
+
+## Quick start
+
+Run `graft` on its own and pick from ready-made charts. Only the ones that work
+on your machine are listed:
+
+| Preset | Shows |
+|---|---|
+| CPU usage (`-p cpu`) | busy % and I/O wait %, every second |
+| Memory (`-p memory`) | used, available and cached memory |
+| Load average (`-p load`) | 1, 5 and 15 minute load |
+| Network traffic (`-p network`) | received / sent bytes per second, per interface |
+| Disk usage (`-p disk`) | % used per mounted filesystem |
+| CPU temperature (`-p temperature`) | °C from the thermal sensor (e.g. a Raspberry Pi) |
+| Ping latency (`-p ping`) | round-trip time to 1.1.1.1 |
+| Processes (`-p processes`) | number of running processes |
+
+Tap one to start it, or tap **edit** to open it in the builder and adjust it.
+Every preset spells out its format, so it also works as an example to copy.
+Your saved profiles appear in the same list, followed by **chart a file** and
+**chart a command**.
 
 ## Building a chart interactively
 
@@ -331,11 +352,23 @@ values plus an optional `time`, or `()` to skip the line.
 ```sh
 graft /var/log/reclaimable.log -F '{key}: {value}' --stats --split --save-profile reclaim
 graft -p reclaim                 # later; extra flags override the profile
-graft --list-profiles            # saved + built-in: meminfo, loadavg, net, cpu-temp
+graft --list-profiles            # saved profiles + built-in presets
 ```
 
 Profiles are stored in `~/.config/graft/profiles.toml`, or wherever
 `$GRAFT_PROFILES` points.
+
+## Development
+
+```sh
+cargo test                                                    # unit, end-to-end and rendering tests
+GRAFT_SNAPSHOTS=snaps cargo test snapshots -- --include-ignored  # write every screen as colour ANSI
+```
+
+The snapshot scenarios (`src/snapshots.rs`) cover the `--once` output, the
+viewer (cursor, split, forecast, timeframe, help, many series), the builder and
+the gallery, at desktop and phone sizes. `cat snaps/*.ans` shows them in your
+terminal.
 
 ## Shell integration
 

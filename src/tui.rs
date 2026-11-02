@@ -1223,19 +1223,19 @@ impl App {
 
     fn draw_help(&self, f: &mut Frame) {
         let area = f.area();
-        let w = 72.min(area.width);
+        let w = 92.min(area.width);
         let mut lines: Vec<Line> = HELP
             .iter()
             .map(|(k, d)| {
                 Line::from(vec![
-                    Span::styled(format!("{k:>16}  "), Style::default().fg(Color::Yellow)),
+                    Span::styled(format!("{k:>15}  "), Style::default().fg(Color::Yellow)),
                     Span::raw(*d),
                 ])
             })
             .collect();
         for (k, code) in &self.binds {
             lines.push(Line::from(vec![
-                Span::styled(format!("{k:>16}  "), Style::default().fg(Color::Cyan)),
+                Span::styled(format!("{k:>15}  "), Style::default().fg(Color::Cyan)),
                 Span::raw(format!("script: {code}")),
             ]));
         }
@@ -1255,6 +1255,35 @@ impl App {
             ),
             rect,
         );
+    }
+}
+
+/// Hooks for rendering snapshots.
+#[cfg(test)]
+impl App {
+    /// Load everything from a finite source.
+    pub(crate) fn test_settle(&mut self) {
+        while !self.live.eof {
+            self.tick();
+        }
+        self.rebuild(true);
+    }
+
+    /// Put the cursor at a fraction (0..1) of the plotted x range.
+    pub(crate) fn test_cursor_at(&mut self, frac: f64) {
+        let (a, b) = self.bounds();
+        self.cursor = Some(a + (b - a) * frac);
+    }
+
+    pub(crate) fn test_keys(&mut self, keys: &str) {
+        for c in keys.chars() {
+            let code = match c {
+                '\n' => KeyCode::Enter,
+                '\x1b' => KeyCode::Esc,
+                c => KeyCode::Char(c),
+            };
+            self.on_event(&TermEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        }
     }
 }
 

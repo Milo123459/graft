@@ -108,6 +108,10 @@ enum Opt {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Hit {
+    /// Gallery: start item `n` / open it in the builder.
+    StartItem(usize),
+    EditItem(usize),
+    NewSource(Src),
     Field(Field),
     Src(Src),
     Load,
@@ -150,6 +154,53 @@ pub struct Builder {
     /// Piped stdin, when the builder was started with data on stdin.
     live: Option<Live>,
     script: Rc<ScriptHost>,
+    /// The quick-start screen (shown when there's no source yet).
+    gallery: Option<Gallery>,
+    /// Came from the gallery: "back" returns there.
+    from_gallery: bool,
+}
+
+/// A ready-made chart (built-in preset or saved profile).
+#[derive(Debug, Clone)]
+struct Item {
+    title: String,
+    description: String,
+    args: Vec<String>,
+    saved: bool,
+}
+
+#[derive(Debug, Clone)]
+struct Gallery {
+    items: Vec<Item>,
+    selected: usize,
+}
+
+impl Gallery {
+    fn new() -> Self {
+        let mut items: Vec<Item> = crate::profile::presets()
+            .into_iter()
+            .filter(|p| p.available())
+            .map(|p| Item {
+                title: p.title.into(),
+                description: p.description.into(),
+                args: p.args.iter().map(|s| s.to_string()).collect(),
+                saved: false,
+            })
+            .collect();
+        items.extend(crate::profile::saved().into_iter().map(|(name, p)| Item {
+            description: p.description.clone().unwrap_or_else(|| {
+                p.args
+                    .iter()
+                    .map(|a| crate::cli::shell_quote(a))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }),
+            title: name,
+            args: p.args,
+            saved: true,
+        }));
+        Self { items, selected: 0 }
+    }
 }
 
 impl Builder {
@@ -218,8 +269,17 @@ impl Builder {
             live,
             script,
             cli,
+            gallery: None,
+            from_gallery: false,
         };
-        if b.source.value.is_empty() && b.src != Src::Stdin {
+        if b.source.value.is_empty()
+            && b.src != Src::Stdin
+            && b.previous.is_none()
+            && !b.cli.has_parser()
+        {
+            // Nothing to go on yet: start with the quick-start gallery.
+            b.gallery = Some(Gallery::new());
+        } else if b.source.value.is_empty() && b.src != Src::Stdin {
             b.focus = Some(Field::Source);
             b.message = Some((
                 "type a file path or a command, then tap load (or press Enter)".into(),
@@ -368,6 +428,9 @@ impl Builder {
     }
 
     fn use_suggestion(&mut self, s: &Suggestion) {
+        if self.message.as_ref().is_some_and(|m| !m.1) {
+            self.message = None;
+        }
         let c = &s.cli;
         let (parser, text) = match s.kind {
             Kind::Template => (Parser::Template, c.format.clone().unwrap_or_default()),
@@ -549,6 +612,9 @@ impl Builder {
     // ───────────── events ─────────────
 
     pub fn on_event(&mut self, ev: &TermEvent) -> Transition {
+        if self.gallery.is_some() {
+            return self.on_gallery_event(ev);
+        }
         match ev {
             TermEvent::Key(k) if k.kind == KeyEventKind::Press => self.on_key(*k),
             TermEvent::Mouse(m) => match m.kind {
@@ -584,6 +650,10 @@ impl Builder {
         }
         match key.code {
             KeyCode::Esc if self.focus.is_some() => self.focus = None,
+            KeyCode::Esc if self.from_gallery => {
+                self.gallery = Some(Gallery::new());
+                self.message = None;
+            }
             KeyCode::Esc => return Transition::Back,
             KeyCode::Tab | KeyCode::BackTab => {
                 let fields = self.fields();
@@ -684,6 +754,9 @@ impl Builder {
             }
             Hit::Parser(p) => {
                 self.parser = p;
+                if self.message.as_ref().is_some_and(|m| !m.1) {
+                    self.message = None;
+                }
                 if p == Parser::Template && self.format.value.is_empty()
                     || p != Parser::Template && self.cli.format.is_some()
                 {
@@ -764,7 +837,12 @@ impl Builder {
                     self.save_name = Some(TextInput::default());
                 }
             }
+            Hit::Back if self.from_gallery => {
+                self.gallery = Some(Gallery::new());
+                self.message = None;
+            }
             Hit::Back => return Transition::Back,
+            Hit::StartItem(_) | Hit::EditItem(_) | Hit::NewSource(_) => {}
             Hit::Preview => self.focus = None,
         }
         Transition::None
@@ -899,7 +977,7 @@ impl Builder {
                 Hit::Save,
             ),
             Button::new(
-                if self.previous.is_some() {
+                if self.previous.is_some() || self.from_gallery {
                     "back"
                 } else {
                     "quit"
@@ -934,6 +1012,9 @@ impl Builder {
 
     pub fn draw(&self, f: &mut Frame) {
         self.hits.clear();
+        if let Some(g) = &self.gallery {
+            return self.draw_gallery(f, g);
+        }
         let area = f.area();
         let w = area.width;
         let heading = Style::default()
@@ -1037,7 +1118,7 @@ impl Builder {
             let r = sugg_rows[i + 1];
             let on = current == Some(i);
             let style = if on {
-                Style::default().fg(Color::Black).bg(Color::Cyan)
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
@@ -1201,6 +1282,249 @@ impl Builder {
     }
 }
 
+impl Builder {
+    /// Load a gallery item; `start` launches it straight away.
+    fn open_item(&mut self, idx: usize, start: bool) -> Transition {
+        let Some(item) = self
+            .gallery
+            .as_ref()
+            .and_then(|g| g.items.get(idx))
+            .cloned()
+        else {
+            return Transition::None;
+        };
+        let cli = match <Cli as clap::Parser>::try_parse_from(
+            std::iter::once("graft".to_string()).chain(item.args.iter().cloned()),
+        ) {
+            Ok(cli) => cli,
+            Err(e) => {
+                self.error(format!(
+                    "{}: {}",
+                    item.title,
+                    e.to_string().lines().next().unwrap_or("")
+                ));
+                return Transition::None;
+            }
+        };
+        let live = self.live.take();
+        *self = Builder::new(cli, live, None);
+        self.from_gallery = true;
+        if start {
+            Transition::Start
+        } else {
+            Transition::None
+        }
+    }
+
+    fn new_source(&mut self, src: Src) {
+        self.gallery = None;
+        self.from_gallery = true;
+        self.src = src;
+        self.source.set("");
+        self.focus = Some(Field::Source);
+        self.message = Some((
+            match src {
+                Src::Command => "type a command whose output has numbers (e.g. cat /proc/meminfo), then press Enter or tap load",
+                _ => "type the path of a file (e.g. /var/log/app.log), then press Enter or tap load",
+            }
+            .into(),
+            false,
+        ));
+    }
+
+    fn on_gallery_event(&mut self, ev: &TermEvent) -> Transition {
+        let n = self.gallery.as_ref().map_or(0, |g| g.items.len());
+        match ev {
+            TermEvent::Key(k) if k.kind == KeyEventKind::Press => {
+                let sel = self.gallery.as_ref().map_or(0, |g| g.selected);
+                match k.code {
+                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Transition::Quit;
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => return Transition::Back,
+                    KeyCode::Up | KeyCode::Char('k') if n > 0 => {
+                        self.gallery.as_mut().expect("gallery").selected = (sel + n - 1) % n
+                    }
+                    KeyCode::Down | KeyCode::Char('j') if n > 0 => {
+                        self.gallery.as_mut().expect("gallery").selected = (sel + 1) % n
+                    }
+                    KeyCode::Enter if n > 0 => return self.open_item(sel, true),
+                    KeyCode::Char('e') if n > 0 => return self.open_item(sel, false),
+                    KeyCode::Char('f') => self.new_source(Src::File),
+                    KeyCode::Char('c') => self.new_source(Src::Command),
+                    _ => {}
+                }
+            }
+            TermEvent::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
+                match self.hits.at(m.column, m.row).map(|h| h.1) {
+                    Some(Hit::StartItem(i)) => return self.open_item(i, true),
+                    Some(Hit::EditItem(i)) => return self.open_item(i, false),
+                    Some(Hit::NewSource(src)) => self.new_source(src),
+                    Some(Hit::Back) => return Transition::Back,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        Transition::None
+    }
+
+    fn draw_gallery(&self, f: &mut Frame, g: &Gallery) {
+        let area = f.area();
+        let heading = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        let dim = Style::default().fg(Color::DarkGray);
+        let mut y = area.y;
+        let line = |f: &mut Frame, l: Line, y: &mut u16| {
+            if *y < area.bottom() {
+                f.render_widget(
+                    l,
+                    Rect {
+                        x: area.x,
+                        y: *y,
+                        width: area.width,
+                        height: 1,
+                    },
+                );
+            }
+            *y += 1;
+        };
+        line(
+            f,
+            Line::from(vec![
+                Span::styled(
+                    " graft ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "  what would you like to chart?",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            &mut y,
+        );
+        y += 1;
+        let title_w = g
+            .items
+            .iter()
+            .map(|i| i.title.chars().count())
+            .max()
+            .unwrap_or(0) as u16
+            + 2;
+        let mut section = None;
+        for (idx, item) in g.items.iter().enumerate() {
+            let this = if item.saved {
+                "your saved profiles"
+            } else {
+                "quick start — tap to start (edit to adjust first)"
+            };
+            if section != Some(item.saved) {
+                if section.is_some() {
+                    y += 1;
+                }
+                line(f, Line::styled(this, heading), &mut y);
+                section = Some(item.saved);
+            }
+            if y >= area.bottom() {
+                break;
+            }
+            let selected = idx == g.selected;
+            // Keep "edit" near the text on wide screens.
+            let right = area.right().min(area.x + title_w + 70);
+            let row = Rect {
+                x: area.x,
+                y,
+                width: right.saturating_sub(area.x + 7),
+                height: 1,
+            };
+            let name_style = if selected {
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                Style::default().add_modifier(Modifier::BOLD)
+            };
+            let pad = " ".repeat((title_w as usize).saturating_sub(item.title.chars().count()));
+            f.render_widget(
+                Line::from(vec![
+                    Span::styled(format!(" ▸ {}{pad}", item.title), name_style),
+                    Span::styled(format!(" {}", item.description), dim),
+                ]),
+                row,
+            );
+            self.hits.push(row, Hit::StartItem(idx));
+            let edit = Rect {
+                x: right.saturating_sub(6),
+                y,
+                width: 6,
+                height: 1,
+            };
+            f.render_widget(
+                Span::styled(
+                    " edit ",
+                    Style::default().fg(Color::White).bg(Color::DarkGray),
+                ),
+                edit,
+            );
+            self.hits.push(edit, Hit::EditItem(idx));
+            y += 1;
+        }
+        y += 1;
+        line(f, Line::styled("or make your own", heading), &mut y);
+        let buttons = vec![
+            Button::new("chart a file", Hit::NewSource(Src::File)),
+            Button::new("chart a command", Hit::NewSource(Src::Command)),
+            Button::new("quit", Hit::Back),
+        ];
+        let h = flow_height(&buttons, area.width);
+        if y + h <= area.bottom() {
+            render_buttons(
+                &buttons,
+                Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: h,
+                },
+                f.buffer_mut(),
+                &self.hits,
+            );
+        }
+        y += h + 1;
+        line(
+            f,
+            Line::styled(
+                "keys: ↑/↓ choose · enter start · e edit · f file · c command · q quit",
+                dim,
+            ),
+            &mut y,
+        );
+        line(
+            f,
+            Line::styled(
+                "next time: graft -p NAME runs a preset or saved profile directly",
+                dim,
+            ),
+            &mut y,
+        );
+        if let Some((m, err)) = &self.message {
+            f.render_widget(
+                Span::styled(
+                    m.clone(),
+                    Style::default().fg(if *err { Color::LightRed } else { Color::Cyan }),
+                ),
+                Rect {
+                    y: area.bottom().saturating_sub(1),
+                    height: 1,
+                    ..area
+                },
+            );
+        }
+    }
+}
+
 /// Run a command once in the background and collect its first lines.
 fn run_sample_command(cmd: String) -> Receiver<Result<Vec<String>, String>> {
     let (tx, rx) = mpsc::channel();
@@ -1264,6 +1588,21 @@ pub fn sample_command_blocking(cmd: &str) -> Option<Vec<String>> {
 }
 
 #[cfg(test)]
+impl Builder {
+    /// Type keys (`↓` is the Down arrow, `\n` Enter).
+    pub(crate) fn test_keys(&mut self, keys: &str) {
+        for c in keys.chars() {
+            let code = match c {
+                '\u{2193}' => KeyCode::Down,
+                '\n' => KeyCode::Enter,
+                c => KeyCode::Char(c),
+            };
+            self.on_event(&TermEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser as _;
@@ -1309,6 +1648,31 @@ mod tests {
 
     fn key(b: &mut Builder, code: KeyCode) -> Transition {
         b.on_event(&TermEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+    }
+
+    #[test]
+    fn gallery_starts_and_edits_presets() {
+        let mut b = builder(&["graft"]);
+        let s = screen(&b, 100, 40);
+        assert!(s.contains("what would you like to chart?"), "{s}");
+        assert!(
+            s.contains("CPU usage") && s.contains("Memory") && s.contains("chart a file"),
+            "{s}"
+        );
+        // Tapping a row starts it.
+        assert_eq!(tap(&mut b, "Memory"), Transition::Start);
+        let app = b.launch().expect("preset launches");
+        assert_eq!(app.current_cli().title.as_deref(), Some("Memory"));
+        // "edit" opens it in the builder with its explicit format, and back returns.
+        let mut b = builder(&["graft"]);
+        key(&mut b, KeyCode::Down);
+        assert_eq!(key(&mut b, KeyCode::Char('e')), Transition::None);
+        assert!(b.gallery.is_none());
+        assert_eq!(b.format.value, "{key}: {value}");
+        key(&mut b, KeyCode::Esc);
+        assert!(b.gallery.is_some());
+        // Phone-sized.
+        assert!(screen(&b, 46, 30).contains("CPU usage"));
     }
 
     #[test]
@@ -1384,6 +1748,8 @@ mod tests {
         assert!(b.preview.error.is_some());
         assert!(b.launch().is_err());
         let mut b = builder(&["graft", "--build"]);
+        assert!(b.gallery.is_some(), "no source: the gallery comes first");
+        key(&mut b, KeyCode::Char('f'));
         assert_eq!(b.focus, Some(Field::Source));
         assert!(b.launch().is_err(), "no source yet");
         "/nope".chars().for_each(|c| {
@@ -1399,7 +1765,7 @@ mod tests {
     #[test]
     fn command_source_samples_in_the_background() {
         let mut b = builder(&["graft", "--build"]);
-        tap(&mut b, " command ");
+        tap(&mut b, " chart a command ");
         "printf 'MemTotal: 100 kB\\nMemFree: 40 kB\\n'"
             .chars()
             .for_each(|c| {

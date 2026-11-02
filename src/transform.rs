@@ -32,6 +32,8 @@ pub struct Derived {
     pub name: String,
     pub source: String,
     pub ast: AST,
+    /// From `NAME:UNIT = EXPR`; otherwise guessed from the first series used.
+    pub unit: Option<Unit>,
 }
 
 pub struct Pipeline {
@@ -60,8 +62,19 @@ impl Pipeline {
                     .split_once('=')
                     .with_context(|| format!("--series '{spec}' should look like NAME=EXPR"))?;
                 let (name, expr) = (name.trim(), expr.trim());
+                let (name, unit) = match name.split_once(':') {
+                    Some((n, u)) => {
+                        let u = u.trim();
+                        let unit = crate::units::lookup_unit(u, cli.binary_units).map_or_else(
+                            || Unit::new(crate::units::Dim::Other(u.to_string())),
+                            |(dim, _)| Unit::new(dim),
+                        );
+                        (n.trim(), Some(unit))
+                    }
+                    None => (name, None),
+                };
                 if name.is_empty() || expr.is_empty() {
-                    bail!("--series '{spec}' should look like NAME=EXPR");
+                    bail!("--series '{spec}' should look like NAME=EXPR (or NAME:UNIT=EXPR)");
                 }
                 let ast = script
                     .compile_expr(expr)
@@ -70,6 +83,7 @@ impl Pipeline {
                     name: name.to_string(),
                     source: expr.to_string(),
                     ast,
+                    unit,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -88,15 +102,9 @@ impl Pipeline {
     }
 
     /// Add derived series and apply transforms to every series.
+    /// Rate/delta, then derived series (so `busy = user / total` works on rates),
+    /// then resampling and smoothing.
     pub fn apply(&self, mut ds: Dataset, script: &ScriptHost) -> Dataset {
-        let derived: Vec<Series> = self
-            .derived
-            .iter()
-            .map(|d| derive(&ds, d, script))
-            .collect();
-        ds.series
-            .retain(|s| !self.derived.iter().any(|d| d.name == s.name));
-        ds.series.extend(derived);
         let time = ds.x_kind == XKind::Time;
         for s in &mut ds.series {
             if self.rate {
@@ -105,6 +113,16 @@ impl Pipeline {
             if self.delta {
                 delta(s);
             }
+        }
+        let derived: Vec<Series> = self
+            .derived
+            .iter()
+            .map(|d| derive(&ds, d, script))
+            .collect();
+        ds.series
+            .retain(|s| !self.derived.iter().any(|d| d.name == s.name));
+        ds.series.extend(derived);
+        for s in &mut ds.series {
             if let Some(r) = self.resample {
                 resample(s, r);
             }
@@ -267,14 +285,15 @@ fn derive(ds: &Dataset, d: &Derived, script: &ScriptHost) -> Series {
                 .push((var.clone(), y));
         }
     }
-    // Guess the unit from the first series mentioned in the expression.
-    let unit = ds
-        .series
-        .iter()
-        .filter_map(|s| d.source.find(&ident(&s.name)).map(|pos| (pos, &s.unit)))
-        .min_by_key(|(pos, _)| *pos)
-        .map(|(_, u)| u.clone())
-        .unwrap_or_default();
+    // The given unit, or a guess from the first series mentioned in the expression.
+    let unit = d.unit.clone().unwrap_or_else(|| {
+        ds.series
+            .iter()
+            .filter_map(|s| d.source.find(&ident(&s.name)).map(|pos| (pos, &s.unit)))
+            .min_by_key(|(pos, _)| *pos)
+            .map(|(_, u)| u.clone())
+            .unwrap_or_default()
+    });
     let points = rows
         .into_values()
         .filter_map(|(x, vars)| {

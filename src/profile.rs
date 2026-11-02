@@ -27,91 +27,252 @@ pub struct Profile {
     pub args: Vec<String>,
 }
 
+/// What a preset needs to work on this machine.
+#[derive(Debug, Clone, Copy)]
+pub enum Needs {
+    File(&'static str),
+    Program(&'static str),
+}
+
+impl Needs {
+    fn met(self) -> bool {
+        match self {
+            Needs::File(p) => std::path::Path::new(p).exists(),
+            Needs::Program(name) => std::env::var_os("PATH").is_some_and(|paths| {
+                std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
+            }),
+        }
+    }
+}
+
+/// A ready-made chart, shown in the quick-start gallery and runnable as `graft -p NAME`.
+#[derive(Debug, Clone)]
+pub struct Preset {
+    pub name: &'static str,
+    pub title: &'static str,
+    pub description: &'static str,
+    pub args: &'static [&'static str],
+    pub needs: &'static [Needs],
+}
+
+impl Preset {
+    pub fn available(&self) -> bool {
+        self.needs.iter().all(|n| n.met())
+    }
+
+    pub fn profile(&self) -> Profile {
+        Profile {
+            description: Some(self.description.into()),
+            args: self.args.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+}
+
+const CPU_TOTAL: &str = "(user + nice + system + idle + iowait + irq + softirq + steal)";
+
+/// Built-in presets. Every one spells out its format — nothing is guessed.
+pub fn presets() -> Vec<Preset> {
+    // Leak the two CPU expressions once so they can live in a 'static table.
+    let busy: &'static str = Box::leak(
+        format!("busy:% = (user + nice + system + irq + softirq + steal) / {CPU_TOTAL} * 100")
+            .into_boxed_str(),
+    );
+    let iowait: &'static str =
+        Box::leak(format!("iowait:% = iowait / {CPU_TOTAL} * 100").into_boxed_str());
+    let cpu_args: &'static [&'static str] = Box::leak(
+        vec![
+            "--cmd",
+            "head -1 /proc/stat",
+            "--every",
+            "1s",
+            "--format",
+            "cpu {user} {nice} {system} {idle} {iowait} {irq} {softirq} {steal}",
+            "--rate",
+            "--series",
+            busy,
+            "--series",
+            iowait,
+            "--select",
+            "busy,iowait",
+            "--ymin",
+            "0",
+            "--ymax",
+            "100",
+            "--title",
+            "CPU usage",
+        ]
+        .into_boxed_slice(),
+    );
+    vec![
+        Preset {
+            name: "cpu",
+            title: "CPU usage",
+            description: "busy % and I/O wait %, every second",
+            args: cpu_args,
+            needs: &[Needs::File("/proc/stat"), Needs::Program("head")],
+        },
+        Preset {
+            name: "memory",
+            title: "Memory",
+            description: "used, available and cached memory",
+            args: &[
+                "--cmd",
+                "cat /proc/meminfo",
+                "--every",
+                "2s",
+                "--format",
+                "{key}: {value}",
+                "--binary-units",
+                "--series",
+                "used:B = MemTotal - MemAvailable",
+                "--select",
+                "used,MemAvailable,Cached",
+                "--ymin",
+                "0",
+                "--title",
+                "Memory",
+            ],
+            needs: &[Needs::File("/proc/meminfo"), Needs::Program("cat")],
+        },
+        Preset {
+            name: "load",
+            title: "Load average",
+            description: "1, 5 and 15 minute load",
+            args: &[
+                "--cmd",
+                "cat /proc/loadavg",
+                "--every",
+                "2s",
+                "--columns",
+                "1,2,3",
+                "--names",
+                "1 min,5 min,15 min",
+                "--ymin",
+                "0",
+                "--title",
+                "Load average",
+            ],
+            needs: &[Needs::File("/proc/loadavg"), Needs::Program("cat")],
+        },
+        Preset {
+            name: "network",
+            title: "Network traffic",
+            description: "received / sent bytes per second, per interface",
+            args: &[
+                "--cmd",
+                "cat /proc/net/dev",
+                "--every",
+                "1s",
+                "--format",
+                "{key}:{_:/\\s*/}{rx} {_:word} {_:word} {_:word} {_:word} {_:word} {_:word} {_:word} {tx}",
+                "--rate",
+                "--unit",
+                "B",
+                "--exclude",
+                "lo.*",
+                "--title",
+                "Network traffic",
+            ],
+            needs: &[Needs::File("/proc/net/dev"), Needs::Program("cat")],
+        },
+        Preset {
+            name: "disk",
+            title: "Disk usage",
+            description: "% used per mounted filesystem",
+            args: &[
+                "--cmd",
+                "df -kP",
+                "--every",
+                "30s",
+                "--format",
+                "{_:word} {_:word} {_:word} {_:word} {value} {key}",
+                "--kind",
+                "bar",
+                "--exclude",
+                "/dev*,/sys*,/run*,/proc*,/snap*",
+                "--title",
+                "Disk usage",
+            ],
+            needs: &[Needs::Program("df")],
+        },
+        Preset {
+            name: "temperature",
+            title: "CPU temperature",
+            description: "°C from the thermal sensor (e.g. Raspberry Pi)",
+            args: &[
+                "--cmd",
+                "cat /sys/class/thermal/thermal_zone0/temp",
+                "--every",
+                "2s",
+                "--columns",
+                "1",
+                "--names",
+                "raw",
+                "--series",
+                "temp:°C = raw / 1000",
+                "--exclude",
+                "raw",
+                "--title",
+                "CPU temperature",
+            ],
+            needs: &[
+                Needs::File("/sys/class/thermal/thermal_zone0/temp"),
+                Needs::Program("cat"),
+            ],
+        },
+        Preset {
+            name: "ping",
+            title: "Ping latency",
+            description: "round-trip time to 1.1.1.1 every 2 s",
+            args: &[
+                "--cmd",
+                "ping -c 1 -W 2 1.1.1.1",
+                "--every",
+                "2s",
+                "--format",
+                "time={latency}",
+                "--title",
+                "Ping 1.1.1.1",
+            ],
+            needs: &[Needs::Program("ping")],
+        },
+        Preset {
+            name: "processes",
+            title: "Processes",
+            description: "number of running processes",
+            args: &[
+                "--cmd",
+                "ls -d /proc/[0-9]* | wc -l",
+                "--every",
+                "2s",
+                "--columns",
+                "1",
+                "--names",
+                "processes",
+                "--title",
+                "Processes",
+            ],
+            needs: &[
+                Needs::File("/proc/1"),
+                Needs::Program("ls"),
+                Needs::Program("wc"),
+            ],
+        },
+    ]
+}
+
 fn builtin() -> BTreeMap<String, Profile> {
-    let p = |desc: &str, args: &[&str]| Profile {
-        description: Some(desc.into()),
-        args: args.iter().map(|s| s.to_string()).collect(),
-    };
-    BTreeMap::from([
-        (
-            "meminfo".into(),
-            p(
-                "Free/available/cached memory from /proc/meminfo",
-                &[
-                    "--cmd",
-                    "cat /proc/meminfo",
-                    "--every",
-                    "1s",
-                    "--kv",
-                    "--binary-units",
-                    "--select",
-                    "MemAvailable,MemFree,Cached,Buffers",
-                    "--title",
-                    "memory",
-                ],
-            ),
-        ),
-        (
-            "loadavg".into(),
-            p(
-                "1/5/15 minute load average",
-                &[
-                    "--cmd",
-                    "cat /proc/loadavg",
-                    "--every",
-                    "2s",
-                    "--columns",
-                    "1,2,3",
-                    "--names",
-                    "load1,load5,load15",
-                    "--title",
-                    "load average",
-                ],
-            ),
-        ),
-        (
-            "net".into(),
-            p(
-                "Received bytes per second per interface",
-                &[
-                    "--cmd",
-                    "cat /proc/net/dev",
-                    "--every",
-                    "1s",
-                    "--kv",
-                    "--rate",
-                    "--unit",
-                    "B",
-                    "--exclude",
-                    "lo",
-                    "--title",
-                    "network rx",
-                ],
-            ),
-        ),
-        (
-            "cpu-temp".into(),
-            p(
-                "CPU temperature (e.g. on a Raspberry Pi), °C",
-                &[
-                    "--cmd",
-                    "cat /sys/class/thermal/thermal_zone0/temp",
-                    "--every",
-                    "2s",
-                    "--columns",
-                    "1",
-                    "--names",
-                    "raw",
-                    "--series",
-                    "celsius = raw / 1000",
-                    "--exclude",
-                    "raw",
-                    "--title",
-                    "CPU temperature (°C)",
-                ],
-            ),
-        ),
-    ])
+    presets()
+        .into_iter()
+        .map(|p| (p.name.to_string(), p.profile()))
+        .collect()
+}
+
+/// Saved profiles, for the gallery.
+pub fn saved() -> Vec<(String, Profile)> {
+    load_file()
+        .map(|f| f.profiles.into_iter().collect())
+        .unwrap_or_default()
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -289,7 +450,7 @@ mod tests {
 
     #[test]
     fn expands_builtin_profile_first() {
-        let out = expand(os(&["graft", "--rate", "-p", "loadavg", "--title", "x"])).unwrap();
+        let out = expand(os(&["graft", "--rate", "-p", "load", "--title", "x"])).unwrap();
         let out: Vec<String> = out
             .iter()
             .map(|s| s.to_string_lossy().into_owned())
@@ -304,6 +465,22 @@ mod tests {
     fn no_profile_is_identity() {
         let args = os(&["graft", "file.log", "--", "-p"]);
         assert_eq!(expand(args.clone()).unwrap(), args);
+    }
+
+    #[test]
+    fn presets_are_valid() {
+        use clap::Parser;
+        for p in presets() {
+            let cli = crate::cli::Cli::try_parse_from(
+                std::iter::once("graft").chain(p.args.iter().copied()),
+            )
+            .unwrap_or_else(|e| panic!("{}: {e}", p.name));
+            assert!(cli.has_parser(), "{} must spell out its format", p.name);
+            let script =
+                std::rc::Rc::new(crate::script::ScriptHost::new(None, cli.binary_units).unwrap());
+            crate::session::Session::new(&cli, script)
+                .unwrap_or_else(|e| panic!("{}: {e:#}", p.name));
+        }
     }
 
     #[test]

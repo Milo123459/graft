@@ -4,7 +4,7 @@ use std::fmt::Write;
 
 use ratatui::style::Color;
 
-use super::{ChartOpts, common_unit, hline_near, min_max, spaced, y_bounds};
+use super::{ChartOpts, common_unit, hline_near, min_max, nice_ticks, spaced, y_bounds, y_ticks};
 use crate::cli::{ChartKind, LegendPos};
 use crate::data::{Dataset, Series};
 
@@ -28,6 +28,19 @@ fn hex(c: Color) -> String {
         Color::LightCyan => (0x3b, 0xc9, 0xdb),
         Color::White | Color::Reset => (0x99, 0x99, 0x99),
         Color::Rgb(r, g, b) => (r, g, b),
+        // The default palette, darkened to read well on white.
+        Color::Indexed(81) => (0x1c, 0x7e, 0xd6),
+        Color::Indexed(213) => (0xd6, 0x33, 0x6c),
+        Color::Indexed(221) => (0xe0, 0x8a, 0x00),
+        Color::Indexed(114) => (0x2f, 0x9e, 0x44),
+        Color::Indexed(209) => (0xf7, 0x67, 0x07),
+        Color::Indexed(141) => (0x70, 0x48, 0xe8),
+        Color::Indexed(203) => (0xe0, 0x31, 0x31),
+        Color::Indexed(43) => (0x0c, 0x85, 0x99),
+        Color::Indexed(33) => (0x19, 0x71, 0xc2),
+        Color::Indexed(186) => (0x99, 0x8a, 0x00),
+        Color::Indexed(168) => (0xa6, 0x1e, 0x4d),
+        Color::Indexed(250) => (0x86, 0x8e, 0x96),
         Color::Indexed(i) => xterm(i),
     };
     format!("#{r:02x}{g:02x}{b:02x}")
@@ -75,28 +88,6 @@ fn esc(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
-}
-
-/// "Nice" tick values covering `[lo, hi]`.
-pub fn nice_ticks(lo: f64, hi: f64, target: usize) -> Vec<f64> {
-    let span = hi - lo;
-    if span <= 0.0 || !span.is_finite() {
-        return vec![lo];
-    }
-    let raw = span / target.max(1) as f64;
-    let mag = 10f64.powf(raw.log10().floor());
-    let step = [1.0, 2.0, 2.5, 5.0, 10.0]
-        .iter()
-        .map(|m| m * mag)
-        .find(|s| span / s <= target as f64)
-        .unwrap_or(10.0 * mag);
-    let mut t = (lo / step).ceil() * step;
-    let mut out = Vec::new();
-    while t <= hi + step * 1e-9 {
-        out.push(if t.abs() < step * 1e-9 { 0.0 } else { t });
-        t += step;
-    }
-    out
 }
 
 struct Frame {
@@ -258,16 +249,8 @@ fn xy(
     // Grid and axes.
     let _ = writeln!(out, r##"<g stroke="#e9ecef" fill="#555">"##);
     let target = ((f.h / 60.0).round() as usize).clamp(2, 6);
-    let yticks = if log {
-        (y0.ceil() as i64..=y1.floor() as i64)
-            .map(|e| e as f64)
-            .collect()
-    } else {
-        nice_ticks(y0, y1, target)
-    };
-    for t in yticks {
+    for (t, label) in y_ticks(y0, y1, target, &unit, log) {
         let y = f.py(t);
-        let label = unit.format(if log { 10f64.powf(t) } else { t });
         let _ = writeln!(
             out,
             r#"<line x1="{}" x2="{}" y1="{y:.1}" y2="{y:.1}"/>"#,
@@ -282,13 +265,14 @@ fn xy(
             esc(&label)
         );
     }
-    let span = x1 - x0;
-    let xticks = spaced(x0, x1, 6);
-    for (k, &t) in xticks.iter().enumerate() {
+    // Calendar-aligned time ticks (or round numbers), like the terminal chart.
+    let xticks = super::x_ticks(ds, opts, x0, x1, (f.w / 110.0) as usize);
+    let n = xticks.len();
+    for (k, (t, label)) in xticks.into_iter().enumerate() {
         let x = f.px(t);
-        let anchor = if k == 0 {
+        let anchor = if k == 0 && x - f.left < 30.0 {
             "start"
-        } else if k == xticks.len() - 1 {
+        } else if k + 1 == n && f.left + f.w - x < 30.0 {
             "end"
         } else {
             "middle"
@@ -303,7 +287,7 @@ fn xy(
             out,
             r#"<text x="{x:.1}" y="{}" text-anchor="{anchor}" stroke="none">{}</text>"#,
             f.top + f.h + 18.0,
-            esc(&opts.fmt_x(ds, t, span))
+            esc(&label)
         );
     }
     let _ = writeln!(out, "</g>");

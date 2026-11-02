@@ -279,8 +279,9 @@ impl Targets {
         match self.rule(name) {
             TargetRule::Fixed(v) => Some(v),
             TargetRule::None => None,
+            // Only for a clear downward trend: forecasting noise to 0 isn't useful.
             TargetRule::Auto => fit
-                .filter(|f| f.falling() && !f.is_flat() && last > 0.0)
+                .filter(|f| f.falling() && !f.is_flat() && f.r2 >= 0.5 && last > 0.0)
                 .map(|_| 0.0),
         }
     }
@@ -603,11 +604,14 @@ impl SeriesReport {
     }
 }
 
+#[derive(Clone)]
 pub struct ReportOpts {
     pub analysis: Analysis,
     pub color: bool,
     pub format: StatsFormat,
     pub template: Option<String>,
+    /// Fit the table to this many columns, dropping the least important ones.
+    pub width: Option<usize>,
 }
 
 /// Stats for every series, as a table with sentences, JSON, or a custom template.
@@ -676,6 +680,33 @@ pub fn report(ds: &Dataset, opts: &ReportOpts) -> Result<String> {
                 .unwrap_or(0)
         })
         .collect();
+    // Which columns fit, most important first: series, trend, forecast, last, R², ...
+    const PRIORITY: [usize; 10] = [0, 7, 9, 2, 8, 4, 3, 5, 6, 1];
+    let mut keep = [false; 10];
+    let mut used = 0;
+    for &c in &PRIORITY {
+        let w = widths[c] + if used == 0 { 0 } else { 2 };
+        if opts.width.is_none_or(|max| used + w <= max) || c == 0 {
+            keep[c] = true;
+            used += w;
+        }
+    }
+    let pick = |cells: &[String]| -> Vec<String> {
+        cells
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| keep[*i])
+            .map(|(_, c)| c.clone())
+            .collect()
+    };
+    let widths: Vec<usize> = widths
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| keep[*i])
+        .map(|(_, w)| *w)
+        .collect();
+    let rows: Vec<Vec<String>> = rows.iter().map(|r| pick(r)).collect();
+    let headers: Vec<String> = pick(&headers.map(String::from));
     let (bold, dim, reset) = if opts.color {
         ("\x1b[1m", "\x1b[2m", "\x1b[0m")
     } else {
@@ -697,7 +728,7 @@ pub fn report(ds: &Dataset, opts: &ReportOpts) -> Result<String> {
         out.push('\n');
     };
     out.push_str(bold);
-    fmt_row(&headers.map(String::from), &mut out);
+    fmt_row(&headers, &mut out);
     out.push_str(reset);
     for r in &rows {
         fmt_row(r, &mut out);

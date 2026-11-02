@@ -47,6 +47,35 @@ impl Unit {
         if self.rate { format!("{base}/s") } else { base }
     }
 
+    /// The multiplier of the display unit used for a value of this size (e.g. 1e9
+    /// for "GB"), so axis ticks can be round in the unit they're shown in.
+    pub fn tick_scale(&self, v: f64) -> f64 {
+        let a = v.abs();
+        match &self.dim {
+            Dim::Bytes { binary } => {
+                let base: f64 = if *binary { 1024.0 } else { 1000.0 };
+                let mut scale = 1.0;
+                while a >= scale * base && scale < base.powi(6) {
+                    scale *= base;
+                }
+                scale
+            }
+            Dim::Seconds => match a {
+                a if a < 1e-6 => 1e-9,
+                a if a < 1e-3 => 1e-6,
+                a if a < 1.0 => 1e-3,
+                a if a < 120.0 => 1.0,
+                a if a < 7200.0 => 60.0,
+                a if a < 172_800.0 => 3600.0,
+                _ => 86400.0,
+            },
+            Dim::None if a >= 1e12 => 1e12,
+            Dim::None if a >= 1e9 => 1e9,
+            Dim::None if a >= 1e6 => 1e6,
+            _ => 1.0,
+        }
+    }
+
     /// Short label for axis titles / tables.
     pub fn label(&self) -> String {
         let base = match &self.dim {
@@ -286,6 +315,20 @@ mod tests {
         assert_eq!(split_number("3e"), Some((3.0, "e")));
         assert_eq!(split_number(".5"), Some((0.5, "")));
         assert_eq!(split_number("-"), None);
+    }
+
+    #[test]
+    fn tick_scales() {
+        assert_eq!(
+            Unit::new(Dim::Bytes { binary: false }).tick_scale(758e9),
+            1e9
+        );
+        assert_eq!(
+            Unit::new(Dim::Bytes { binary: true }).tick_scale(2048.0),
+            1024.0
+        );
+        assert_eq!(Unit::new(Dim::Seconds).tick_scale(0.25), 1e-3);
+        assert_eq!(Unit::default().tick_scale(42.0), 1.0);
     }
 
     #[test]
