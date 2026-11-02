@@ -88,6 +88,10 @@ const HELP: &[(&str, &str)] = &[
     ),
     ("", "each pane has its own series, chart type and lines"),
     ("Tab / Alt+arrows", "pick the next pane / the pane that way"),
+    (
+        "Ctrl+Z / u",
+        "undo (Ctrl+Y / U redo) — also the ↶ undo button",
+    ),
     ("K", "markers: edit, delete or add rules"),
     ("C", "copy the command for this view"),
     ("⋯", "more: chart type, log scale, target lines, pause,"),
@@ -223,6 +227,7 @@ const CONSOLE_HELP: &[(&str, &str)] = &[
         "svg(\"out.svg\")  format()  quit()",
         "export / change the format / quit",
     ),
+    ("undo()  redo()", "step back / forward through your changes"),
     (
         "copy()  copy(text)",
         "copy this view's command (or any text) to your clipboard",
@@ -334,6 +339,7 @@ enum Cmd {
     Save,
     Copy,
     Markers,
+    Undo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -379,6 +385,22 @@ fn parse_dir(s: &str) -> Option<PDir> {
         _ => None,
     }
 }
+
+/// What undo restores: everything you set up, not where you're looking (cursor, zoom).
+#[derive(Debug, Clone)]
+struct Snapshot {
+    opts: ChartOpts,
+    timeframe: Timeframe,
+    hidden: Vec<String>,
+    show_stats: bool,
+    mark_rules: Vec<crate::marks::MarkRule>,
+    manual_marks: Vec<crate::render::Mark>,
+    /// For comparing setups (computed markers left out).
+    key: String,
+}
+
+/// How many steps undo remembers.
+const UNDO_DEPTH: usize = 100;
 
 /// Buttons at the bottom of the markers menu.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -491,6 +513,13 @@ pub struct App {
     marks_menu: Option<usize>,
     /// The console is editing this rule: the next `mark_when` replaces it.
     editing_rule: Option<usize>,
+    /// Earlier setups to go back to (Ctrl+Z / u), and undone ones to redo.
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    /// Panes put aside while side by side is on.
+    panes_before_side_by_side: Option<Panes>,
+    /// This event was an undo or redo (not a step of its own).
+    stepped: bool,
     /// The source picker for the focused pane: (label, source name).
     source_menu: Option<(Vec<SourceChoice>, usize)>,
     /// Where the chart area was last drawn (for pane taps and border drags).
@@ -565,6 +594,10 @@ impl App {
             manual_marks: Vec::new(),
             marks_menu: None,
             editing_rule: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            panes_before_side_by_side: None,
+            stepped: false,
             sub_views: Vec::new(),
             source_menu: None,
             chart_rect: std::cell::Cell::new(Rect::default()),
@@ -1692,10 +1725,19 @@ impl App {
     /// Side by side on: trends move to the right-hand chart, live data stays left.
     /// Off: the right-hand trends come back over the live data.
     fn toggle_side_by_side(&mut self) {
-        // From panes: back to a plain side by side.
-        if self.opts.panes.take().is_some() {
+        // From panes: side by side for now, and the panes come back when it's off.
+        if let Some(p) = self.opts.panes.take() {
             self.pane_menu = false;
+            self.panes_before_side_by_side = Some(p);
+            self.opts.side_by_side = true;
+            return;
+        }
+        if self.opts.side_by_side
+            && let Some(p) = self.panes_before_side_by_side.take()
+        {
             self.opts.side_by_side = false;
+            self.opts.panes = Some(p);
+            return;
         }
         self.opts.side_by_side = !self.opts.side_by_side;
         if self.opts.side_by_side {
@@ -2278,6 +2320,7 @@ impl App {
             Cmd::Targets => self.opts.show_targets = !self.opts.show_targets,
             Cmd::RangeStep(dir) => self.step_timeframe(dir),
             Cmd::Copy => self.copy(None),
+            Cmd::Undo => return self.step_back(),
             Cmd::Markers => {
                 self.marks_menu = match self.marks_menu {
                     Some(_) => None,
@@ -2445,6 +2488,12 @@ impl App {
             Action::Svg(path) => self.export_view(path),
             Action::Pane(a) => self.apply_pane_action(a),
             Action::Copy(text) => self.copy(text),
+            Action::Undo => {
+                self.step_back();
+            }
+            Action::Redo => {
+                self.step_forward();
+            }
             Action::MarkHere(label) => {
                 let x = self.cursor.or_else(|| self.ds.x_range().map(|r| r.1));
                 match x {
@@ -2534,15 +2583,126 @@ impl App {
     // ───────────── events ─────────────
 
     pub fn on_event(&mut self, ev: &TermEvent) -> Transition {
+        // Undo and redo themselves aren't steps.
+        if let TermEvent::Key(k) = ev
+            && k.kind == KeyEventKind::Press
+            && self.console.is_none()
+        {
+            let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+            match k.code {
+                KeyCode::Char('z') if ctrl => return self.step_back(),
+                KeyCode::Char('y') if ctrl => return self.step_forward(),
+                KeyCode::Char('Z') if ctrl => return self.step_forward(),
+                KeyCode::Char('u') if !ctrl && self.no_menu_open() => return self.step_back(),
+                KeyCode::Char('U') if !ctrl && self.no_menu_open() => return self.step_forward(),
+                _ => {}
+            }
+        }
+        let before = self.snapshot();
         let t = match ev {
             TermEvent::Key(k) if k.kind == KeyEventKind::Press => self.on_key(*k),
             TermEvent::Mouse(m) => self.on_mouse(*m),
             _ => Transition::None,
         };
+        let after_key = self.snapshot_key();
+        if !std::mem::take(&mut self.stepped) && after_key != before.key {
+            self.undo.push(before);
+            if self.undo.len() > UNDO_DEPTH {
+                self.undo.remove(0);
+            }
+            self.redo.clear();
+        }
         match (t, self.pending.take()) {
             (Transition::None, Some(p)) => p,
             (t, _) => t,
         }
+    }
+
+    fn no_menu_open(&self) -> bool {
+        !(self.lines_menu
+            || self.range_menu
+            || self.pane_menu
+            || self.help
+            || self.console_help
+            || self.source_menu.is_some()
+            || self.marks_menu.is_some())
+    }
+
+    fn snapshot_key(&self) -> String {
+        let opts = ChartOpts {
+            marks: Vec::new(),
+            ..self.opts.clone()
+        };
+        let mut hidden: Vec<&String> = self.hidden.iter().collect();
+        hidden.sort();
+        format!(
+            "{opts:?}|{:?}|{hidden:?}|{}|{:?}|{:?}",
+            self.timeframe, self.show_stats, self.mark_rules, self.manual_marks
+        )
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        let mut hidden: Vec<String> = self.hidden.iter().cloned().collect();
+        hidden.sort();
+        Snapshot {
+            opts: self.opts.clone(),
+            timeframe: self.timeframe,
+            hidden,
+            show_stats: self.show_stats,
+            mark_rules: self.mark_rules.clone(),
+            manual_marks: self.manual_marks.clone(),
+            key: self.snapshot_key(),
+        }
+    }
+
+    fn restore(&mut self, s: Snapshot) {
+        self.opts = s.opts;
+        self.timeframe = s.timeframe;
+        self.hidden = s.hidden.into_iter().collect();
+        self.show_stats = s.show_stats;
+        self.mark_rules = s.mark_rules;
+        self.manual_marks = s.manual_marks;
+        self.selection = None;
+        self.rebuild(true);
+        self.tick_sources(true);
+    }
+
+    /// Undo: back to the setup before the last change.
+    fn step_back(&mut self) -> Transition {
+        self.stepped = true;
+        match self.undo.pop() {
+            Some(prev) => {
+                self.redo.push(self.snapshot());
+                self.restore(prev);
+                let more = self.undo.len();
+                self.say(
+                    format!(
+                        "undone{} · Ctrl+Y / U redoes",
+                        if more > 0 {
+                            format!(" ({more} more)")
+                        } else {
+                            String::new()
+                        }
+                    ),
+                    false,
+                );
+            }
+            None => self.say("nothing to undo", false),
+        }
+        Transition::None
+    }
+
+    fn step_forward(&mut self) -> Transition {
+        self.stepped = true;
+        match self.redo.pop() {
+            Some(next) => {
+                self.undo.push(self.snapshot());
+                self.restore(next);
+                self.say("redone", false);
+            }
+            None => self.say("nothing to redo", false),
+        }
+        Transition::None
     }
 
     /// Whether an on/off button is on.
@@ -2996,6 +3156,9 @@ impl App {
             b("forecast", Cmd::Forecast).active(self.opts.forecast.is_some()),
             b("split", Cmd::Split).active(self.opts.split),
         ];
+        if !self.undo.is_empty() {
+            v.insert(0, b("↶ undo", Cmd::Undo));
+        }
         // Markers, once there are some (always under ⋯).
         if self.mark_rows() > 0 {
             v.push(
@@ -4572,6 +4735,52 @@ mod tests {
         );
         assert!(app.selection.is_none());
         assert!(!screen(&app).contains("selected 6 hours"));
+    }
+
+    #[test]
+    fn undo_redo_and_side_by_side_keeps_panes() {
+        let mut app = app(&[
+            "graft",
+            LOG,
+            "--pane",
+            "node1 kind=stat",
+            "--pane",
+            "node2",
+            "--layout",
+            "1 / 2",
+        ]);
+        let panes = app.opts.panes.clone();
+        // Side by side on and off again: the panes come back.
+        key(&mut app, KeyCode::Char('D'));
+        assert!(app.opts.side_by_side && app.opts.panes.is_none());
+        key(&mut app, KeyCode::Char('D'));
+        assert!(!app.opts.side_by_side);
+        assert_eq!(app.opts.panes, panes);
+        // Several changes, then undo them one by one (Ctrl+Z and u), and redo.
+        key(&mut app, KeyCode::Char('y')); // log scale
+        key(&mut app, KeyCode::Char('s')); // stats
+        key(&mut app, KeyCode::Right); // panning isn't a step
+        let ctrl_z = TermEvent::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        app.on_event(&ctrl_z);
+        assert!(app.opts.log && !app.show_stats);
+        key(&mut app, KeyCode::Char('u'));
+        assert!(!app.opts.log);
+        key(&mut app, KeyCode::Char('U'));
+        assert!(app.opts.log);
+        // The undo button, and the console.
+        let (x, y) = find(&app, "↶ undo");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert!(!app.opts.log);
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, "redo()");
+        key(&mut app, KeyCode::Enter);
+        assert!(app.opts.log);
+        // Back to the very start, panes and all.
+        while !app.undo.is_empty() {
+            app.on_event(&ctrl_z);
+        }
+        assert!(!app.opts.log && !app.opts.side_by_side);
+        assert_eq!(app.opts.panes, panes);
     }
 
     #[test]

@@ -397,6 +397,7 @@ mouse capture off, so your terminal's own text selection works.
 | `w` | pane panel (inside: `v` / `s` split right / down, `x` close, arrows pick, shift+arrows move, ctrl+arrows or `< > + -` resize, `=` even, `t` chart type, `T` lines, `1`–`9` series, `o` one chart) |
 | `Tab` / `Alt+arrows` | pick the next pane / the pane that way |
 | `K` | markers: edit, delete or add rules and markers |
+| `Ctrl+Z` / `u` | undo the last change (chart type, lines, panes, timeframe, markers…); `Ctrl+Y` / `U` redo. Also the **↶ undo** button once there's something to undo |
 | `f` / `G` | forecast / target lines on or off |
 | `R` / `[` `]` | timeframe dropdown / narrower, wider timeframe |
 | `F` | change the format or source (builder) |

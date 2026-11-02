@@ -72,6 +72,8 @@ pub enum Action {
     MarkHere(String),
     /// Remove every marker and marker rule.
     ClearMarks,
+    Undo,
+    Redo,
     /// Open the builder to change the format or source.
     Format,
 }
@@ -790,6 +792,10 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
     });
     let st = state.clone();
     engine.register_fn("clear_marks", move || push(&st, Action::ClearMarks));
+    let st = state.clone();
+    engine.register_fn("undo", move || push(&st, Action::Undo));
+    let st = state.clone();
+    engine.register_fn("redo", move || push(&st, Action::Redo));
     let st = state.clone();
     engine.register_fn("copy", move || push(&st, Action::Copy(None)));
     let st = state.clone();
