@@ -227,6 +227,12 @@ graft \
   --title ETH --last 15m
 ```
 
+With several live sources the chart redraws in rounds — once every one of them
+has sent something new — so a combined line moves once per round instead of
+each time one source happens to answer first (a stalled source can't freeze it:
+after about two of its intervals it redraws anyway). `--no-sync` redraws on
+every update instead.
+
 Sources sample at slightly different moments, so `mean_of([...])` and
 `values_at(name, xs)` line other series up on the first one's times. In the
 viewer: `:merge("binance = -c '…' --regex '…'")` adds one, `:unmerge("binance")`

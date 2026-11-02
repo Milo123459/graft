@@ -232,7 +232,7 @@ pub fn scenarios() -> Vec<(String, String)> {
         "-F",
         FMT,
         "--mark",
-        "delta < -400MB => {name} {delta}",
+        "delta < -400MB => {name} {delta} | ▼ red",
         "--mark",
         "name == \"node1\" && pct > 1 => node1 up {pct}",
     ]);

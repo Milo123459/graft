@@ -256,6 +256,11 @@ impl Sub {
         self.session.store.revision
     }
 
+    /// Still sending data (a command that keeps running, a followed file).
+    pub fn is_live(&self) -> bool {
+        self.live.spec.is_live() && !self.live.eof
+    }
+
     fn try_open(name: &str, interactive: bool) -> Result<Self> {
         Self::start(name, cli_for(name)?, interactive)
     }

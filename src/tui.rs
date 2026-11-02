@@ -593,6 +593,12 @@ pub struct App {
     shown_line_errors: Vec<String>,
     /// `--merge` sources, running.
     merge_subs: Vec<crate::sources::Sub>,
+    /// Live sources' revisions at the last redraw (for redrawing in rounds).
+    sync_revs: Vec<Option<u64>>,
+    /// The longest to wait for a full round before redrawing anyway.
+    sync_wait: Duration,
+    /// How many times the data was rebuilt (for tests).
+    builds: u64,
     /// Merged-source problems already reported.
     shown_merge_problems: Vec<String>,
     /// The alerts & notifications menu is open.
@@ -685,6 +691,9 @@ impl App {
             stepped: false,
             shown_line_errors: Vec::new(),
             merge_subs: Vec::new(),
+            sync_revs: Vec::new(),
+            sync_wait: Duration::from_secs(2),
+            builds: 0,
             shown_merge_problems: Vec::new(),
             alerts_menu: false,
             editing_alert: None,
@@ -834,10 +843,12 @@ impl App {
         if !force {
             // Throttle rebuilds while data is streaming in.
             let due = self.live.eof || self.last_build.elapsed() > Duration::from_millis(150);
-            if self.paused || rev == self.built_rev || !due {
+            if self.paused || rev == self.built_rev || !due || !self.round_complete() {
                 return;
             }
         }
+        self.sync_revs = self.source_revisions();
+        self.builds += 1;
         let old_max = self.ds.x_range().map(|r| r.1);
         self.full = self.session.base_dataset();
         self.apply_unit();
@@ -1587,7 +1598,7 @@ impl App {
             let r = Rect {
                 y,
                 height: 1,
-                width: inner.width.saturating_sub(25),
+                width: inner.width.saturating_sub(27),
                 ..inner
             };
             if y < inner.bottom() {
@@ -1601,18 +1612,19 @@ impl App {
                     r,
                 );
                 self.hits.push(r, Hit::EditRule(i));
-                if inner.width > 28 {
+                if inner.width > 30 {
                     let b = Rect {
-                        x: inner.right() - 24,
+                        x: inner.right() - 26,
                         y,
-                        width: 20,
+                        width: 22,
                         height: 1,
                     };
                     render_buttons(
                         &[
                             Button::new(rule.symbol(), Hit::CycleMarkSymbol(i)),
+                            // Fixed width, so the notify buttons line up row to row.
                             Button::new(
-                                rule.color.as_deref().unwrap_or("auto"),
+                                format!("{:<7}", rule.color.as_deref().unwrap_or("auto")),
                                 Hit::CycleMarkColor(i),
                             ),
                             Button::new("notify", Hit::ToggleMarkNotify(i)).active(rule.notify),
@@ -3333,9 +3345,51 @@ impl App {
         }
     }
 
+    /// Revisions of the live sources (the main one, then each --merge).
+    fn source_revisions(&self) -> Vec<Option<u64>> {
+        let main =
+            (self.live.spec.is_live() && !self.live.eof).then_some(self.session.store.revision);
+        std::iter::once(main)
+            .chain(
+                self.merge_subs
+                    .iter()
+                    .map(|m| m.is_live().then(|| m.revision())),
+            )
+            .collect()
+    }
+
+    /// With merged live sources, redraw in rounds: once every one of them has sent
+    /// something new — or after a while, so a stalled source can't freeze the chart.
+    fn round_complete(&self) -> bool {
+        if self.merge_subs.is_empty() || self.cli.no_sync {
+            return true;
+        }
+        let now = self.source_revisions();
+        let all_new = now
+            .iter()
+            .zip(self.sync_revs.iter().chain(std::iter::repeat(&None)))
+            .all(|(n, before)| match (n, before) {
+                (Some(n), Some(b)) => n != b,
+                // Not live (or newly live): nothing to wait for.
+                _ => true,
+            });
+        all_new || self.last_build.elapsed() > self.sync_wait
+    }
+
     /// Start the `--merge` sources (again, after the list changed).
     fn start_merges(&mut self) {
         self.merge_subs.clear();
+        // Wait at most about two samples of the slowest source for a full round.
+        let slowest = self
+            .cli
+            .merge
+            .iter()
+            .filter_map(|m| crate::sources::Merge::parse(m).ok())
+            .map(|m| m.cli().every)
+            .chain(std::iter::once(self.cli.every))
+            .max()
+            .unwrap_or(Duration::from_secs(1));
+        self.sync_wait = (slowest * 2).max(Duration::from_millis(500));
         for spec in self.cli.merge.clone() {
             match crate::sources::Merge::parse(&spec) {
                 Ok(m) => self
@@ -6059,6 +6113,46 @@ mod tests {
             field.y,
         );
         assert_eq!(app.console.as_ref().unwrap().cursor, 2);
+    }
+
+    #[test]
+    fn merged_live_sources_redraw_in_rounds() {
+        let run = |sync: bool| {
+            let mut args = vec![
+                "graft",
+                "-c",
+                "echo fast=1",
+                "-n",
+                "200ms",
+                "--kv",
+                "--merge",
+                "slow = -c 'sleep 0.5; echo v=2' -n 200ms --kv",
+            ];
+            if !sync {
+                args.push("--no-sync");
+            }
+            let cli = <Cli as clap::Parser>::parse_from(&args);
+            let spec = crate::setup::source_spec(&cli, true).unwrap();
+            let setup = crate::setup::build(cli, spec.clone(), false).unwrap();
+            let mut app = App::new(setup, Live::new(spec));
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(2600) {
+                app.tick();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                app.ds.series.iter().any(|s| s.name == "slow"),
+                "{:?}",
+                app.ds.series.iter().map(|s| &s.name).collect::<Vec<_>>()
+            );
+            app.builds
+        };
+        let (rounds, free) = (run(true), run(false));
+        // The slow source answers every ~0.7 s: about 3-4 rounds, against a redraw for
+        // nearly every fast sample without sync.
+        // (plus a few while starting up)
+        assert!(rounds <= 8, "{rounds} rebuilds in rounds");
+        assert!(free >= rounds + 3, "{free} without sync vs {rounds} with");
     }
 
     #[test]

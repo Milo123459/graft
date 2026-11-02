@@ -58,6 +58,11 @@ pub struct Cli {
     #[arg(long, value_name = "NAME[ = ARGS]", help_heading = "Input")]
     pub merge: Vec<String>,
 
+    /// With --merge, redraw as soon as any source has new data, instead of waiting
+    /// for a round with something new from every live source.
+    #[arg(long, help_heading = "Input")]
+    pub no_sync: bool,
+
     /// Name this source's series after NAME (several become NAME.series), like a
     /// --merge source.
     #[arg(long = "as", value_name = "NAME", help_heading = "Input")]
@@ -658,6 +663,7 @@ impl Cli {
             (self.trend_only, "--trend-only"),
             (self.side_by_side, "--side-by-side"),
             (self.no_targets, "--no-targets"),
+            (self.no_sync, "--no-sync"),
         ];
         a.extend(flags.iter().filter(|f| f.0).map(|f| f.1.to_string()));
         // Optional-value flags need `=`.
