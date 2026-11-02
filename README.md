@@ -342,11 +342,23 @@ Available functions:
   `eta(name, target)`, `forecast(name, seconds_ahead)`.
 - Data: `values`, `xs`.
 - Formatting: `fmt(name, v)`, `fmt_dur`, `fmt_time`, `bytes`.
-- Viewer actions: `hline(v[, label])`, `clear_hlines()`, `zoom("6h")`,
-  `reset()`, `show(name)`, `hide(name)`, `chart("bar")`,
-  `target(name, v)`, `clear_target(name)`, `forecast("7d" | "auto" | "off")`,
-  `range("7d" | "500" | "all")`, `trend("avg,median,p95" | "line" | "off")`, `raw(bool)`,
-  `side_by_side(bool)`.
+- Viewer actions — every toolbar button has one, so key bindings and the
+  console can do anything a tap can:
+  - `timeframe(1h)`, `timeframe("7d")`, `timeframe("500")` (points),
+    `timeframe("all")`, `timeframe("2026-11-01", "2026-11-02 12:00")`
+    (`""` as the end = until now); `range(…)` is the same
+  - `lines("live,avg,median,p95")` (any mix; `"line"` is the straight fit),
+    `window(50)` / `window("auto")` for the rolling window,
+    `trend("avg,p95" | "off")` sets just the trend layers
+  - on/off buttons: `live`, `side_by_side`, `stats`, `split`, `log`, `targets`,
+    `pause`, `follow`, `cursor`, `measure`, `mouse` — call with no argument
+    to toggle (`stats()`), or with a bool to set (`split(true)`)
+  - `forecast("7d" | "auto" | "off")`, `target(name, v)`, `clear_target(name)`,
+    `chart("bar")`, `show(name)`, `hide(name)`, `hline(v[, label])`,
+    `clear_hlines()`
+  - `zoom(6h)`, `zoom_in()`, `zoom_out()`, `pan("left" | "right" | -0.5)`,
+    `reset()`
+  - `svg()` / `svg("out.svg")`, `format()` (open the builder), `quit()`
 - Output: `print(...)`.
 
 Unit literals such as `50GB`, `200ms` and `1d` work in all expressions.

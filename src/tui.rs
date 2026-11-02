@@ -23,7 +23,7 @@ use crate::interactive::{Live, Transition};
 use crate::render::{
     ChartOpts, ChartWidget, HLine, Horizon, Overlay, PlotArea, plot_x_bounds, value_at,
 };
-use crate::script::{Action, display};
+use crate::script::{Action, Flag, display};
 use crate::session::Session;
 use crate::setup::Setup;
 use crate::stats::SeriesReport;
@@ -164,18 +164,27 @@ const CONSOLE_HELP: &[(&str, &str)] = &[
         "fmt_time(t)  bytes(v)",
         "a timestamp / a byte count, readable",
     ),
-    ("— changing the chart —", ""),
+    ("— every button has a command —", ""),
     (
-        "trend(\"avg,median\")",
-        "extra lines: avg, median, p95 (any mix), line, or \"off\"",
+        "timeframe(1h)",
+        "only recent data: 1h, 7d, \"500\" (points) or \"all\"",
     ),
     (
-        "raw(false)",
-        "hide the live data (trends only); raw(true) brings it back",
+        "timeframe(\"2026-11-01\", \"\")",
+        "from a time on (or between two times)",
     ),
     (
-        "side_by_side(true)",
-        "live data and its trends in two charts",
+        "lines(\"live,avg\")",
+        "which lines to show: live, avg, median, p95, line",
+    ),
+    ("window(50)", "points in the rolling average (\"auto\")"),
+    (
+        "stats() split() log()",
+        "toggle a button; or set it: stats(true), split(false)…",
+    ),
+    (
+        "side_by_side() targets()",
+        "also live() pause() follow() cursor() measure() mouse()",
     ),
     (
         "forecast(\"7d\")",
@@ -185,22 +194,23 @@ const CONSOLE_HELP: &[(&str, &str)] = &[
         "target(\"s\", 50GB)",
         "a forecast target for a series (clear_target(\"s\"))",
     ),
+    ("chart(\"bar\")", "line, scatter, bar, histogram, sparkline"),
+    ("show(\"s\")  hide(\"s\")", "show or hide a series"),
     (
-        "range(\"24h\")",
-        "only recent data (\"all\" for everything)",
+        "zoom(6h)  reset()",
+        "zoom to the last 6 hours / show everything",
     ),
     (
-        "zoom(\"6h\")  reset()",
-        "zoom to the last 6 hours / show everything",
+        "zoom_in() zoom_out()",
+        "pan(\"left\") pan(\"right\") — like the ◀ ▶ + − buttons",
     ),
     (
         "hline(50GB, \"label\")",
         "a reference line (clear_hlines() removes them)",
     ),
-    ("show(\"s\")  hide(\"s\")", "show or hide a series"),
     (
-        "chart(\"bar\")",
-        "chart type: line, scatter, bar, histogram, sparkline",
+        "svg(\"out.svg\")  format()  quit()",
+        "export / change the format / quit",
     ),
     ("print(x)", "show a value (several prints are joined)"),
     ("— examples —", ""),
@@ -219,6 +229,10 @@ const CONSOLE_HELP: &[(&str, &str)] = &[
     (
         "target(\"node1\", 50GB); forecast(\"auto\")",
         "aim for 50 GB and draw the forecast",
+    ),
+    (
+        "timeframe(6h); lines(\"live,median\"); stats(true)",
+        "several at once, separated by ;",
     ),
     (
         "",
@@ -335,6 +349,8 @@ pub struct App {
     lines_menu: bool,
     /// The timeframe dropdown is open.
     range_menu: bool,
+    /// A transition requested by the console or a key binding (quit, builder, mouse).
+    pending: Option<Transition>,
     hits: Hits<Hit>,
     plots: RefCell<Vec<PlotArea>>,
     /// The part of the data shown and analysed.
@@ -397,6 +413,7 @@ impl App {
             horizon,
             lines_menu: false,
             range_menu: false,
+            pending: None,
             hits: Hits::default(),
             plots: RefCell::new(Vec::new()),
             timeframe,
@@ -617,7 +634,7 @@ impl App {
         }
     }
 
-    fn export_view(&mut self) {
+    fn export_view(&mut self, path: Option<String>) {
         let mut ds = self.ds.clone();
         ds.series.retain(|s| !self.hidden.contains(&s.name));
         if let Some((a, b)) = self.view {
@@ -625,7 +642,9 @@ impl App {
                 .iter_mut()
                 .for_each(|s| s.points = s.range(a, b).to_vec());
         }
-        let name = format!("graft-{}.svg", chrono::Local::now().format("%Y%m%d-%H%M%S"));
+        let name = path.unwrap_or_else(|| {
+            format!("graft-{}.svg", chrono::Local::now().format("%Y%m%d-%H%M%S"))
+        });
         match crate::export::export(std::path::Path::new(&name), &ds, &self.opts) {
             Ok(()) => self.say(format!("saved {name}"), false),
             Err(e) => self.say(format!("export failed: {e:#}"), true),
@@ -1146,7 +1165,7 @@ impl App {
             }
             Cmd::Format => return Transition::OpenBuilder,
             Cmd::Console => self.console = Some(TextInput::default()),
-            Cmd::Export => self.export_view(),
+            Cmd::Export => self.export_view(None),
             Cmd::Help => {
                 self.help = !self.help;
                 self.help_scroll = 0;
@@ -1192,8 +1211,17 @@ impl App {
         script.set_data(self.full.clone(), self.focus());
         let result = script.eval(code);
         let printed = script.take_output();
+        self.message = None;
         for action in script.take_actions() {
             self.apply(action);
+        }
+        // A command that complained (e.g. an unknown line name) keeps its message.
+        if self.message.as_ref().is_some_and(|m| m.error) {
+            return;
+        }
+        // …and so does one that explained itself (e.g. "timeframe: 6h — …").
+        if self.message.is_some() && printed.is_empty() && matches!(&result, Ok(v) if v.is_unit()) {
+            return;
         }
         match result {
             Ok(v) => {
@@ -1252,13 +1280,57 @@ impl App {
                     Err(_) => self.say(format!("trend: use avg, median, p95 or line (comma separated), or \"off\" — not \"{list}\""), true),
                 },
             },
-            Action::Raw(on) => {
-                self.opts.show_raw = on;
-                if !on && self.opts.trends.is_empty() {
-                    self.opts.trends.push(TrendStyle::Avg);
+            Action::Lines(list) => {
+                let mut live = false;
+                let mut trends = Vec::new();
+                for x in list.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+                    match x {
+                        "live" | "raw" | "data" => live = true,
+                        other => match TrendStyle::from_str(other, true) {
+                            Ok(t) if !trends.contains(&t) => trends.push(t),
+                            Ok(_) => {}
+                            Err(_) => {
+                                return self.say(
+                                    format!("lines: use live, avg, median, p95 or line (comma separated) — not \"{other}\""),
+                                    true,
+                                );
+                            }
+                        },
+                    }
+                }
+                trends.sort_by_key(|x| TrendStyle::ALL.iter().position(|a| a == x));
+                self.opts.show_raw = live || trends.is_empty();
+                self.opts.trends = trends;
+            }
+            Action::TrendWindow(n) => self.opts.trend_window = n,
+            Action::RangeNumber(v) => {
+                let w = if self.full.x_kind == crate::data::XKind::Time {
+                    Window::Span(v.abs())
+                } else {
+                    Window::Points(v.abs().round().max(1.0) as usize)
+                };
+                self.set_timeframe(Timeframe::last(w));
+            }
+            Action::Between(a, b) => {
+                let mut cli = self.current_cli();
+                cli.last = None;
+                cli.since = Some(a);
+                cli.until = b;
+                match crate::setup::timeframe(&cli) {
+                    Ok(tf) => self.set_timeframe(tf),
+                    Err(e) => self.say(format!("timeframe: {e:#}"), true),
                 }
             }
-            Action::SideBySide(on) => self.opts.side_by_side = on,
+            Action::Flag(flag, on) => self.set_flag(flag, on),
+            Action::Pan(f) => self.pan(f),
+            Action::ZoomStep(zoom_in) => self.zoom_at(if zoom_in { 0.5 } else { 2.0 }, None),
+            Action::Svg(path) => self.export_view(path),
+            Action::Help => {
+                self.help = true;
+                self.help_scroll = 0;
+            }
+            Action::Quit => self.pending = Some(Transition::Quit),
+            Action::Format => self.pending = Some(Transition::OpenBuilder),
             Action::Range(r) => match r.map(|r| parse_window(&r)).transpose() {
                 Ok(w) => self.set_timeframe(w.map_or_else(Timeframe::default, Timeframe::last)),
                 Err(e) => self.say(format!("range: {e}"), true),
@@ -1301,10 +1373,55 @@ impl App {
     // ───────────── events ─────────────
 
     pub fn on_event(&mut self, ev: &TermEvent) -> Transition {
-        match ev {
+        let t = match ev {
             TermEvent::Key(k) if k.kind == KeyEventKind::Press => self.on_key(*k),
             TermEvent::Mouse(m) => self.on_mouse(*m),
             _ => Transition::None,
+        };
+        match (t, self.pending.take()) {
+            (Transition::None, Some(p)) => p,
+            (t, _) => t,
+        }
+    }
+
+    /// Whether an on/off button is on.
+    fn flag(&self, flag: Flag) -> bool {
+        match flag {
+            Flag::Live => self.opts.show_raw || self.opts.trends.is_empty(),
+            Flag::SideBySide => self.opts.side_by_side,
+            Flag::Stats => self.show_stats,
+            Flag::Split => self.opts.split,
+            Flag::Log => self.opts.log,
+            Flag::Targets => self.opts.show_targets,
+            Flag::Pause => self.paused,
+            Flag::Follow => self.follow_pointer,
+            Flag::Cursor => self.cursor.is_some(),
+            Flag::Mouse => self.mouse,
+            Flag::Measure => self.measuring || self.anchor.is_some() || self.selection.is_some(),
+        }
+    }
+
+    /// Set (or toggle, with `None`) an on/off button, as if it were tapped.
+    fn set_flag(&mut self, flag: Flag, on: Option<bool>) {
+        if on == Some(self.flag(flag)) {
+            return;
+        }
+        let cmd = match flag {
+            Flag::Live => return self.toggle_layer(None),
+            Flag::SideBySide => Cmd::SideBySide,
+            Flag::Stats => Cmd::Stats,
+            Flag::Split => Cmd::Split,
+            Flag::Log => Cmd::Log,
+            Flag::Targets => Cmd::Targets,
+            Flag::Pause => Cmd::Pause,
+            Flag::Follow => Cmd::Follow,
+            Flag::Cursor => Cmd::Cursor,
+            Flag::Mouse => Cmd::Mouse,
+            Flag::Measure => Cmd::Select,
+        };
+        let t = self.run_cmd(cmd);
+        if t != Transition::None {
+            self.pending = Some(t);
         }
     }
 
@@ -2565,6 +2682,44 @@ mod tests {
         let cli = app.current_cli();
         assert_eq!(cli.trend, [TrendStyle::Avg, TrendStyle::P95]);
         assert!(cli.side_by_side);
+    }
+
+    #[test]
+    fn every_button_has_a_console_command() {
+        let mut app = app(&["graft", LOG]);
+        let run = |app: &mut App, code: &str| {
+            key(app, KeyCode::Char(':'));
+            type_str(app, code);
+            key(app, KeyCode::Enter);
+        };
+        run(&mut app, "timeframe(6h)");
+        assert_eq!(app.timeframe.last, Some(Window::Span(21600.0)));
+        run(&mut app, "timeframe(\"2026-11-02\", \"2026-11-02 03:00\")");
+        assert_eq!(app.ds.series[0].points.len(), 4);
+        run(&mut app, "timeframe(\"all\")");
+        assert!(app.timeframe.is_all());
+        run(&mut app, "lines(\"median,live\"); window(5)");
+        assert!(app.opts.show_raw && app.opts.trends == [TrendStyle::Median]);
+        assert_eq!(app.opts.trend_window, Some(5));
+        run(&mut app, "lines(\"avg\")");
+        assert!(!app.opts.show_raw && app.opts.trends == [TrendStyle::Avg]);
+        run(&mut app, "lines(\"bogus\")");
+        assert!(app.message.as_ref().is_some_and(|m| m.error));
+        run(
+            &mut app,
+            "stats(); split(true); split(true); log(); targets(false)",
+        );
+        assert!(app.show_stats && app.opts.split && app.opts.log && !app.opts.show_targets);
+        run(&mut app, "stats(); log(false); pause(true); cursor(true)");
+        assert!(!app.show_stats && !app.opts.log && app.paused && app.cursor.is_some());
+        run(&mut app, "zoom_in(); pan(\"left\")");
+        assert!(app.view.is_some());
+        run(&mut app, "reset()");
+        assert!(app.view.is_none());
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, "quit()");
+        let t = app.on_event(&TermEvent::Key(KeyEvent::from(KeyCode::Enter)));
+        assert_eq!(t, Transition::Quit);
     }
 
     #[test]

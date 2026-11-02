@@ -42,12 +42,61 @@ pub enum Action {
     Forecast(Option<String>),
     /// Timeframe (`"7d"`, `"500"`), or `None` for all data.
     Range(Option<String>),
-    /// Trend lines: "fit"/"line", "avg"/"average", or `None` for off.
+    /// Trend lines: a comma list ("avg,median,p95", "line"), or `None` for off.
     Trend(Option<String>),
-    /// Show the raw data (false = trend only).
-    Raw(bool),
-    SideBySide(bool),
+    /// Every line to show, including "live": "live,avg".
+    Lines(String),
+    /// Points in the rolling window (`None` = automatic).
+    TrendWindow(Option<usize>),
+    /// Timeframe as a number: seconds on a time axis, else a point count.
+    RangeNumber(f64),
+    /// Timeframe between two times (`until` open-ended when `None`).
+    Between(String, Option<String>),
+    /// An on/off toolbar button: `Some` sets it, `None` toggles.
+    Flag(Flag, Option<bool>),
+    /// Move the view by a fraction of its width (negative = left).
+    Pan(f64),
+    /// Zoom in (`true`) or out one step.
+    ZoomStep(bool),
+    /// Write the view to an SVG (default name when `None`).
+    Svg(Option<String>),
+    Help,
+    Quit,
+    /// Open the builder to change the format or source.
+    Format,
 }
+
+/// Toolbar buttons that are on or off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flag {
+    Live,
+    SideBySide,
+    Stats,
+    Split,
+    Log,
+    Targets,
+    Pause,
+    Follow,
+    Cursor,
+    Mouse,
+    Measure,
+}
+
+/// Script names of the on/off buttons. Each takes an optional bool (none = toggle).
+pub const FLAGS: &[(&str, Flag)] = &[
+    ("live", Flag::Live),
+    ("raw", Flag::Live),
+    ("side_by_side", Flag::SideBySide),
+    ("stats", Flag::Stats),
+    ("split", Flag::Split),
+    ("log", Flag::Log),
+    ("targets", Flag::Targets),
+    ("pause", Flag::Pause),
+    ("follow", Flag::Follow),
+    ("cursor", Flag::Cursor),
+    ("mouse", Flag::Mouse),
+    ("measure", Flag::Measure),
+];
 
 /// State shared between the host and registered functions.
 #[derive(Debug, Default)]
@@ -526,19 +575,92 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
             Action::Trend((!matches!(t, "off" | "none" | "false")).then(|| t.to_string())),
         );
     });
+    for &(name, flag) in FLAGS {
+        let st = state.clone();
+        engine.register_fn(name, move |on: bool| {
+            push(&st, Action::Flag(flag, Some(on)))
+        });
+        let st = state.clone();
+        engine.register_fn(name, move || push(&st, Action::Flag(flag, None)));
+    }
     let st = state.clone();
-    engine.register_fn("raw", move |on: bool| push(&st, Action::Raw(on)));
-    let st = state.clone();
-    engine.register_fn("side_by_side", move |on: bool| {
-        push(&st, Action::SideBySide(on))
+    engine.register_fn("lines", move |l: &str| {
+        push(&st, Action::Lines(l.to_string()))
     });
     let st = state.clone();
-    engine.register_fn("range", move |r: &str| {
-        push(
-            &st,
-            Action::Range((!matches!(r, "all" | "off" | "none")).then(|| r.to_string())),
-        );
+    engine.register_fn("window", move |w: Dynamic| -> FnResult<()> {
+        let n = match w.clone().into_immutable_string() {
+            Ok(s) if s == "auto" => None,
+            Ok(s) => Some(
+                s.trim()
+                    .parse::<usize>()
+                    .map_err(|_| "window needs a number of points, or \"auto\"")?,
+            ),
+            Err(_) => Some(
+                dyn_to_f64(&w)
+                    .ok_or("window needs a number of points, or \"auto\"")?
+                    .round()
+                    .max(1.0) as usize,
+            ),
+        };
+        push(&st, Action::TrendWindow(n));
+        Ok(())
     });
+    // `timeframe` is the toolbar button's name; `range` the original one.
+    for name in ["range", "timeframe"] {
+        let st = state.clone();
+        engine.register_fn(name, move |r: Dynamic| -> FnResult<()> {
+            match r.clone().into_immutable_string() {
+                Ok(s) => push(
+                    &st,
+                    Action::Range(
+                        (!matches!(s.as_str(), "all" | "off" | "none")).then(|| s.to_string()),
+                    ),
+                ),
+                Err(_) => push(
+                    &st,
+                    Action::RangeNumber(
+                        dyn_to_f64(&r).ok_or("timeframe needs e.g. 1h, \"7d\", 500 or \"all\"")?,
+                    ),
+                ),
+            }
+            Ok(())
+        });
+        let st = state.clone();
+        engine.register_fn(name, move |a: &str, b: &str| {
+            push(
+                &st,
+                Action::Between(a.to_string(), (!b.is_empty()).then(|| b.to_string())),
+            )
+        });
+    }
+    let st = state.clone();
+    engine.register_fn("pan", move |by: Dynamic| -> FnResult<()> {
+        let f = match by.clone().into_immutable_string() {
+            Ok(s) if s == "left" => -0.2,
+            Ok(s) if s == "right" => 0.2,
+            Ok(_) => return Err("pan needs \"left\", \"right\" or a fraction of the view (-0.5 = half a screen left)".into()),
+            Err(_) => dyn_to_f64(&by).ok_or("pan needs \"left\" or \"right\"")?,
+        };
+        push(&st, Action::Pan(f));
+        Ok(())
+    });
+    let st = state.clone();
+    engine.register_fn("zoom_in", move || push(&st, Action::ZoomStep(true)));
+    let st = state.clone();
+    engine.register_fn("zoom_out", move || push(&st, Action::ZoomStep(false)));
+    let st = state.clone();
+    engine.register_fn("svg", move || push(&st, Action::Svg(None)));
+    let st = state.clone();
+    engine.register_fn("svg", move |path: &str| {
+        push(&st, Action::Svg(Some(path.to_string())))
+    });
+    let st = state.clone();
+    engine.register_fn("help", move || push(&st, Action::Help));
+    let st = state.clone();
+    engine.register_fn("quit", move || push(&st, Action::Quit));
+    let st = state.clone();
+    engine.register_fn("format", move || push(&st, Action::Format));
     let st = state.clone();
     engine.register_fn("clear_target", move |n: &str| {
         push(&st, Action::Target(n.into(), None))
