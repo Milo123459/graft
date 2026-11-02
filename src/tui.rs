@@ -452,8 +452,19 @@ struct Snapshot {
     mark_rules: Vec<crate::marks::MarkRule>,
     manual_marks: Vec<crate::render::Mark>,
     custom: Vec<crate::lines::CustomLine>,
+    alerts: Vec<String>,
+    /// Settings kept only in the configuration: title, unit, hlines, notify targets.
+    cli_bits: CliBits,
     /// For comparing setups (computed markers left out).
     key: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CliBits {
+    title: Option<String>,
+    unit: Option<String>,
+    hline: Vec<String>,
+    notify: Vec<String>,
 }
 
 /// How many steps undo remembers.
@@ -739,13 +750,12 @@ impl App {
         c.trend_only = !self.opts.trends.is_empty() && !self.opts.show_raw;
         c.trend_window = self.opts.trend_window;
         c.right_panel = self.opts.side_by_side.then(|| self.opts.right.clone());
-        c.pane = self
-            .opts
-            .panes
+        let panes = self.opts.panes.as_ref().filter(|_| !self.trivial_panes());
+        c.pane = panes
             .iter()
             .flat_map(|p| p.panes.iter().map(Pane::to_spec))
             .collect();
-        c.layout = self.opts.panes.as_ref().map(Panes::layout_expr);
+        c.layout = panes.map(|p| p.layout_expr());
         c.mark = self.mark_rules.iter().map(|r| r.to_spec()).collect();
         c.line = self.session.custom.iter().map(|l| l.to_spec()).collect();
         c.alert = self.alerts.clone();
@@ -907,6 +917,15 @@ impl App {
         }
     }
 
+    /// Rule `removed` is gone: the rule being edited moves up (or is gone too).
+    fn shift_editing_rule(&mut self, removed: usize) {
+        self.editing_rule = match self.editing_rule {
+            Some(i) if i == removed => None,
+            Some(i) if i > removed => Some(i - 1),
+            other => other,
+        };
+    }
+
     /// Place markers from the rules (and those set by hand) on the current data.
     fn update_marks(&mut self) {
         let mut new = self.session.script.take_mark_rules();
@@ -929,8 +948,20 @@ impl App {
             crate::marks::evaluate(&self.session.script, &self.mark_rules, &self.ds);
         if let Some(e) = errors.into_iter().next() {
             // Each failing rule is dropped so the message isn't repeated on every update.
-            self.mark_rules
-                .retain(|r| !e.contains(&format!("mark '{}'", r.expr)));
+            let before = self.mark_rules.len();
+            let mut k = 0;
+            while k < self.mark_rules.len() {
+                if e.contains(&format!("mark '{}'", self.mark_rules[k].expr)) {
+                    self.mark_rules.remove(k);
+                    self.shift_editing_rule(k);
+                } else {
+                    k += 1;
+                }
+            }
+            if self.mark_rules.len() != before {
+                // Markers point at rules by position: place them again.
+                marks = crate::marks::evaluate(&self.session.script, &self.mark_rules, &self.ds).0;
+            }
             self.say(e, true);
         }
         // Notifying rules: tell about markers newer than any told about before. On a
@@ -938,7 +969,9 @@ impl App {
         // History: before any data, or while the source is first being read.
         let catching_up = self.ds.series.iter().all(|s| s.points.is_empty())
             || self.started.elapsed() < Duration::from_secs(2);
-        let live = self.live.spec.is_live() && !catching_up;
+        // Live: the main source, or any merged into it (e.g. price feeds over a file).
+        let live = (self.live.spec.is_live() || self.merge_subs.iter().any(|m| m.is_live()))
+            && !catching_up;
         let mut news = Vec::new();
         for (i, rule) in self.mark_rules.iter().enumerate().filter(|(_, r)| r.notify) {
             let newest = marks
@@ -1036,7 +1069,31 @@ impl App {
             .enumerate()
             .filter(|(_, t)| t.contains(':'))
             .collect();
-        let rows = self.alerts.len().max(1) + notifying.len().max(1) + custom.len() + 11;
+        let on = |t: &str| self.cli.notify.iter().any(|x| x == t);
+        let target_buttons = vec![
+            Button::new("bell", Hit::ToggleTarget("bell"))
+                .active(on("bell") || self.cli.notify.is_empty()),
+            Button::new("desktop", Hit::ToggleTarget("desktop")).active(on("desktop")),
+            Button::new("+ ntfy (phone)", Hit::AddTarget("ntfy")),
+            Button::new("+ webhook", Hit::AddTarget("webhook")),
+            Button::new("+ command", Hit::AddTarget("cmd")),
+        ];
+        let action_buttons = vec![
+            Button::new("+ add alert", Hit::EditAlert(None)),
+            Button::new("send a test", Hit::TestNotify),
+            Button::new("done", Hit::CloseAlerts),
+        ];
+        // On a narrow screen the buttons wrap: make room for every row of them.
+        let inner_w = w.saturating_sub(2);
+        let (target_h, action_h) = (
+            flow_height(&target_buttons, inner_w),
+            flow_height(&action_buttons, inner_w),
+        );
+        let rows = self.alerts.len().max(1)
+            + notifying.len().max(1)
+            + custom.len()
+            + 9
+            + (target_h + action_h) as usize;
         let h = (rows as u16).min(area.height);
         let rect = Rect {
             x: (area.width - w) / 2,
@@ -1145,18 +1202,19 @@ impl App {
             f.render_widget(Line::styled("send notifications to", head), row(y));
             y += 1;
         }
+        let rows_at = |y: u16, n: u16| Rect {
+            y,
+            height: n.min(inner.bottom().saturating_sub(y)),
+            ..inner
+        };
         if y < inner.bottom() {
-            let on = |t: &str| self.cli.notify.iter().any(|x| x == t);
-            let buttons = vec![
-                Button::new("bell", Hit::ToggleTarget("bell"))
-                    .active(on("bell") || self.cli.notify.is_empty()),
-                Button::new("desktop", Hit::ToggleTarget("desktop")).active(on("desktop")),
-                Button::new("+ ntfy (phone)", Hit::AddTarget("ntfy")),
-                Button::new("+ webhook", Hit::AddTarget("webhook")),
-                Button::new("+ command", Hit::AddTarget("cmd")),
-            ];
-            render_buttons(&buttons, row(y), f.buffer_mut(), &self.hits);
-            y += 1;
+            render_buttons(
+                &target_buttons,
+                rows_at(y, target_h),
+                f.buffer_mut(),
+                &self.hits,
+            );
+            y += target_h;
         }
         for (i, t) in custom {
             if y >= inner.bottom() {
@@ -1174,12 +1232,12 @@ impl App {
         }
         y += 1;
         if y < inner.bottom() {
-            let buttons = vec![
-                Button::new("+ add alert", Hit::EditAlert(None)),
-                Button::new("send a test", Hit::TestNotify),
-                Button::new("done", Hit::CloseAlerts),
-            ];
-            render_buttons(&buttons, row(y), f.buffer_mut(), &self.hits);
+            render_buttons(
+                &action_buttons,
+                rows_at(y, action_h),
+                f.buffer_mut(),
+                &self.hits,
+            );
         }
         if inner.height > 0 {
             f.render_widget(
@@ -1461,6 +1519,7 @@ impl App {
     fn delete_mark_row(&mut self, row: usize) {
         if row < self.mark_rules.len() {
             self.mark_rules.remove(row);
+            self.shift_editing_rule(row);
         } else if row - self.mark_rules.len() < self.manual_marks.len() {
             self.manual_marks.remove(row - self.mark_rules.len());
         }
@@ -1475,6 +1534,7 @@ impl App {
         match a {
             MarkAction::AddRule => {
                 self.marks_menu = None;
+                self.editing_rule = None;
                 self.console = Some(TextInput::new("mark_when(\""));
                 self.say(
                     "e.g. mark_when(\"delta < -1GB\", \"dropped {delta}\") · value prev delta pct rate time name",
@@ -1483,10 +1543,12 @@ impl App {
             }
             MarkAction::MarkNow => {
                 self.marks_menu = None;
+                self.editing_rule = None;
                 self.console = Some(TextInput::new("mark(\""));
                 self.say("label the marker, e.g. mark(\"router reboot\") (at the cursor, else the newest data)", false);
             }
             MarkAction::ClearAll => {
+                self.editing_rule = None;
                 self.mark_rules.clear();
                 self.manual_marks.clear();
                 self.update_marks();
@@ -1772,7 +1834,7 @@ impl App {
     fn pane_op(&mut self, op: PaneOp) {
         let area = self.chart_rect.get();
         match op {
-            PaneOp::Done => return self.pane_menu = false,
+            PaneOp::Done => return self.close_pane_menu(),
             PaneOp::Single => {
                 // Keep the focused pane's lines and chart type for the single chart.
                 if let Some(p) = self.focused_pane().cloned() {
@@ -2913,8 +2975,10 @@ impl App {
                 );
             }
             Cmd::Panes => {
-                self.pane_menu = !self.pane_menu;
                 if self.pane_menu {
+                    self.close_pane_menu();
+                } else {
+                    self.pane_menu = true;
                     self.ensure_panes();
                 }
             }
@@ -2993,12 +3057,22 @@ impl App {
 
     fn apply(&mut self, action: Action) {
         match action {
-            Action::HLine(value, label) => self.opts.hlines.push(HLine {
-                value,
-                color: Some(Color::Red),
-                label,
-            }),
-            Action::ClearHLines => self.opts.hlines.clear(),
+            Action::HLine(value, label) => {
+                // Kept in the configuration too, so it's saved with the chart.
+                self.cli.hline.push(match &label {
+                    Some(l) => format!("{value}:red:{l}"),
+                    None => format!("{value}:red"),
+                });
+                self.opts.hlines.push(HLine {
+                    value,
+                    color: Some(Color::Red),
+                    label,
+                })
+            }
+            Action::ClearHLines => {
+                self.cli.hline.clear();
+                self.opts.hlines.clear()
+            }
             Action::Zoom(span) => {
                 if let Some((_, b)) = self.ds.x_range() {
                     self.set_view(b - span, b);
@@ -3090,10 +3164,17 @@ impl App {
             Action::Between(a, b) => {
                 let mut cli = self.current_cli();
                 cli.last = None;
-                cli.since = Some(a);
-                cli.until = b;
+                cli.since = Some(a.clone());
+                cli.until = b.clone();
                 match crate::setup::timeframe(&cli) {
-                    Ok(tf) => self.set_timeframe(tf),
+                    Ok(tf) => {
+                        // Kept as written ("2026-11-01", "yesterday") so profiles and
+                        // recent charts reopen on the same range.
+                        self.cli.last = None;
+                        self.cli.since = Some(a);
+                        self.cli.until = b;
+                        self.set_timeframe(tf)
+                    }
                     Err(e) => self.say(format!("timeframe: {e:#}"), true),
                 }
             }
@@ -3135,6 +3216,7 @@ impl App {
                 self.check_alerts();
             }
             Action::Unalert(expr) => {
+                self.editing_alert = None;
                 let before = self.alerts.len();
                 self.alerts.retain(|a| a.trim() != expr.trim());
                 if self.alerts.len() == before {
@@ -3289,6 +3371,10 @@ impl App {
                     self.history.push(code.clone());
                     self.eval(&code);
                 }
+                // An edit ends with this command, whatever it was: a later rule or alert
+                // (from a key binding, say) mustn't replace the one that was being edited.
+                self.editing_rule = None;
+                self.editing_alert = None;
             }
             KeyCode::Up | KeyCode::Down if !self.history.is_empty() => {
                 let last = self.history.len() - 1;
@@ -3320,8 +3406,17 @@ impl App {
                 KeyCode::Char('z') if ctrl => return self.step_back(),
                 KeyCode::Char('y') if ctrl => return self.step_forward(),
                 KeyCode::Char('Z') if ctrl => return self.step_forward(),
-                KeyCode::Char('u') if !ctrl && self.no_menu_open() => return self.step_back(),
-                KeyCode::Char('U') if !ctrl && self.no_menu_open() => return self.step_forward(),
+                // Unless you've bound u / U to something else.
+                KeyCode::Char('u')
+                    if !ctrl && self.no_menu_open() && !self.binds.contains_key(&'u') =>
+                {
+                    return self.step_back();
+                }
+                KeyCode::Char('U')
+                    if !ctrl && self.no_menu_open() && !self.binds.contains_key(&'U') =>
+                {
+                    return self.step_forward();
+                }
                 _ => {}
             }
         }
@@ -3439,20 +3534,57 @@ impl App {
             || self.alerts_menu)
     }
 
+    fn cli_bits(&self) -> CliBits {
+        CliBits {
+            title: self.cli.title.clone(),
+            unit: self.cli.unit.clone(),
+            hline: self.cli.hline.clone(),
+            notify: self.cli.notify.clone(),
+        }
+    }
+
+    /// The single pane opening the pane panel makes, unchanged: the same as no panes.
+    fn trivial_panes(&self) -> bool {
+        self.opts.panes.as_ref().is_some_and(|p| {
+            p.count() == 1
+                && p.panes[0].series.is_empty()
+                && p.panes[0].kind.is_none()
+                && p.panes[0].source.is_none()
+                && p.panes[0]
+                    .lines
+                    .as_ref()
+                    .is_none_or(|l| *l == self.global_lines())
+        })
+    }
+
+    fn close_pane_menu(&mut self) {
+        self.pane_menu = false;
+        if self.trivial_panes() {
+            self.opts.panes = None;
+        }
+    }
+
     fn snapshot_key(&self) -> String {
         let opts = ChartOpts {
             marks: Vec::new(),
+            panes: if self.trivial_panes() {
+                None
+            } else {
+                self.opts.panes.clone()
+            },
             ..self.opts.clone()
         };
         let mut hidden: Vec<&String> = self.hidden.iter().collect();
         hidden.sort();
         format!(
-            "{opts:?}|{:?}|{hidden:?}|{}|{:?}|{:?}|{:?}",
+            "{opts:?}|{:?}|{hidden:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}",
             self.timeframe,
             self.show_stats,
             self.mark_rules,
             self.manual_marks,
-            self.session.custom
+            self.session.custom,
+            self.alerts,
+            self.cli_bits()
         )
     }
 
@@ -3467,6 +3599,8 @@ impl App {
             mark_rules: self.mark_rules.clone(),
             manual_marks: self.manual_marks.clone(),
             custom: self.session.custom.clone(),
+            alerts: self.alerts.clone(),
+            cli_bits: self.cli_bits(),
             key: self.snapshot_key(),
         }
     }
@@ -3479,9 +3613,19 @@ impl App {
         self.mark_rules = s.mark_rules;
         self.manual_marks = s.manual_marks;
         self.session.custom = s.custom;
+        self.alerts = s.alerts;
+        self.cli.title = s.cli_bits.title;
+        self.cli.unit = s.cli_bits.unit;
+        self.cli.hline = s.cli_bits.hline;
+        self.cli.notify = s.cli_bits.notify;
+        self.editing_rule = None;
+        self.editing_alert = None;
+        // The pane panel works on panes: it closes with them.
+        self.pane_menu &= self.opts.panes.is_some();
         self.selection = None;
         self.rebuild(true);
         self.tick_sources(true);
+        self.check_alerts();
     }
 
     /// Undo: back to the setup before the last change.
@@ -3695,8 +3839,10 @@ impl App {
                 return Transition::None;
             }
             KeyCode::Char('w') => {
-                self.pane_menu = !self.pane_menu;
                 if self.pane_menu {
+                    self.close_pane_menu();
+                } else {
+                    self.pane_menu = true;
                     self.ensure_panes();
                 }
                 return Transition::None;
@@ -3864,6 +4010,11 @@ impl App {
                         Hit::DeleteAlert(i) => {
                             if i < self.alerts.len() {
                                 self.alerts.remove(i);
+                                self.editing_alert = match self.editing_alert {
+                                    Some(e) if e == i => None,
+                                    Some(e) if e > i => Some(e - 1),
+                                    other => other,
+                                };
                                 self.check_alerts();
                             }
                             Transition::None
@@ -4039,7 +4190,13 @@ impl App {
                 }
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                if let Some(plot) = self.plot_at(col, row) {
+                // A menu drawn over the chart: the scroll is meant for it, not the chart.
+                let over_menu = self.lines_menu
+                    || self.range_menu
+                    || self.source_menu.is_some()
+                    || self.marks_menu.is_some()
+                    || self.alerts_menu;
+                if !over_menu && let Some(plot) = self.plot_at(col, row) {
                     // Small steps: trackpads send many events per swipe.
                     let up = m.kind == MouseEventKind::ScrollUp;
                     if m.modifiers.contains(KeyModifiers::SHIFT) {
@@ -4160,15 +4317,21 @@ impl App {
     }
 
     fn chips(&self) -> Vec<Button<Hit>> {
-        self.ds
-            .series
+        // With panes, the picked pane's series (it may have a source of its own): a
+        // chip's index is what toggle_series gets.
+        let names: Vec<String> = if self.opts.panes.is_some() {
+            self.pane_series_names()
+        } else {
+            self.ds.series.iter().map(|s| s.name.clone()).collect()
+        };
+        names
             .iter()
             .enumerate()
-            .map(|(i, s)| {
-                let shown = !self.hidden.contains(&s.name)
-                    && self.focused_pane().is_none_or(|p| p.shows(&s.name));
+            .map(|(i, name)| {
+                let shown = !self.hidden.contains(name)
+                    && self.focused_pane().is_none_or(|p| p.shows(name));
                 Button::new(
-                    format!("{} {}", if shown { "●" } else { "○" }, s.name),
+                    format!("{} {name}", if shown { "●" } else { "○" }),
                     Hit::Series(i),
                 )
                 .active(shown)
@@ -6166,5 +6329,86 @@ mod tests {
         let app = app(&["graft", LOG, "--alert", "node1 < 59GB"]);
         assert_eq!(app.firing, vec!["node1 < 59GB".to_string()]);
         assert!(screen(&app).contains("ALERT node1 < 59GB"));
+    }
+
+    fn run(app: &mut App, code: &str) {
+        key(app, KeyCode::Char(':'));
+        app.console.as_mut().unwrap().set(code);
+        key(app, KeyCode::Enter);
+    }
+
+    #[test]
+    fn review_fixes_for_the_viewer() {
+        // An edit ends with the command it opened: a rule added later (here by a key
+        // binding) is a new rule, not a replacement.
+        let mut app = super::tests::app(&[
+            "graft",
+            LOG,
+            "--mark",
+            "delta < -1.5GB => fell",
+            "--bind",
+            "x = mark_when(\"value > 400GB\", \"big\")",
+        ]);
+        key(&mut app, KeyCode::Char('K'));
+        key(&mut app, KeyCode::Enter);
+        app.console.as_mut().unwrap().set("title(\"other\")");
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.mark_rules.len(), 2, "{:?}", app.mark_rules);
+        assert_eq!(app.mark_rules[0].expr, "delta < -1.5GB");
+
+        // Ranges, lines and titles set in the viewer are saved with it, and undo
+        // takes them back.
+        let mut app = super::tests::app(&["graft", LOG]);
+        run(&mut app, r#"range("2026-11-01 12:00", "2026-11-02 00:00")"#);
+        let c = app.current_cli();
+        assert_eq!(
+            (c.since.as_deref(), c.until.as_deref(), c.last),
+            (Some("2026-11-01 12:00"), Some("2026-11-02 00:00"), None)
+        );
+        run(&mut app, r#"hline(50GB, "limit")"#);
+        assert_eq!(app.current_cli().hline.len(), 1);
+        run(&mut app, r#"title("disks")"#);
+        assert_eq!(app.current_cli().title.as_deref(), Some("disks"));
+        run(&mut app, r#"alert("last(\"node1\") < 1GB")"#);
+        assert_eq!(app.alerts.len(), 1);
+        for _ in 0..3 {
+            key(&mut app, KeyCode::Char('u'));
+        }
+        let c = app.current_cli();
+        assert!(c.hline.is_empty() && c.title.is_none() && app.alerts.is_empty());
+        assert_eq!(app.opts.hlines.len(), 0);
+
+        // Opening and closing the pane panel changes nothing (not even undo).
+        let mut app = super::tests::app(&["graft", LOG]);
+        let steps = app.undo.len();
+        key(&mut app, KeyCode::Char('w'));
+        assert!(app.pane_menu && app.opts.panes.is_some());
+        key(&mut app, KeyCode::Char('w'));
+        assert!(app.opts.panes.is_none());
+        assert_eq!(app.undo.len(), steps);
+        assert!(app.current_cli().pane.is_empty());
+        // Undo with the panel open leaves no panel without panes.
+        key(&mut app, KeyCode::Char('w'));
+        key(&mut app, KeyCode::Char('|'));
+        assert!(app.opts.panes.as_ref().is_some_and(|p| p.count() == 2));
+        app.on_event(&TermEvent::Key(KeyEvent::new(
+            KeyCode::Char('z'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(app.pane_menu == app.opts.panes.is_some());
+
+        // The alerts menu fits a phone: every button is there at 46 columns.
+        let mut app = super::tests::app(&["graft", LOG]);
+        app.alerts_menu = true;
+        let s = screen_sized(&app, 46, 40);
+        for b in ["+ command", "+ add alert", "done"] {
+            assert!(s.contains(b), "{b}:\n{s}");
+        }
+
+        // A binding on u wins over undo.
+        let mut app = super::tests::app(&["graft", LOG, "--bind", "u = title(\"bound\")"]);
+        key(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.opts.title, "bound");
     }
 }
