@@ -229,6 +229,10 @@ const CONSOLE_HELP: &[(&str, &str)] = &[
     ),
     ("undo()  redo()", "step back / forward through your changes"),
     (
+        "title(\"ETH\")  unit(\"USD\")",
+        "the chart's title / the unit for plain numbers",
+    ),
+    (
         "add_line(\"ema30\", \"ema(values(\\\"ETH\\\"), 30)\")",
         "a custom line from Rhai (same name replaces it)",
     ),
@@ -731,6 +735,7 @@ impl App {
         }
         let old_max = self.ds.x_range().map(|r| r.1);
         self.full = self.session.full_dataset();
+        self.apply_unit();
         self.presets = timeframe_presets(&self.full);
         self.timeframe.apply(&mut self.full);
         self.ds = self.session.select(&self.full);
@@ -2225,7 +2230,7 @@ impl App {
             let pts = self.opts.window_for(n.max(1));
             let span = self
                 .window_span(pts)
-                .map(|d| format!(" (≈{})", crate::time::fmt_duration_compact(d)))
+                .map(|d| format!(" (≈{})", crate::time::fmt_duration(d)))
                 .unwrap_or_default();
             let text = format!("window: {pts} points{span}  ");
             f.render_widget(
@@ -2610,6 +2615,18 @@ impl App {
             Action::Svg(path) => self.export_view(path),
             Action::Pane(a) => self.apply_pane_action(a),
             Action::Copy(text) => self.copy(text),
+            Action::Title(t) => {
+                self.opts.title = t.clone();
+                self.cli.title = (!t.is_empty()).then_some(t);
+            }
+            Action::Unit(u) => {
+                let u = u.trim().to_string();
+                if !u.is_empty() && crate::units::lookup_unit(&u, self.cli.binary_units).is_none() {
+                    self.say(format!("unit: '{u}' isn't one graft knows; shown as a suffix"), false);
+                }
+                self.cli.unit = (!u.is_empty()).then_some(u);
+                self.rebuild(true);
+            }
             Action::AddLine(name, expr) => {
                 match crate::lines::CustomLine::parse(&format!("{name} = {expr}")) {
                     Ok(line) => {
@@ -2620,7 +2637,7 @@ impl App {
                         self.rebuild(true);
                         let first = self.session.line_errors.borrow().first().cloned();
                         if let Some(e) = first {
-                            return self.say(e, true);
+                            self.say(e, true);
                         }
                     }
                     Err(e) => self.say(format!("add_line: {e}"), true),
@@ -2761,6 +2778,23 @@ impl App {
         match (t, self.pending.take()) {
             (Transition::None, Some(p)) => p,
             (t, _) => t,
+        }
+    }
+
+    /// `unit(…)` from the console: values parsed without a unit get this one.
+    fn apply_unit(&mut self) {
+        let Some(u) = self.cli.unit.as_deref() else {
+            return;
+        };
+        let (dim, mult) = crate::units::lookup_unit(u, self.cli.binary_units)
+            .unwrap_or_else(|| (crate::units::Dim::Other(u.to_string()), 1.0));
+        for s in &mut self.full.series {
+            if s.unit.dim == crate::units::Dim::None {
+                s.unit = crate::units::Unit::new(dim.clone());
+                if mult != 1.0 {
+                    s.points.iter_mut().for_each(|p| p.1 *= mult);
+                }
+            }
         }
     }
 
@@ -3213,6 +3247,13 @@ impl App {
                         p.focus = id;
                     }
                 }
+                // A tap on a chart with no time axis (stat tiles, bars…) lets go of the
+                // cursor, so the status line follows the newest data again.
+                if self.plot_at(col, row).is_none()
+                    && self.chart_rect.get().contains((col, row).into())
+                {
+                    self.cursor = None;
+                }
                 // Shift+click: measure from the cursor (or the previous shift+click) to here.
                 if let Some(plot) = self.plot_at(col, row)
                     && m.modifiers.contains(KeyModifiers::SHIFT)
@@ -3650,26 +3691,51 @@ impl App {
                     Style::default()
                 },
             ));
-        } else {
-            let points: usize = self.ds.series.iter().map(|s| s.points.len()).sum();
+        } else if let Some(latest) = self
+            .ds
+            .series
+            .iter()
+            .filter(|s| !self.hidden.contains(&s.name))
+            .filter_map(|s| s.points.last().map(|p| p.0))
+            .reduce(f64::max)
+        {
+            // Nothing picked: the newest data, as it comes in.
+            spans.push(Span::styled("latest ", dim));
+            spans.push(Span::styled(
+                self.ds.fmt_x_full(crate::render::round_x(&self.ds, latest)),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            for (i, s) in self
+                .ds
+                .series
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| !self.hidden.contains(&s.name))
+            {
+                if let Some(&(_, y)) = s.points.last() {
+                    spans.push(Span::styled(
+                        format!("  {}=", s.name),
+                        Style::default().fg(self.opts.color(i)),
+                    ));
+                    spans.push(Span::raw(s.unit.format(y)));
+                }
+            }
             let hint = if self.mouse {
                 "tap to inspect · drag to measure · ? help"
             } else {
                 "? help  : console  q quit"
             };
-            spans.push(Span::styled(
-                format!(
-                    "{} · {} series · {points} pts{}   {hint}",
-                    self.opts.kind.name(),
-                    self.ds.series.len(),
-                    if self.view.is_some() {
-                        " · zoomed"
-                    } else {
-                        ""
-                    }
-                ),
-                dim,
-            ));
+            spans.push(Span::styled(format!("   {hint}"), dim));
+        } else {
+            let hint = if self.mouse {
+                "tap to inspect · drag to measure · ? help"
+            } else {
+                "? help  : console  q quit"
+            };
+            spans.push(Span::styled(hint, dim));
+        }
+        if self.selection.is_some() || self.anchor.is_some() {
+            spans.push(Span::styled("   Esc clears the range", dim));
         }
         Line::from(spans)
     }
@@ -5011,6 +5077,55 @@ mod tests {
         let mut app = super::tests::app(&["graft", LOG, "--target", "node1=50GB"]);
         more(&mut app);
         assert!(app.has_targets());
+    }
+
+    #[test]
+    fn custom_lines_title_and_unit_from_the_viewer() {
+        let mut app = app(&[
+            "graft",
+            LOG,
+            "-s",
+            "node1",
+            "--line",
+            "ema5 = ema(values(\"node1\"), 5)",
+        ]);
+        assert!(app.ds.series.iter().any(|s| s.name == "ema5"));
+        // The lines menu lists it; ✎ opens it in the console, same name replaces it.
+        key(&mut app, KeyCode::Char('T'));
+        let s = screen(&app);
+        assert!(
+            s.contains("custom lines (Rhai)") && s.contains("ema5 = ema(values(\"node1\"), 5)"),
+            "{s}"
+        );
+        let (x, y) = find(&app, "ema5 = ema");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert_eq!(
+            app.console.as_ref().unwrap().value,
+            "add_line(\"ema5\", \"ema(values(\\\"node1\\\"), 5)\")"
+        );
+        app.console
+            .as_mut()
+            .unwrap()
+            .set("add_line(\"ema5\", \"sma(values(\\\"node1\\\"), 3)\")");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.current_cli().line, ["ema5 = sma(values(\"node1\"), 3)"]);
+        // Errors are reported, and the line left out.
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, "add_line(\"bad\", \"values(\\\"nope\\\")\")");
+        key(&mut app, KeyCode::Enter);
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|m| m.error && m.text.contains("unknown series 'nope'"))
+        );
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, "remove_line(\"bad\"); title(\"Disks\")");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.current_cli().line.len(), 1);
+        assert!(screen(&app).contains("Disks"));
+        // Undo brings the bad line back.
+        key(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.current_cli().line.len(), 2);
     }
 
     #[test]

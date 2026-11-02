@@ -1937,6 +1937,14 @@ impl ChartWidget<'_> {
                 format!("selected {span} "),
                 Style::default().fg(Color::Yellow),
             ));
+        } else if let Some(&(x, _)) = sum.points.last()
+            && self.ds.x_kind == XKind::Time
+        {
+            // When the value is from (a tile has no time axis to read it off).
+            title.push(Span::styled(
+                format!("at {} ", self.ds.fmt_x(round_x(self.ds, x), 60.0)),
+                Style::default().fg(Color::DarkGray),
+            ));
         }
         let block = Block::bordered()
             .border_style(Style::default().fg(Color::DarkGray))

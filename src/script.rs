@@ -74,6 +74,10 @@ pub enum Action {
     ClearMarks,
     Undo,
     Redo,
+    /// The chart title.
+    Title(String),
+    /// The unit for values that don't carry one (`USD`, `ms`, `%`…); "" for none.
+    Unit(String),
     /// A custom line: name (optionally `name:unit`) and Rhai expression.
     AddLine(String, String),
     RemoveLine(String),
@@ -266,6 +270,8 @@ impl ScriptHost {
         let state = Rc::new(RefCell::new(ScriptState::default()));
         let mut engine = Engine::new();
         engine.set_max_operations(50_000_000);
+        // Room for real indicator code (the defaults are tuned for one-liners).
+        engine.set_max_expr_depths(256, 256);
         register_api(&mut engine, &state, binary);
         let ast = match script {
             Some(path) => {
@@ -827,6 +833,10 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
     });
     let st = state.clone();
     engine.register_fn("clear_marks", move || push(&st, Action::ClearMarks));
+    let st = state.clone();
+    engine.register_fn("title", move |t: &str| push(&st, Action::Title(t.into())));
+    let st = state.clone();
+    engine.register_fn("unit", move |u: &str| push(&st, Action::Unit(u.into())));
     let st = state.clone();
     engine.register_fn("add_line", move |name: &str, expr: &str| {
         push(&st, Action::AddLine(name.into(), expr.into()))

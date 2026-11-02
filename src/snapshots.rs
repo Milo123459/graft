@@ -456,6 +456,11 @@ fn write_custom_snapshot() {
         app.tick();
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+    // Draw once so taps know where things are, then press GRAFT_SNAPSHOT_KEYS.
+    screen(&app, 150, 45);
+    if let Ok(keys) = std::env::var("GRAFT_SNAPSHOT_KEYS") {
+        app.test_keys(&keys);
+    }
     std::fs::create_dir_all(&dir).unwrap();
     for (name, w, h) in [("custom", 150, 45), ("phone-custom", 46, 40)] {
         std::fs::write(

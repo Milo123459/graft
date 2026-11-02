@@ -491,3 +491,40 @@ fn markers_are_drawn_and_listed() {
     let bad = graft(&[LOG, "-F", FMT, "--once", "--mark", "=> x"]);
     assert!(String::from_utf8_lossy(&bad.stderr).contains("give a condition"));
 }
+
+#[test]
+fn custom_lines_written_in_rhai() {
+    let o = graft(&[
+        LOG,
+        "-F",
+        FMT,
+        "--no-chart",
+        "--script",
+        "examples/indicators.rhai",
+        "--line",
+        "mine = my_ema(values(\"node1\"), 5)",
+        "--line",
+        "builtin = ema(values(\"node1\"), 5)",
+        "--line",
+        "gap = spread(\"node2\", \"node1\")",
+        "--stats-template",
+        "{name} {last:raw} {n}",
+    ]);
+    let out = stdout(&o);
+    let get = |name: &str| {
+        out.lines()
+            .find(|l| l.starts_with(&format!("{name} ")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{name} missing: {out}{}",
+                    String::from_utf8_lossy(&o.stderr)
+                )
+            })
+            .to_string()
+    };
+    // The Rhai EMA and the built-in agree, point for point at the end.
+    let last = |name: &str| get(name).split(' ').nth(1).unwrap().parse::<f64>().unwrap();
+    assert!((last("mine") - last("builtin")).abs() < 1.0, "{out}");
+    assert!(get("gap").ends_with(" 29"), "{out}");
+    assert!((last("gap") - (415.7e9 - 58.8e9)).abs() < 1e6, "{out}");
+}

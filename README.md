@@ -171,6 +171,36 @@ type passwords for you: use key login (`ssh-copy-id HOST`) or `ssh-add`; if it
 can't log in, it says how to fix it. Remote charts show up in your recent list
 as `HOST: …`.
 
+### Custom lines (Rhai)
+
+Draw your own line over the data, worked out in Rhai over the whole series —
+for example an EMA30 over a live ETH price:
+
+```sh
+graft -c 'curl -s https://api.coinbase.com/v2/prices/ETH-USD/spot' -n 1s \
+  --regex '"amount":"(?P<ETH>[0-9.]+)"' -u USD \
+  --line 'ema30 = ema(values("ETH"), 30)'
+```
+
+`--line 'NAME[:UNIT] = EXPR'` (repeatable). The expression returns an array
+(one value per point of the series it names; a shorter one lines up with the
+newest points), `[x, y]` pairs, or a number for a flat line. Built in:
+`ema(a, n)`, `sma(a, n)`, `values(name)`, `xs(name)`, `values_at(name, xs)`
+(another series at those times), and every console function (`mean`, `p95`,
+`slope`…). Functions from `--script` work too: `examples/indicators.rhai` has an
+EMA, Bollinger bands and a spread written in Rhai:
+
+```sh
+graft … --script examples/indicators.rhai \
+  --line 'upper = band(values("ETH"), 20, 2.0)' --line 'lower = band(values("ETH"), 20, -2.0)'
+```
+
+A custom line is a series like any other (legend, readout, stats, markers,
+alerts). In the viewer, the lines menu (`T`) lists them: tap one to edit it,
+**✕** to delete, **+ custom line** to add; or `add_line("name", "expr")` and
+`remove_line("name")` in the console. Money: `-u USD` (or `$`, `EUR`, `GBP`)
+shows `$3,456.78`; `:unit("USD")` and `:title("ETH")` change it while running.
+
 ### Markers
 
 Put a ▼ on the chart wherever something happens — a condition checked at every
