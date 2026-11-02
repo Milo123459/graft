@@ -220,12 +220,13 @@ graft /var/log/reclaimable.log -F '{key}: {value}' --no-chart \
 ## Quick start
 
 Run `graft` on its own and pick from ready-made charts. Only the ones that work
-on your machine are listed:
+on your machine are listed. CPU, memory, load, network and ping have both Linux
+(`/proc`) and macOS (`top`, `memory_pressure`, `sysctl`, `netstat`) versions:
 
 | Preset | Shows |
 |---|---|
 | CPU usage (`-p cpu`) | busy % and I/O wait %, every second |
-| Memory (`-p memory`) | used, available and cached memory |
+| Memory (`-p memory`) | used, available and cached memory (macOS: free %) |
 | Load average (`-p load`) | 1, 5 and 15 minute load |
 | Network traffic (`-p network`) | received / sent bytes per second, per interface |
 | Disk usage (`-p disk`) | % used per mounted filesystem |

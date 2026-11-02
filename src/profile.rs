@@ -32,12 +32,15 @@ pub struct Profile {
 pub enum Needs {
     File(&'static str),
     Program(&'static str),
+    /// `std::env::consts::OS`, e.g. "linux" or "macos".
+    Os(&'static str),
 }
 
 impl Needs {
     fn met(self) -> bool {
         match self {
             Needs::File(p) => std::path::Path::new(p).exists(),
+            Needs::Os(os) => std::env::consts::OS == os,
             Needs::Program(name) => std::env::var_os("PATH").is_some_and(|paths| {
                 std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
             }),
@@ -71,6 +74,7 @@ impl Preset {
 const CPU_TOTAL: &str = "(user + nice + system + idle + iowait + irq + softirq + steal)";
 
 /// Built-in presets. Every one spells out its format — nothing is guessed.
+/// Some have per-OS variants (Linux reads /proc; macOS uses its own tools).
 pub fn presets() -> Vec<Preset> {
     // Leak the two CPU expressions once so they can live in a 'static table.
     let busy: &'static str = Box::leak(
@@ -103,169 +107,103 @@ pub fn presets() -> Vec<Preset> {
         ]
         .into_boxed_slice(),
     );
-    vec![
+    #[rustfmt::skip]
+    let presets = vec![
+        // ── Linux ──
         Preset {
-            name: "cpu",
-            title: "CPU usage",
-            description: "busy % and I/O wait %, every second",
+            name: "cpu", title: "CPU usage", description: "busy % and I/O wait %, every second",
             args: cpu_args,
             needs: &[Needs::File("/proc/stat"), Needs::Program("head")],
         },
         Preset {
-            name: "memory",
-            title: "Memory",
-            description: "used, available and cached memory",
-            args: &[
-                "--cmd",
-                "cat /proc/meminfo",
-                "--every",
-                "2s",
-                "--format",
-                "{key}: {value}",
-                "--binary-units",
-                "--series",
-                "used:B = MemTotal - MemAvailable",
-                "--select",
-                "used,MemAvailable,Cached",
-                "--ymin",
-                "0",
-                "--title",
-                "Memory",
-            ],
+            name: "memory", title: "Memory", description: "used, available and cached memory",
+            args: &["--cmd", "cat /proc/meminfo", "--every", "2s", "--format", "{key}: {value}", "--binary-units",
+                "--series", "used:B = MemTotal - MemAvailable", "--select", "used,MemAvailable,Cached", "--ymin", "0", "--title", "Memory"],
             needs: &[Needs::File("/proc/meminfo"), Needs::Program("cat")],
         },
         Preset {
-            name: "load",
-            title: "Load average",
-            description: "1, 5 and 15 minute load",
-            args: &[
-                "--cmd",
-                "cat /proc/loadavg",
-                "--every",
-                "2s",
-                "--columns",
-                "1,2,3",
-                "--names",
-                "1 min,5 min,15 min",
-                "--ymin",
-                "0",
-                "--title",
-                "Load average",
-            ],
+            name: "load", title: "Load average", description: "1, 5 and 15 minute load",
+            args: &["--cmd", "cat /proc/loadavg", "--every", "2s", "--columns", "1,2,3", "--names", "1 min,5 min,15 min",
+                "--ymin", "0", "--title", "Load average"],
             needs: &[Needs::File("/proc/loadavg"), Needs::Program("cat")],
         },
         Preset {
-            name: "network",
-            title: "Network traffic",
-            description: "received / sent bytes per second, per interface",
-            args: &[
-                "--cmd",
-                "cat /proc/net/dev",
-                "--every",
-                "1s",
-                "--format",
-                "{key}:{_:/\\s*/}{rx} {_:word} {_:word} {_:word} {_:word} {_:word} {_:word} {_:word} {tx}",
-                "--rate",
-                "--unit",
-                "B",
-                "--exclude",
-                "lo.*",
-                "--title",
-                "Network traffic",
-            ],
+            name: "network", title: "Network traffic", description: "received / sent bytes per second, per interface",
+            args: &["--cmd", "cat /proc/net/dev", "--every", "1s",
+                "--format", "{key}:{_:/\\s*/}{rx} {_:word} {_:word} {_:word} {_:word} {_:word} {_:word} {_:word} {tx}",
+                "--rate", "--unit", "B", "--exclude", "lo.*", "--title", "Network traffic"],
             needs: &[Needs::File("/proc/net/dev"), Needs::Program("cat")],
         },
         Preset {
-            name: "disk",
-            title: "Disk usage",
-            description: "% used per mounted filesystem",
-            args: &[
-                "--cmd",
-                "df -kP",
-                "--every",
-                "30s",
-                "--format",
-                "{_:word} {_:word} {_:word} {_:word} {value} {key}",
-                "--kind",
-                "bar",
-                "--exclude",
-                "/dev*,/sys*,/run*,/proc*,/snap*",
-                "--title",
-                "Disk usage",
-            ],
+            name: "temperature", title: "CPU temperature", description: "°C from the thermal sensor (e.g. Raspberry Pi)",
+            args: &["--cmd", "cat /sys/class/thermal/thermal_zone0/temp", "--every", "2s", "--columns", "1", "--names", "raw",
+                "--series", "temp:°C = raw / 1000", "--exclude", "raw", "--title", "CPU temperature"],
+            needs: &[Needs::File("/sys/class/thermal/thermal_zone0/temp"), Needs::Program("cat")],
+        },
+        Preset {
+            name: "ping", title: "Ping latency", description: "round-trip time to 1.1.1.1 every 2 s",
+            args: &["--cmd", "ping -c 1 -W 2 1.1.1.1", "--every", "2s", "--format", "time={latency}", "--title", "Ping 1.1.1.1"],
+            needs: &[Needs::Os("linux"), Needs::Program("ping")],
+        },
+        // ── macOS ──
+        Preset {
+            name: "cpu", title: "CPU usage", description: "busy, user and system % (from top), every 2 s",
+            args: &["--cmd", "top -l 2 -n 0 -s 1 | grep 'CPU usage' | tail -1", "--every", "2s",
+                "--format", "CPU usage: {user} user, {sys} sys, {idle} idle",
+                "--series", "busy:% = user + sys", "--select", "busy,user,sys", "--ymin", "0", "--ymax", "100", "--title", "CPU usage"],
+            needs: &[Needs::Os("macos"), Needs::Program("top")],
+        },
+        Preset {
+            name: "memory", title: "Memory", description: "free memory % (from memory_pressure)",
+            args: &["--cmd", "memory_pressure | tail -1", "--every", "5s", "--format", "percentage: {free}",
+                "--ymin", "0", "--ymax", "100", "--title", "Memory"],
+            needs: &[Needs::Os("macos"), Needs::Program("memory_pressure")],
+        },
+        Preset {
+            name: "load", title: "Load average", description: "1, 5 and 15 minute load",
+            args: &["--cmd", "sysctl -n vm.loadavg", "--every", "2s", "--columns", "2,3,4", "--names", "1 min,5 min,15 min",
+                "--ymin", "0", "--title", "Load average"],
+            needs: &[Needs::Os("macos"), Needs::Program("sysctl")],
+        },
+        Preset {
+            name: "network", title: "Network traffic", description: "received / sent bytes per second on en0",
+            args: &["--cmd", "netstat -I en0 -b | grep Link", "--every", "1s",
+                "--format", "{_:word} {_:word} {_:word} {_:word} {_:word} {_:word} {rx} {_:word} {_:word} {tx}",
+                "--rate", "--unit", "B", "--title", "Network en0"],
+            needs: &[Needs::Os("macos"), Needs::Program("netstat")],
+        },
+        Preset {
+            name: "ping", title: "Ping latency", description: "round-trip time to 1.1.1.1 every 2 s",
+            args: &["--cmd", "ping -c 1 -t 2 1.1.1.1", "--every", "2s", "--format", "time={latency}", "--title", "Ping 1.1.1.1"],
+            needs: &[Needs::Os("macos"), Needs::Program("ping")],
+        },
+        // ── both ──
+        Preset {
+            name: "disk", title: "Disk usage", description: "% used per mounted filesystem",
+            args: &["--cmd", "df -kP", "--every", "30s", "--format", "{_:word} {_:word} {_:word} {_:word} {value} {key}", "--kind", "bar",
+                "--exclude", "/dev*,/sys*,/run*,/proc*,/snap*,/private/var/vm,/System/Volumes/VM,/System/Volumes/Preboot,/System/Volumes/Update*,/System/Volumes/xarts,/System/Volumes/iSCPreboot,/System/Volumes/Hardware",
+                "--title", "Disk usage"],
             needs: &[Needs::Program("df")],
         },
         Preset {
-            name: "temperature",
-            title: "CPU temperature",
-            description: "°C from the thermal sensor (e.g. Raspberry Pi)",
-            args: &[
-                "--cmd",
-                "cat /sys/class/thermal/thermal_zone0/temp",
-                "--every",
-                "2s",
-                "--columns",
-                "1",
-                "--names",
-                "raw",
-                "--series",
-                "temp:°C = raw / 1000",
-                "--exclude",
-                "raw",
-                "--title",
-                "CPU temperature",
-            ],
-            needs: &[
-                Needs::File("/sys/class/thermal/thermal_zone0/temp"),
-                Needs::Program("cat"),
-            ],
+            name: "processes", title: "Processes", description: "number of running processes",
+            args: &["--cmd", "ps -A -o pid= | wc -l", "--every", "2s", "--columns", "1", "--names", "processes", "--title", "Processes"],
+            needs: &[Needs::Program("ps"), Needs::Program("wc")],
         },
-        Preset {
-            name: "ping",
-            title: "Ping latency",
-            description: "round-trip time to 1.1.1.1 every 2 s",
-            args: &[
-                "--cmd",
-                "ping -c 1 -W 2 1.1.1.1",
-                "--every",
-                "2s",
-                "--format",
-                "time={latency}",
-                "--title",
-                "Ping 1.1.1.1",
-            ],
-            needs: &[Needs::Program("ping")],
-        },
-        Preset {
-            name: "processes",
-            title: "Processes",
-            description: "number of running processes",
-            args: &[
-                "--cmd",
-                "ls -d /proc/[0-9]* | wc -l",
-                "--every",
-                "2s",
-                "--columns",
-                "1",
-                "--names",
-                "processes",
-                "--title",
-                "Processes",
-            ],
-            needs: &[
-                Needs::File("/proc/1"),
-                Needs::Program("ls"),
-                Needs::Program("wc"),
-            ],
-        },
-    ]
+    ];
+    presets
 }
 
+/// Presets by name; where there are per-OS variants, the one that works here wins.
 fn builtin() -> BTreeMap<String, Profile> {
-    presets()
-        .into_iter()
-        .map(|p| (p.name.to_string(), p.profile()))
-        .collect()
+    let mut out: BTreeMap<String, (bool, Profile)> = BTreeMap::new();
+    for p in presets() {
+        let ok = p.available();
+        if out.get(p.name).is_none_or(|(had, _)| !had && ok) {
+            out.insert(p.name.to_string(), (ok, p.profile()));
+        }
+    }
+    out.into_iter().map(|(k, v)| (k, v.1)).collect()
 }
 
 /// Saved profiles, for the gallery.
