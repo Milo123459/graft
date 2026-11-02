@@ -22,7 +22,7 @@ fn summary() {
     out
 }
 
-bind("D", "summary()");                       // trend summary
-bind("W", "hline(50GB, \"50 GB\")");           // add a warning line
-bind("C", "clear_hlines()");
-bind("Z", "zoom(\"12h\")");                    // last 12 hours
+bind("D", summary());                       // trend summary
+bind("W", hline(50GB, "50 GB"));           // add a warning line
+bind("X", clear_hlines());
+bind("Z", zoom("12h"));                    // last 12 hours

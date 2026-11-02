@@ -79,6 +79,12 @@ pub enum Action {
     Unmerge(String),
     /// Load a Rhai script file while running.
     Load(String),
+    /// Add (or, when editing, replace) an alert condition.
+    Alert(String),
+    Unalert(String),
+    /// Add / remove a notification target (`bell`, `ntfy:topic`…).
+    NotifyTo(String),
+    NotifyOff(String),
     /// Show only these series (hide the rest).
     Only(Vec<String>),
     Toggle(String),
@@ -208,8 +214,9 @@ static UNIT_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
 /// Rewrite unit literals (`50GB`, `1.5 h`, `200ms`, `1d`) into plain numbers in base
 /// units, leaving string literals untouched.
 pub fn preprocess(src: &str, binary: bool) -> String {
+    let src = &quote_bind_code(src);
     let mut out = String::with_capacity(src.len());
-    let mut rest = src;
+    let mut rest = src.as_str();
     while !rest.is_empty() {
         // Copy code up to the next string literal, rewriting it; then copy the literal.
         let code_end = rest.find(['"', '`', '\'']).unwrap_or(rest.len());
@@ -234,6 +241,98 @@ pub fn preprocess(src: &str, binary: bool) -> String {
         }
     }
     out
+}
+
+/// `bind("r", only("eth"))` → `bind("r", "only(\"eth\")")`: the code a key runs is
+/// written as code, and kept as text to run when the key is pressed. (A string, a
+/// `|| …` closure or a `{ … }` block work too.)
+fn quote_bind_code(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    let mut copied = 0;
+    while i < b.len() {
+        match b[i] {
+            // Skip strings and comments: `bind(` inside them isn't a call.
+            q @ (b'"' | b'`' | b'\'') => i = skip_string(b, i, q),
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'b' if src[i..].starts_with("bind")
+                && (i == 0 || !is_ident(b[i - 1]))
+                && src[i + 4..].trim_start().starts_with('(') =>
+            {
+                let open = i + 4 + (src[i + 4..].len() - src[i + 4..].trim_start().len());
+                // The first argument ends at a top-level comma; the second at the
+                // matching close paren.
+                let Some(comma) = scan_to(b, open + 1, b',') else {
+                    i += 4;
+                    continue;
+                };
+                let Some(close) = scan_to(b, comma + 1, b')') else {
+                    i += 4;
+                    continue;
+                };
+                let arg = src[comma + 1..close].trim();
+                let quoted = arg.starts_with('"') || arg.starts_with('`');
+                if !quoted && !arg.is_empty() {
+                    let code = arg.strip_prefix("||").unwrap_or(arg).trim();
+                    out.push_str(&src[copied..=comma]);
+                    out.push_str(" \"");
+                    out.push_str(&code.replace('\\', "\\\\").replace('"', "\\\""));
+                    out.push('"');
+                    copied = close;
+                }
+                i = close;
+            }
+            _ => i += 1,
+        }
+    }
+    out.push_str(&src[copied..]);
+    out
+}
+
+fn is_ident(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_'
+}
+
+/// Index just past the string starting at `i` (quote `q`), honouring escapes.
+fn skip_string(b: &[u8], mut i: usize, q: u8) -> usize {
+    i += 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            c if c == q => return i + 1,
+            _ => i += 1,
+        }
+    }
+    b.len()
+}
+
+/// The next `target` at nesting depth 0 from `i` (skipping strings and brackets).
+fn scan_to(b: &[u8], mut i: usize, target: u8) -> Option<usize> {
+    let mut depth = 0i32;
+    while i < b.len() {
+        match b[i] {
+            q @ (b'"' | b'`' | b'\'') => {
+                i = skip_string(b, i, q);
+                continue;
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            c @ (b')' | b']' | b'}') => {
+                if depth == 0 {
+                    return (c == target).then_some(i);
+                }
+                depth -= 1;
+            }
+            c if c == target && depth == 0 => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 fn rewrite_units(code: &str, binary: bool) -> String {
@@ -598,14 +697,20 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
     engine.register_fn("mean_of", move |names: Array| -> FnResult<Array> {
         // The average of several series, on the first one's times (each where it has data).
         let names: Vec<String> = names.iter().map(|d| d.to_string()).collect();
-        let first = names
-            .first()
-            .ok_or("mean_of([\"a\", \"b\"]) needs at least one series")?;
-        let base = points(&st, first)?.points;
+        if names.is_empty() {
+            return Err("mean_of([\"a\", \"b\"]) needs at least one series".into());
+        }
+        // Sources that haven't sent anything yet are left out (until they do).
         let others: Vec<Vec<(f64, f64)>> = names
             .iter()
-            .map(|n| points(&st, n).map(|p| p.points))
-            .collect::<Result<_, _>>()?;
+            .filter_map(|n| points(&st, n).ok().map(|p| p.points))
+            .filter(|p| !p.is_empty())
+            .collect();
+        let Some(base) = others.first().cloned() else {
+            // None at all: say which names are unknown.
+            points(&st, &names[0])?;
+            return Ok(Array::new());
+        };
         Ok(base
             .iter()
             .map(|&(x, _)| {
@@ -891,6 +996,17 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
     engine.register_fn("save", move |name: &str| {
         push(&st, Action::SaveProfile(name.into()))
     });
+    // mark_when(expr, label, true): also notify for each new marker.
+    let st = state.clone();
+    engine.register_fn(
+        "mark_when",
+        move |expr: &str, label: &str, notify: bool| -> FnResult<()> {
+            let mut rule = crate::marks::MarkRule::parse(&format!("{expr} => {label}"))?;
+            rule.notify = notify;
+            st.borrow_mut().mark_rules.push(rule);
+            Ok(())
+        },
+    );
     for with_label in [false, true] {
         let st = state.clone();
         let f = move |expr: &str, label: &str| -> FnResult<()> {
@@ -922,6 +1038,20 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
     let st = state.clone();
     engine.register_fn("unmerge", move |name: &str| {
         push(&st, Action::Unmerge(name.into()))
+    });
+    let st = state.clone();
+    engine.register_fn("alert", move |e: &str| push(&st, Action::Alert(e.into())));
+    let st = state.clone();
+    engine.register_fn("unalert", move |e: &str| {
+        push(&st, Action::Unalert(e.into()))
+    });
+    let st = state.clone();
+    engine.register_fn("notify_to", move |t: &str| {
+        push(&st, Action::NotifyTo(t.into()))
+    });
+    let st = state.clone();
+    engine.register_fn("notify_off", move |t: &str| {
+        push(&st, Action::NotifyOff(t.into()))
     });
     let st = state.clone();
     engine.register_fn("load", move |path: &str| {
@@ -1003,6 +1133,41 @@ mod tests {
             None,
         );
         host
+    }
+
+    #[test]
+    fn bind_takes_code() {
+        assert_eq!(
+            quote_bind_code(r#"bind("r", only("eth", "ema30"))"#),
+            r#"bind("r", "only(\"eth\", \"ema30\")")"#
+        );
+        assert_eq!(
+            quote_bind_code(r#"bind("r", "hide(\"x\")")"#),
+            r#"bind("r", "hide(\"x\")")"#
+        );
+        assert_eq!(
+            quote_bind_code(r#"bind("x", { hide("a"); zoom(6h) }); let y = 1;"#),
+            r#"bind("x", "{ hide(\"a\"); zoom(6h) }"); let y = 1;"#
+        );
+        assert_eq!(
+            quote_bind_code(r#"bind("c", || toggle("cb"))"#),
+            r#"bind("c", "toggle(\"cb\")")"#
+        );
+        // Not calls: inside strings and comments, or other names.
+        let s = r#"print("bind(\"r\", x)"); // bind("r", y)
+rebind("a", b)"#;
+        assert_eq!(quote_bind_code(s), s);
+        // A bound key really runs it.
+        let host = ScriptHost::new(None, false).unwrap();
+        let _ = host.eval(r#"bind("r", hide("node1"))"#).unwrap();
+        assert_eq!(
+            host.binds(),
+            [("r".to_string(), r#"hide("node1")"#.to_string())]
+        );
+        assert!(
+            host.take_actions().is_empty(),
+            "binding doesn't run the code"
+        );
     }
 
     #[test]

@@ -92,7 +92,11 @@ const HELP: &[(&str, &str)] = &[
         "Ctrl+Z / u",
         "undo (Ctrl+Y / U redo) — also the ↶ undo button",
     ),
-    ("K", "markers: edit, delete or add rules"),
+    ("K", "markers: edit, delete or add rules (notify per rule)"),
+    (
+        "N",
+        "alerts & notifications: add, edit, where they go, test",
+    ),
     ("C", "copy the command for this view"),
     ("⋯", "more: chart type, log scale, target lines, pause,"),
     (
@@ -233,7 +237,7 @@ const CONSOLE_HELP: &[(&str, &str)] = &[
         "show just these lines (show_all(), toggle(\"coinbase\"))",
     ),
     (
-        "bind(\"r\", \"only(\\\"eth\\\")\")",
+        "bind(\"r\", only(\"eth\"))",
         "a key of your own (also --bind 'r = …')",
     ),
     (
@@ -263,6 +267,15 @@ const CONSOLE_HELP: &[(&str, &str)] = &[
     (
         "save(\"disks\")",
         "save this view (source, format, panes…): graft -p disks",
+    ),
+    ("— alerts —", ""),
+    (
+        "alert(\"last(\\\"eth\\\") < 3000\")",
+        "an alert (unalert(…) removes it) · N lists them",
+    ),
+    (
+        "notify_to(\"ntfy:my-topic\")",
+        "where notifications go: bell desktop ntfy: webhook: cmd:",
     ),
     ("— markers —", ""),
     (
@@ -367,6 +380,7 @@ enum Cmd {
     Save,
     Copy,
     Markers,
+    Alerts,
     Undo,
 }
 
@@ -389,6 +403,15 @@ enum Hit {
     LineAction(Option<usize>),
     DeleteLine(usize),
     /// Markers menu.
+    ToggleMarkNotify(usize),
+    /// Alerts menu.
+    EditAlert(Option<usize>),
+    DeleteAlert(usize),
+    ToggleTarget(&'static str),
+    AddTarget(&'static str),
+    RemoveTarget(usize),
+    TestNotify,
+    CloseAlerts,
     EditRule(usize),
     DeleteRule(usize),
     DeleteManual(usize),
@@ -433,6 +456,18 @@ struct Snapshot {
 
 /// How many steps undo remembers.
 const UNDO_DEPTH: usize = 100;
+
+/// A marker rule as listed (without the `notify` prefix, shown as a button instead).
+struct MarkRuleView<'a>(&'a crate::marks::MarkRule);
+
+impl MarkRuleView<'_> {
+    fn text(&self) -> String {
+        match &self.0.label {
+            Some(l) => format!("{} => {l}", self.0.expr),
+            None => self.0.expr.clone(),
+        }
+    }
+}
 
 /// Buttons at the bottom of the markers menu.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -556,6 +591,16 @@ pub struct App {
     shown_line_errors: Vec<String>,
     /// `--merge` sources, running.
     merge_subs: Vec<crate::sources::Sub>,
+    /// Merged-source problems already reported.
+    shown_merge_problems: Vec<String>,
+    /// The alerts & notifications menu is open.
+    alerts_menu: bool,
+    /// The console is editing alert `n` (running it replaces that alert).
+    editing_alert: Option<usize>,
+    /// For each notifying marker rule, the newest marker already told about.
+    notified_marks: HashMap<String, f64>,
+    /// When the viewer opened (markers found while catching up aren't news).
+    started: Instant,
     /// The source picker for the focused pane: (label, source name).
     source_menu: Option<(Vec<SourceChoice>, usize)>,
     /// Where the chart area was last drawn (for pane taps and border drags).
@@ -636,6 +681,11 @@ impl App {
             stepped: false,
             shown_line_errors: Vec::new(),
             merge_subs: Vec::new(),
+            shown_merge_problems: Vec::new(),
+            alerts_menu: false,
+            editing_alert: None,
+            notified_marks: HashMap::new(),
+            started: Instant::now(),
             sub_views: Vec::new(),
             source_menu: None,
             chart_rect: std::cell::Cell::new(Rect::default()),
@@ -684,6 +734,7 @@ impl App {
         c.layout = self.opts.panes.as_ref().map(Panes::layout_expr);
         c.mark = self.mark_rules.iter().map(|r| r.to_spec()).collect();
         c.line = self.session.custom.iter().map(|l| l.to_spec()).collect();
+        c.alert = self.alerts.clone();
         let mut hidden: Vec<String> = self.hidden.iter().cloned().collect();
         hidden.sort();
         c.hide = hidden;
@@ -733,6 +784,18 @@ impl App {
         }
         for m in &mut self.merge_subs {
             m.pump(Duration::from_millis(10));
+        }
+        // A merged source in trouble says so, by name.
+        let problems: Vec<String> = self
+            .merge_subs
+            .iter()
+            .filter_map(|m| m.problem().map(|p| format!("{}: {p}", m.name)))
+            .collect();
+        if problems != self.shown_merge_problems {
+            if let Some(p) = problems.first() {
+                self.say(p.clone(), true);
+            }
+            self.shown_merge_problems = problems;
         }
         self.rebuild(false);
         self.tick_sources(false);
@@ -812,8 +875,17 @@ impl App {
         self.update_marks();
         let errors = self.session.line_errors.borrow().clone();
         if errors != self.shown_line_errors {
-            if let Some(e) = errors.first() {
-                self.say(e.clone(), true);
+            match errors.first() {
+                Some(e) => self.say(e.clone(), true),
+                // Fixed (e.g. a source that was late has arrived): stop showing it.
+                None if self
+                    .message
+                    .as_ref()
+                    .is_some_and(|m| m.error && m.text.starts_with("line ")) =>
+                {
+                    self.message = None;
+                }
+                None => {}
             }
             self.shown_line_errors = errors;
         }
@@ -838,8 +910,263 @@ impl App {
                 .retain(|r| !e.contains(&format!("mark '{}'", r.expr)));
             self.say(e, true);
         }
+        // Notifying rules: tell about markers newer than any told about before. On a
+        // rule's first run (or a source that isn't live) nothing is sent: those are history.
+        // History: before any data, or while the source is first being read.
+        let catching_up = self.ds.series.iter().all(|s| s.points.is_empty())
+            || self.started.elapsed() < Duration::from_secs(2);
+        let live = self.live.spec.is_live() && !catching_up;
+        let mut news = Vec::new();
+        for (i, rule) in self.mark_rules.iter().enumerate().filter(|(_, r)| r.notify) {
+            let newest = marks
+                .iter()
+                .filter(|m| m.rule == Some(i))
+                .map(|m| m.x)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let key = rule.to_spec();
+            match self.notified_marks.get(&key) {
+                Some(&seen) if live => {
+                    for m in marks.iter().filter(|m| m.rule == Some(i) && m.x > seen) {
+                        news.push(format!("{} ({})", m.label, self.ds.fmt_x_full(m.x)));
+                    }
+                }
+                _ => {}
+            }
+            if newest > f64::NEG_INFINITY || !self.notified_marks.contains_key(&key) {
+                let prev = self
+                    .notified_marks
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(f64::NEG_INFINITY);
+                self.notified_marks.insert(key, newest.max(prev));
+            }
+        }
+        if !news.is_empty() {
+            let msg = if news.len() > 3 {
+                format!("{} and {} more", news[..3].join("; "), news.len() - 3)
+            } else {
+                news.join("; ")
+            };
+            self.notify_now(msg);
+        }
         marks.extend(self.manual_marks.iter().cloned());
         self.opts.marks = marks;
+    }
+
+    /// Send a notification to the `--notify` targets (the bell if there are none), and
+    /// show it in the status line.
+    fn notify_now(&mut self, msg: String) {
+        let targets = if self.cli.notify.is_empty() {
+            vec!["bell".to_string()]
+        } else {
+            self.cli.notify.clone()
+        };
+        crate::notify::send_in_background(targets, self.opts.title.clone(), msg.clone());
+        self.say(format!("🔔 {msg}"), false);
+    }
+
+    // ───────────── alerts menu ─────────────
+
+    fn edit_alert(&mut self, i: Option<usize>) {
+        let q = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+        let code = match i.and_then(|i| self.alerts.get(i)) {
+            Some(a) => format!("alert({})", q(a)),
+            None => {
+                let first = self
+                    .ds
+                    .series
+                    .first()
+                    .map_or("name".to_string(), |s| s.name.clone());
+                format!("alert(\"last(\\\"{first}\\\") > 100\")")
+            }
+        };
+        self.alerts_menu = false;
+        self.editing_alert = i;
+        self.console = Some(TextInput::new(code));
+        self.say(
+            "an alert is a condition on the whole chart, e.g. last(\"eth\") < 3000 or slope(\"x\", \"1h\") < 0 · Enter saves",
+            false,
+        );
+    }
+
+    fn toggle_target(&mut self, t: &str) {
+        match self.cli.notify.iter().position(|x| x == t) {
+            Some(i) => {
+                self.cli.notify.remove(i);
+            }
+            None => self.cli.notify.push(t.to_string()),
+        }
+    }
+
+    fn draw_alerts_menu(&self, f: &mut Frame) {
+        if !self.alerts_menu {
+            return;
+        }
+        let area = f.area();
+        let w = 84.min(area.width);
+        let notifying: Vec<&crate::marks::MarkRule> =
+            self.mark_rules.iter().filter(|r| r.notify).collect();
+        let custom: Vec<(usize, &String)> = self
+            .cli
+            .notify
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.contains(':'))
+            .collect();
+        let rows = self.alerts.len().max(1) + notifying.len().max(1) + custom.len() + 11;
+        let h = (rows as u16).min(area.height);
+        let rect = Rect {
+            x: (area.width - w) / 2,
+            y: area.height.saturating_sub(h) / 2,
+            width: w,
+            height: h,
+        };
+        Clear.render(rect, f.buffer_mut());
+        let block = Block::bordered()
+            .title(" alerts & notifications ")
+            .border_style(Style::default().fg(Color::Yellow));
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        self.hits.push(rect, Hit::MenuBackground);
+        let dim = Style::default().fg(Color::Gray);
+        let head = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        let mut y = inner.y;
+        let row = |y: u16| Rect {
+            y,
+            height: 1,
+            ..inner
+        };
+        let x_button = |f: &mut Frame, y: u16, hit: Hit| {
+            if y < inner.bottom() && inner.width > 4 {
+                let r = Rect {
+                    x: inner.right() - 3,
+                    y,
+                    width: 3,
+                    height: 1,
+                };
+                f.render_widget(
+                    Span::styled(" ✕ ", Style::default().fg(Color::White).bg(Color::DarkGray)),
+                    r,
+                );
+                self.hits.push(r, hit);
+            }
+        };
+        f.render_widget(
+            Line::styled(
+                "alerts — a condition on the whole chart; notifies when it starts holding",
+                head,
+            ),
+            row(y),
+        );
+        y += 1;
+        if self.alerts.is_empty() {
+            f.render_widget(Line::styled("  none yet", dim), row(y));
+            y += 1;
+        }
+        for (i, a) in self.alerts.iter().enumerate() {
+            if y >= inner.bottom() {
+                break;
+            }
+            let firing = self.firing.iter().any(|f| f == a);
+            let r = Rect {
+                width: inner.width.saturating_sub(4),
+                ..row(y)
+            };
+            f.render_widget(
+                Line::from(vec![
+                    Span::styled(" ✎ ", Style::default().fg(Color::Yellow)),
+                    Span::raw(a.clone()),
+                    if firing {
+                        Span::styled(
+                            "  ● firing",
+                            Style::default()
+                                .fg(Color::LightRed)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        Span::styled("  ○ quiet", dim)
+                    },
+                ]),
+                r,
+            );
+            self.hits.push(r, Hit::EditAlert(Some(i)));
+            x_button(f, y, Hit::DeleteAlert(i));
+            y += 1;
+        }
+        y += 1;
+        if y < inner.bottom() {
+            f.render_widget(
+                Line::styled(
+                    "markers that notify (turn on with notify in the markers menu, K)",
+                    head,
+                ),
+                row(y),
+            );
+            y += 1;
+        }
+        if notifying.is_empty() && y < inner.bottom() {
+            f.render_widget(Line::styled("  none", dim), row(y));
+            y += 1;
+        }
+        for r in &notifying {
+            if y >= inner.bottom() {
+                break;
+            }
+            f.render_widget(Line::raw(format!("  ▼ {}", MarkRuleView(r).text())), row(y));
+            y += 1;
+        }
+        y += 1;
+        if y < inner.bottom() {
+            f.render_widget(Line::styled("send notifications to", head), row(y));
+            y += 1;
+        }
+        if y < inner.bottom() {
+            let on = |t: &str| self.cli.notify.iter().any(|x| x == t);
+            let buttons = vec![
+                Button::new("bell", Hit::ToggleTarget("bell"))
+                    .active(on("bell") || self.cli.notify.is_empty()),
+                Button::new("desktop", Hit::ToggleTarget("desktop")).active(on("desktop")),
+                Button::new("+ ntfy (phone)", Hit::AddTarget("ntfy")),
+                Button::new("+ webhook", Hit::AddTarget("webhook")),
+                Button::new("+ command", Hit::AddTarget("cmd")),
+            ];
+            render_buttons(&buttons, row(y), f.buffer_mut(), &self.hits);
+            y += 1;
+        }
+        for (i, t) in custom {
+            if y >= inner.bottom() {
+                break;
+            }
+            f.render_widget(
+                Line::raw(format!("  → {t}")),
+                Rect {
+                    width: inner.width.saturating_sub(4),
+                    ..row(y)
+                },
+            );
+            x_button(f, y, Hit::RemoveTarget(i));
+            y += 1;
+        }
+        y += 1;
+        if y < inner.bottom() {
+            let buttons = vec![
+                Button::new("+ add alert", Hit::EditAlert(None)),
+                Button::new("send a test", Hit::TestNotify),
+                Button::new("done", Hit::CloseAlerts),
+            ];
+            render_buttons(&buttons, row(y), f.buffer_mut(), &self.hits);
+        }
+        if inner.height > 0 {
+            f.render_widget(
+                Line::styled(
+                    "tap an alert to edit it · ✕ removes · Esc closes",
+                    Style::default().fg(Color::DarkGray),
+                ),
+                row(inner.bottom() - 1),
+            );
+        }
     }
 
     fn check_alerts(&mut self) {
@@ -1170,7 +1497,7 @@ impl App {
         let area = f.area();
         let w = 80.min(area.width);
         let rows = self.mark_rows().max(1) as u16;
-        let h = (rows + 7).min(area.height);
+        let h = (rows + 9).min(area.height);
         let rect = Rect {
             x: (area.width - w) / 2,
             y: area.height.saturating_sub(h) / 2,
@@ -1213,6 +1540,23 @@ impl App {
                 self.hits.push(r, hit);
             }
         };
+        line(
+            f,
+            y,
+            Line::styled(
+                " a rule is checked at every point: value prev delta pct rate time name,",
+                dim,
+            ),
+        );
+        line(
+            f,
+            y + 1,
+            Line::styled(
+                " other series by name (ema30, ema30_prev) · notify: tell me about new ones",
+                dim,
+            ),
+        );
+        y += 2;
         if self.mark_rules.is_empty() && self.manual_marks.is_empty() {
             line(
                 f,
@@ -1231,19 +1575,34 @@ impl App {
             let r = Rect {
                 y,
                 height: 1,
-                width: inner.width.saturating_sub(4),
+                width: inner.width.saturating_sub(13),
                 ..inner
             };
             if y < inner.bottom() {
+                let shown = MarkRuleView(rule).text();
                 f.render_widget(
                     Line::from(vec![
                         Span::styled(" ✎ ", Style::default().fg(Color::Yellow)),
-                        Span::styled(rule.to_spec(), style),
-                        Span::styled(format!("  ▼ {count}"), dim),
+                        Span::styled(shown, style),
+                        Span::styled(format!("  ▼ {count} placed"), dim),
                     ]),
                     r,
                 );
                 self.hits.push(r, Hit::EditRule(i));
+                if inner.width > 14 {
+                    let b = Rect {
+                        x: inner.right() - 12,
+                        y,
+                        width: 8,
+                        height: 1,
+                    };
+                    render_buttons(
+                        &[Button::new("notify", Hit::ToggleMarkNotify(i)).active(rule.notify)],
+                        b,
+                        f.buffer_mut(),
+                        &self.hits,
+                    );
+                }
             }
             delete(f, y, Hit::DeleteRule(i));
             y += 1;
@@ -2508,6 +2867,7 @@ impl App {
             Cmd::RangeStep(dir) => self.step_timeframe(dir),
             Cmd::Copy => self.copy(None),
             Cmd::Undo => return self.step_back(),
+            Cmd::Alerts => self.alerts_menu = !self.alerts_menu,
             Cmd::Markers => {
                 self.marks_menu = match self.marks_menu {
                     Some(_) => None,
@@ -2734,6 +3094,32 @@ impl App {
                 self.start_merges();
                 self.rebuild(true);
             }
+            Action::Alert(expr) => {
+                let expr = expr.trim().to_string();
+                match self.editing_alert.take() {
+                    Some(i) if i < self.alerts.len() => self.alerts[i] = expr,
+                    _ if !self.alerts.contains(&expr) => self.alerts.push(expr),
+                    _ => {}
+                }
+                self.check_alerts();
+            }
+            Action::Unalert(expr) => {
+                let before = self.alerts.len();
+                self.alerts.retain(|a| a.trim() != expr.trim());
+                if self.alerts.len() == before {
+                    self.say(format!("unalert: no alert '{expr}'"), true);
+                }
+                self.check_alerts();
+            }
+            Action::NotifyTo(t) => match crate::notify::parse_target(&t) {
+                Ok(t) => {
+                    if !self.cli.notify.contains(&t) {
+                        self.cli.notify.push(t);
+                    }
+                }
+                Err(e) => self.say(format!("notify_to: {e}"), true),
+            },
+            Action::NotifyOff(t) => self.cli.notify.retain(|x| x != &t),
             Action::Load(path) => {
                 let p = std::path::PathBuf::from(path.trim());
                 match self.session.script.load(&p) {
@@ -2860,6 +3246,7 @@ impl App {
             KeyCode::Esc => {
                 self.console = None;
                 self.editing_rule = None;
+                self.editing_alert = None;
             }
             KeyCode::Enter => {
                 let code = std::mem::take(&mut input.value);
@@ -2973,7 +3360,8 @@ impl App {
             || self.help
             || self.console_help
             || self.source_menu.is_some()
-            || self.marks_menu.is_some())
+            || self.marks_menu.is_some()
+            || self.alerts_menu)
     }
 
     fn snapshot_key(&self) -> String {
@@ -3124,6 +3512,14 @@ impl App {
             self.on_marks_menu_key(key);
             return Transition::None;
         }
+        if self.alerts_menu {
+            match key.code {
+                KeyCode::Char('a') => self.edit_alert(None),
+                KeyCode::Char('t') => self.notify_now("test notification from graft".into()),
+                _ => self.alerts_menu = false,
+            }
+            return Transition::None;
+        }
         if self.pane_menu && self.on_pane_key(key) {
             return Transition::None;
         }
@@ -3257,6 +3653,7 @@ impl App {
             KeyCode::Char('R') => Cmd::RangeMenu,
             KeyCode::Char('C') => Cmd::Copy,
             KeyCode::Char('K') => Cmd::Markers,
+            KeyCode::Char('N') => Cmd::Alerts,
             KeyCode::Char('[') => Cmd::RangeStep(-1),
             KeyCode::Char(']') => Cmd::RangeStep(1),
             KeyCode::Char(' ' | 'p') => Cmd::Pause,
@@ -3345,6 +3742,54 @@ impl App {
                             }
                             Transition::None
                         }
+                        Hit::ToggleMarkNotify(i) => {
+                            if let Some(r) = self.mark_rules.get_mut(i) {
+                                r.notify = !r.notify;
+                            }
+                            Transition::None
+                        }
+                        Hit::EditAlert(i) => {
+                            self.edit_alert(i);
+                            Transition::None
+                        }
+                        Hit::DeleteAlert(i) => {
+                            if i < self.alerts.len() {
+                                self.alerts.remove(i);
+                                self.check_alerts();
+                            }
+                            Transition::None
+                        }
+                        Hit::ToggleTarget(t) => {
+                            self.toggle_target(t);
+                            Transition::None
+                        }
+                        Hit::AddTarget(kind) => {
+                            self.alerts_menu = false;
+                            self.console = Some(TextInput::new(format!("notify_to(\"{kind}:")));
+                            self.say(
+                                match kind {
+                                    "ntfy" => "ntfy topic (pick something unguessable), e.g. notify_to(\"ntfy:eth-alerts-x7\") — then subscribe in the ntfy app",
+                                    "webhook" => "webhook URL, e.g. notify_to(\"webhook:https://hooks.slack.com/…\")",
+                                    _ => "a command; it gets $GRAFT_ALERT and $GRAFT_TITLE, e.g. notify_to(\"cmd:say $GRAFT_ALERT\")",
+                                },
+                                false,
+                            );
+                            Transition::None
+                        }
+                        Hit::RemoveTarget(i) => {
+                            if i < self.cli.notify.len() {
+                                self.cli.notify.remove(i);
+                            }
+                            Transition::None
+                        }
+                        Hit::TestNotify => {
+                            self.notify_now("test notification from graft".into());
+                            Transition::None
+                        }
+                        Hit::CloseAlerts => {
+                            self.alerts_menu = false;
+                            Transition::None
+                        }
                         Hit::EditRule(i) => {
                             self.edit_rule(i);
                             Transition::None
@@ -3376,12 +3821,14 @@ impl App {
                     || self.range_menu
                     || self.source_menu.is_some()
                     || self.marks_menu.is_some()
+                    || self.alerts_menu
                 {
                     // A tap outside a menu closes it.
                     self.lines_menu = false;
                     self.range_menu = false;
                     self.source_menu = None;
                     self.marks_menu = None;
+                    self.alerts_menu = false;
                     return Transition::None;
                 }
                 // Panes: grab a border to resize, or tap a pane to focus it.
@@ -3541,11 +3988,15 @@ impl App {
         // Markers, once there are some (always under ⋯).
         if self.mark_rows() > 0 {
             v.push(
-                b(
-                    &format!("markers ({})", self.opts.marks.len()),
-                    Cmd::Markers,
-                )
-                .active(self.marks_menu.is_some()),
+                b(&format!("markers ({})", self.mark_rows()), Cmd::Markers)
+                    .active(self.marks_menu.is_some()),
+            );
+        }
+        // Alerts, once there are some: lit while one is firing.
+        if !self.alerts.is_empty() {
+            v.push(
+                b(&format!("alerts ({})", self.alerts.len()), Cmd::Alerts)
+                    .active(self.alerts_menu || !self.firing.is_empty()),
             );
         }
         // The timeframe dropdown.
@@ -3583,6 +4034,7 @@ impl App {
                 b("save", Cmd::Save),
                 b("copy cmd", Cmd::Copy),
                 b("markers", Cmd::Markers).active(self.marks_menu.is_some()),
+                b("alerts", Cmd::Alerts).active(self.alerts_menu || !self.firing.is_empty()),
                 b(":", Cmd::Console),
                 b("svg", Cmd::Export),
                 b("mouse", Cmd::Mouse).active(self.mouse),
@@ -3703,6 +4155,7 @@ impl App {
         }
         self.draw_source_menu(f);
         self.draw_marks_menu(f);
+        self.draw_alerts_menu(f);
         if self.help {
             let mut entries: Vec<(String, String, Color)> = HELP
                 .iter()
@@ -5361,6 +5814,85 @@ mod tests {
                 .as_ref()
                 .is_some_and(|m| m.error && m.text.contains("no series called"))
         );
+    }
+
+    #[test]
+    fn markers_notify_about_new_ones_and_the_alerts_menu() {
+        let dir = std::env::temp_dir().join(format!("graft-notify-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (log, out) = (dir.join("live.log"), dir.join("out.txt"));
+        std::fs::write(
+            &log,
+            "2026-11-02 10:00:00 v=150\n2026-11-02 10:01:00 v=10\n",
+        )
+        .unwrap();
+        let notify = format!("cmd:echo \"$GRAFT_ALERT\" >> {}", out.display());
+        let args = [
+            "graft",
+            log.to_str().unwrap(),
+            "--kv",
+            "-f",
+            "--mark",
+            "notify value > 100 => big {value}",
+            "--notify",
+            &notify,
+        ];
+        let cli = <Cli as clap::Parser>::parse_from(args);
+        let spec = crate::setup::source_spec(&cli, true).unwrap();
+        let setup = crate::setup::build(cli, spec.clone(), false).unwrap();
+        let mut app = App::new(setup, Live::new(spec));
+        let settle = |app: &mut App| {
+            for _ in 0..30 {
+                app.tick();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            app.rebuild(true);
+        };
+        settle(&mut app);
+        assert_eq!(app.opts.marks.len(), 1, "the old marker is there");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!out.exists(), "history doesn't notify");
+        app.started -= Duration::from_secs(3);
+        // A new matching line notifies.
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        writeln!(f, "2026-11-02 10:02:00 v=170").unwrap();
+        drop(f);
+        settle(&mut app);
+        let mut got = String::new();
+        for _ in 0..50 {
+            got = std::fs::read_to_string(&out).unwrap_or_default();
+            if !got.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(got.starts_with("big 170"), "{got}");
+        // The markers menu shows rules (toolbar) and how often each fired (menu).
+        assert!(screen(&app).contains("markers (1)"));
+        key(&mut app, KeyCode::Char('K'));
+        let s = screen(&app);
+        assert!(s.contains("▼ 2 placed") && s.contains(" notify "), "{s}");
+        key(&mut app, KeyCode::Esc);
+        // The alerts menu: add one, see it firing, pick where notifications go.
+        key(&mut app, KeyCode::Char('N'));
+        assert!(screen(&app).contains("alerts & notifications"));
+        let (x, y) = find(&app, "+ add alert");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        app.console
+            .as_mut()
+            .unwrap()
+            .set(r#"alert("last(\"v\") > 100")"#);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.alerts, ["last(\"v\") > 100"]);
+        key(&mut app, KeyCode::Char('N'));
+        let s = screen(&app);
+        assert!(s.contains("● firing") && s.contains("alerts (1)"), "{s}");
+        let (x, y) = find(&app, " desktop ");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert!(app.current_cli().notify.contains(&"desktop".to_string()));
+        assert_eq!(app.current_cli().alert, ["last(\"v\") > 100"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

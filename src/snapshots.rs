@@ -239,6 +239,22 @@ pub fn scenarios() -> Vec<(String, String)> {
     add("view-markers", screen(&app, 150, 45));
     app.test_keys("K");
     add("view-markers-menu", screen(&app, 150, 45));
+    let mut app = viewer(&[
+        LOG,
+        "-F",
+        FMT,
+        "--alert",
+        "node1 < 59GB",
+        "--alert",
+        "eta(\"node2\", 200GB) < 3d",
+        "--mark",
+        "notify delta < -1.5GB => {name} dropped {delta}",
+        "--notify",
+        "ntfy:my-disks",
+    ]);
+    app.test_keys("N");
+    add("view-alerts-menu", screen(&app, 150, 45));
+    add("phone-alerts-menu", screen(&app, 46, 40));
     add("phone-markers-menu", screen(&app, 46, 34));
     let mut app = viewer(&[
         month,

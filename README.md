@@ -251,7 +251,9 @@ Bind keys of your own to any console code:
 --bind 'c = toggle("coinbase")'
 ```
 
-or while it runs: `:bind("r", "only(\"eth\")")` (works straight away). Bound
+or while it runs: `:bind("r", only("eth"))` — the second argument is code, not a
+string (a `{ … }` block runs several things: `:bind("x", { hide("coinbase");
+title("ETH only") })`). It works straight away. Bound
 keys win over built-in ones, are listed in `?`, and are kept when you save or
 copy the view.
 
@@ -586,8 +588,8 @@ Unit literals such as `50GB`, `200ms` and `1d` work in all expressions.
 
 ```rhai
 fn daily(name) { fmt(name, slope(name, "1d")) + "/day" }
-bind("D", "daily(\"node2\")");
-bind("W", "hline(50GB, \"warn\")");
+bind("D", daily("node2"));
+bind("W", hline(50GB, "warn"));
 ```
 
 It can also define `parse(line)` for formats that need real code

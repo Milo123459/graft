@@ -21,11 +21,18 @@ const MAX_PER_RULE: usize = 300;
 pub struct MarkRule {
     pub expr: String,
     pub label: Option<String>,
+    /// Send a notification (`--notify` targets) for each new marker it places.
+    pub notify: bool,
 }
 
 impl MarkRule {
-    /// `EXPR` or `EXPR => LABEL`.
+    /// `EXPR` or `EXPR => LABEL`, optionally starting with `notify `.
     pub fn parse(s: &str) -> Result<MarkRule, String> {
+        let trimmed = s.trim_start();
+        let (notify, s) = match trimmed.strip_prefix("notify ") {
+            Some(rest) => (true, rest),
+            None => (false, trimmed),
+        };
         let (expr, label) = match s.split_once("=>") {
             Some((e, l)) => (
                 e.trim(),
@@ -39,13 +46,19 @@ impl MarkRule {
         Ok(MarkRule {
             expr: expr.to_string(),
             label,
+            notify,
         })
     }
 
     pub fn to_spec(&self) -> String {
-        match &self.label {
+        let rule = match &self.label {
             Some(l) => format!("{} => {l}", self.expr),
             None => self.expr.clone(),
+        };
+        if self.notify {
+            format!("notify {rule}")
+        } else {
+            rule
         }
     }
 }
@@ -206,6 +219,9 @@ mod tests {
         let (_, errors) = evaluate(&host, &[MarkRule::parse("value").unwrap()], &ds);
         assert!(errors[0].contains("expected true/false"), "{errors:?}");
         assert!(MarkRule::parse(" => x").is_err());
+        let n = MarkRule::parse("notify value > 5 => hot").unwrap();
+        assert!(n.notify && n.expr == "value > 5");
+        assert_eq!(MarkRule::parse(&n.to_spec()).unwrap(), n);
         // Other series by name, now and at the previous point: crossings.
         let crossing = Dataset {
             x_kind: XKind::Time,

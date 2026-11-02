@@ -238,6 +238,20 @@ impl Sub {
         ds
     }
 
+    /// What's wrong, if anything: an error from its command, or lines that don't fit
+    /// its format.
+    pub fn problem(&self) -> Option<String> {
+        if let Some(e) = &self.view.error {
+            return Some(e.clone());
+        }
+        (self.session.lines > 0 && self.session.matched == 0).then(|| {
+            format!(
+                "{} lines read, none matched its format (try its command with --explain=3)",
+                self.session.lines
+            )
+        })
+    }
+
     pub fn revision(&self) -> u64 {
         self.session.store.revision
     }
