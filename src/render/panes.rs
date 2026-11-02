@@ -509,7 +509,13 @@ fn expr(node: &Node, top: bool) -> String {
             let pct = if (ratio - 0.5).abs() < 0.005 {
                 String::new()
             } else {
-                format!("{}%", (ratio * 100.0).round())
+                // Whole percents, unless that would lose a small share.
+                let p = ratio * 100.0;
+                if p.round() >= 10.0 && 100.0 - p.round() >= 10.0 {
+                    format!("{}%", p.round())
+                } else {
+                    format!("{}%", (p * 10.0).round() / 10.0)
+                }
             };
             let s = format!("{} {op}{pct} {}", expr(a, false), expr(b, false));
             if top { s } else { format!("({s})") }
@@ -582,7 +588,10 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
                         .parse()
                         .map_err(|_| "--layout: bad percentage")?;
                     i += 1;
-                    Some((v / 100.0).clamp(0.1, 0.9))
+                    if !(v > 0.0 && v < 100.0) {
+                        return Err(format!("--layout: {v}% should be between 0% and 100%"));
+                    }
+                    Some(v / 100.0)
                 } else {
                     i = start;
                     None
@@ -629,17 +638,38 @@ fn parse_level(t: &[Tok], pos: &mut usize, split: Split) -> Result<Node, String>
         *pos += 1;
         parts.push(sub(t, pos)?);
     }
-    if parts.len() == 2 && shares[0].is_some() {
-        let b = parts.pop().unwrap();
-        let a = parts.pop().unwrap();
-        return Ok(Node::Split {
-            split,
-            ratio: shares[0].unwrap(),
-            a: Box::new(a),
-            b: Box::new(b),
-        });
+    if shares.iter().all(Option::is_none) {
+        return Ok(chain(split, parts));
     }
-    Ok(chain(split, parts))
+    // `a |20% b |30% c`: each share is the part before it, out of the whole; parts
+    // without one split what's left equally.
+    let given: f64 = shares.iter().flatten().sum();
+    if given >= 1.0 {
+        return Err(format!(
+            "--layout: the shares add up to {:.0}% — leave room for the last pane",
+            given * 100.0
+        ));
+    }
+    let open = parts.len() - shares.iter().flatten().count();
+    let rest = (1.0 - given) / open as f64;
+    let mut sizes: Vec<f64> = shares.iter().map(|s| s.unwrap_or(rest)).collect();
+    sizes.push(rest);
+    Ok(chain_sized(split, parts, &sizes))
+}
+
+/// `a op b op c` with the given shares of the whole.
+fn chain_sized(split: Split, mut parts: Vec<Node>, sizes: &[f64]) -> Node {
+    if parts.len() == 1 {
+        return parts.pop().unwrap();
+    }
+    let total: f64 = sizes.iter().sum();
+    let first = parts.remove(0);
+    Node::Split {
+        split,
+        ratio: (sizes[0] / total).clamp(0.01, 0.99),
+        a: Box::new(first),
+        b: Box::new(chain_sized(split, parts, &sizes[1..])),
+    }
 }
 
 fn parse_stack(t: &[Tok], pos: &mut usize) -> Result<Node, String> {
@@ -707,6 +737,46 @@ mod tests {
             .map(|r| r.1.width)
             .collect();
         assert_eq!(widths, [33, 33, 33]);
+        // Shares in longer chains: each is the pane before it; the rest split what's left.
+        let p = Panes::from_args(&[], Some("1 |20% 2 |30% 3"))
+            .unwrap()
+            .unwrap();
+        let widths: Vec<u16> = p
+            .rects(Rect::new(0, 0, 100, 10))
+            .iter()
+            .map(|r| r.1.width)
+            .collect();
+        assert_eq!(widths, [20, 30, 50]);
+        let p = Panes::from_args(&[], Some("1 |50% 2 | 3"))
+            .unwrap()
+            .unwrap();
+        let widths: Vec<u16> = p
+            .rects(Rect::new(0, 0, 100, 10))
+            .iter()
+            .map(|r| r.1.width)
+            .collect();
+        assert_eq!(widths, [50, 25, 25]);
+        assert!(parse_layout("1 |60% 2 |50% 3").is_err());
+        assert!(parse_layout("1 |0% 2").is_err());
+        // Small shares (many panes in a row) survive a round trip.
+        let many = (1..=12)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let p = Panes::from_args(&[], Some(&many)).unwrap().unwrap();
+        let again = parse_layout(&p.layout_expr()).unwrap();
+        let q = Panes {
+            root: again,
+            panes: p.panes.clone(),
+            focus: 0,
+        };
+        let w = |p: &Panes| -> Vec<u16> {
+            p.rects(Rect::new(0, 0, 120, 10))
+                .iter()
+                .map(|r| r.1.width)
+                .collect()
+        };
+        assert_eq!(w(&p), w(&q));
         assert!(parse_layout("1 | ").is_err());
         assert!(parse_layout("1 + 2").is_err());
         assert!(Panes::from_args(&[], Some("1 | 1")).is_err());

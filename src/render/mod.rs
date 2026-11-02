@@ -660,19 +660,33 @@ pub fn nice_ticks(lo: f64, hi: f64, target: usize) -> Vec<f64> {
         .map(|m| m * mag)
         .find(|s| span / s <= target as f64)
         .unwrap_or(10.0 * mag);
-    let mut t = (lo / step).ceil() * step;
+    let start = (lo / step).ceil() * step;
+    // Past float precision (huge values, tiny span) the step can't move `start`.
+    if !step.is_finite() || step <= 0.0 || start + step == start {
+        return vec![lo, hi];
+    }
     let mut out = Vec::new();
-    while t <= hi + step * 1e-9 {
+    for k in 0..=target.max(1) * 4 + 2 {
+        let t = start + k as f64 * step;
+        if t > hi + step * 1e-9 {
+            break;
+        }
         out.push(if t.abs() < step * 1e-9 { 0.0 } else { t });
-        t += step;
     }
     out
 }
 
 /// Round y ticks in the unit they're displayed in (`100 GB`, `250 ms`, ...).
 pub fn y_ticks(y0: f64, y1: f64, target: usize, unit: &Unit, log: bool) -> Vec<(f64, String)> {
+    if !y0.is_finite() || !y1.is_finite() {
+        return Vec::new();
+    }
     if log {
-        let decades: Vec<f64> = (y0.ceil() as i64..=y1.floor() as i64)
+        let (lo, hi) = (y0.ceil() as i64, y1.floor() as i64);
+        // Many decades: label every few so the list stays short.
+        let every = ((hi - lo) / target.max(1) as i64).max(1);
+        let decades: Vec<f64> = (lo..=hi)
+            .filter(|e| (e - lo) % every == 0)
             .map(|e| e as f64)
             .collect();
         let ticks = if decades.len() >= 2 {
@@ -1104,8 +1118,8 @@ impl<'a> ChartWidget<'a> {
                 .copied()
                 .chain(hl)
                 .chain(targets.iter().map(|t| t.2)),
-            self.opts.ymin.map(ty),
-            self.opts.ymax.map(ty),
+            self.opts.ymin.filter(|v| !log || *v > 0.0).map(ty),
+            self.opts.ymax.filter(|v| !log || *v > 0.0).map(ty),
         );
 
         let unit = common_unit(lines.iter().map(|l| l.1));
@@ -1242,6 +1256,10 @@ impl<'a> ChartWidget<'a> {
         // avg: bright, solid · median: light, solid · p95: light, dashed · trend: bright, dashed.
         let mut trend_lines: Vec<StyledLine> = Vec::new();
         for (i, s, style, pts) in &trends {
+            // e.g. a fit on a log scale over data that's all ≤ 0.
+            if pts.is_empty() {
+                continue;
+            }
             let color = self.opts.color(*i);
             let color = match style {
                 TrendStyle::Median | TrendStyle::P95 => light_color(color),
@@ -1558,7 +1576,12 @@ impl<'a> ChartWidget<'a> {
             .filter_map(|t| Some((t.color, t.name(), t.series, self.summarise(t)?.value)))
             .collect();
         if latest.is_empty() {
-            return self.render_empty(area, buf, "waiting for data…");
+            let why = if self.overlay.selection.is_some_and(|(a, b)| b > a) && !tiles.is_empty() {
+                "no data in selection"
+            } else {
+                "waiting for data…"
+            };
+            return self.render_empty(area, buf, why);
         }
         let block = self.block();
         let inner = block.inner(area);
@@ -1810,6 +1833,8 @@ impl Tile<'_> {
 struct Summary {
     value: f64,
     points: Vec<(f64, f64)>,
+    /// Data points in the stretch (`points` may be a decimated trend line).
+    count: usize,
     selected: Option<(f64, f64)>,
 }
 
@@ -1852,6 +1877,7 @@ impl ChartWidget<'_> {
             return Some(Summary {
                 value: last,
                 points: raw.to_vec(),
+                count: raw.len(),
                 selected,
             });
         };
@@ -1877,6 +1903,7 @@ impl ChartWidget<'_> {
         Some(Summary {
             value,
             points,
+            count: raw.len(),
             selected,
         })
     }
@@ -1962,6 +1989,27 @@ impl ChartWidget<'_> {
     fn render_stat_tile(&self, area: Rect, buf: &mut Buffer, t: &Tile) {
         let (s, color) = (t.series, t.color);
         let Some(sum) = self.summarise(t) else {
+            // Still show which tile this is, and why it's blank.
+            let block = Block::bordered()
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(Span::styled(
+                    format!(" {} ", t.name()),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ));
+            let inner = block.inner(area);
+            block.render(area, buf);
+            let why = if self.overlay.selection.is_some_and(|(a, b)| b > a) {
+                "no data in selection"
+            } else {
+                "waiting for data…"
+            };
+            Line::styled(format!(" {why}"), Style::default().fg(Color::DarkGray)).render(
+                Rect {
+                    height: inner.height.min(1),
+                    ..inner
+                },
+                buf,
+            );
             return;
         };
         let mut title = vec![Span::styled(
@@ -1971,7 +2019,7 @@ impl ChartWidget<'_> {
         if let Some((a, b)) = sum.selected {
             let span = match self.ds.x_kind {
                 XKind::Time => crate::time::fmt_duration(b - a),
-                _ => format!("{} points", sum.points.len()),
+                _ => format!("{} points", sum.count),
             };
             title.push(Span::styled(
                 format!("selected {span} "),
@@ -2040,7 +2088,8 @@ impl ChartWidget<'_> {
         if let Some(&(x0, first)) = pts.first()
             && pts.len() > 1
         {
-            let d = last - first;
+            // Along the line drawn (live data or the trend), first to last.
+            let d = pts.last().map_or(last, |p| p.1) - first;
             let arrow = if d > 0.0 {
                 "▲"
             } else if d < 0.0 {
@@ -2055,7 +2104,7 @@ impl ChartWidget<'_> {
             };
             let over = match self.ds.x_kind {
                 XKind::Time => format!(" in {}", crate::time::fmt_duration(x_last - x0)),
-                _ => format!(" over {} points", pts.len()),
+                _ => format!(" over {} points", sum.count),
             };
             put(
                 buf,
@@ -2215,7 +2264,11 @@ pub fn pane_view(ds: &Dataset, opts: &ChartOpts, pane: &panes::Pane) -> (Dataset
 
 /// Bar, histogram and sparkline charts have no lines to draw over the data: each trend
 /// becomes a series of its own ("node1 avg"), in a lighter shade of the series' colour.
-pub fn with_trend_series(ds: &Dataset, opts: &ChartOpts) -> (Dataset, ChartOpts) {
+pub fn with_trend_series(
+    ds: &Dataset,
+    opts: &ChartOpts,
+    hidden: Option<&HashSet<String>>,
+) -> (Dataset, ChartOpts) {
     let mut out = Dataset {
         x_kind: ds.x_kind,
         series: Vec::new(),
@@ -2227,6 +2280,10 @@ pub fn with_trend_series(ds: &Dataset, opts: &ChartOpts) -> (Dataset, ChartOpts)
         if live {
             out.series.push(s.clone());
             palette.push(c);
+        }
+        // A hidden series' trends are hidden with it.
+        if hidden.is_some_and(|h| h.contains(&s.name)) {
+            continue;
         }
         for &t in &opts.trends {
             if let Some(points) = opts.trend_points(s, t, s.points.len().max(2)) {
@@ -2368,7 +2425,7 @@ impl Widget for ChartWidget<'_> {
             ChartKind::Line | ChartKind::Scatter | ChartKind::Bar | ChartKind::Stat
         ) && !self.opts.trends.is_empty()
         {
-            let (ds, opts) = with_trend_series(self.ds, self.opts);
+            let (ds, opts) = with_trend_series(self.ds, self.opts, self.overlay.hidden);
             return ChartWidget::new(&ds, &opts, self.overlay).render(area, buf);
         }
         match self.opts.kind {

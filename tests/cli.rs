@@ -648,3 +648,33 @@ fn review_fixes_for_scripting() {
     let (_, e) = out(&["-1p", "load"]);
     assert!(e.contains("give -p on its own"), "{e}");
 }
+
+#[test]
+fn review_fixes_for_rendering() {
+    let run = |args: &[&str], input: &str| {
+        let o = graft_stdin(args, input);
+        assert!(
+            o.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        stdout(&o)
+    };
+    let ones: String = (1..=20).map(|i| format!("{i}\n")).collect();
+    // A log scale ignores a lower bound of 0 rather than crashing.
+    run(
+        &["--format", "{v0}", "--log", "--ymin", "0", "--once"],
+        &ones,
+    );
+    // A fit on a log scale over data that's all ≤ 0 has nothing to draw.
+    run(
+        &["--format", "{v0}", "--log", "--trend=fit", "--once"],
+        "-5\n-4\n-3\n-2\n-1\n",
+    );
+    // Huge values with a tiny spread: the axis still gets labels (and doesn't hang).
+    let out = run(
+        &["--format", "{v0}", "--once"],
+        "1700000000000000000\n1700000000000000512\n",
+    );
+    assert!(out.contains("1.70e18"), "{out}");
+}

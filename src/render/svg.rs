@@ -118,6 +118,22 @@ impl Frame {
 }
 
 pub fn render(ds: &Dataset, opts: &ChartOpts, width: u32, height: u32) -> String {
+    let series: Vec<(usize, &Series)> = ds
+        .series
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !s.points.is_empty())
+        .collect();
+    let split = opts.split
+        && series.len() > 1
+        && !matches!(opts.kind, ChartKind::Bar | ChartKind::Histogram);
+    // Split panels need room for an axis each: grow the image rather than squash them.
+    const MIN_PANEL: u32 = 110;
+    let height = if split {
+        height.max(40 + MIN_PANEL * series.len() as u32)
+    } else {
+        height
+    };
     let (w, h) = (width as f64, height as f64);
     let mut out = String::new();
     let _ = writeln!(
@@ -132,12 +148,6 @@ pub fn render(ds: &Dataset, opts: &ChartOpts, width: u32, height: u32) -> String
         esc(&opts.title)
     );
 
-    let series: Vec<(usize, &Series)> = ds
-        .series
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| !s.points.is_empty())
-        .collect();
     if series.is_empty() {
         let _ = writeln!(
             out,
@@ -150,7 +160,7 @@ pub fn render(ds: &Dataset, opts: &ChartOpts, width: u32, height: u32) -> String
     match opts.kind {
         ChartKind::Bar => bars(&mut out, &series, opts, w, h),
         ChartKind::Histogram => histogram(&mut out, series[0], opts, w, h),
-        _ if opts.split && series.len() > 1 => {
+        _ if split => {
             let panel = (h - 40.0) / series.len() as f64;
             for (k, s) in series.iter().enumerate() {
                 let top = 40.0 + panel * k as f64;
@@ -232,8 +242,8 @@ fn xy(
         .filter(|&v| !panel || data.is_none_or(|(lo, hi)| hline_near(v, lo, hi)));
     let (y0, y1) = y_bounds(
         values.iter().copied().chain(hl),
-        opts.ymin.map(ty),
-        opts.ymax.map(ty),
+        opts.ymin.filter(|v| !log || *v > 0.0).map(ty),
+        opts.ymax.filter(|v| !log || *v > 0.0).map(ty),
     );
     let f = Frame {
         left: 90.0,
