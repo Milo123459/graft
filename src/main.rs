@@ -18,6 +18,7 @@ mod setup;
 #[cfg(test)]
 mod snapshots;
 mod source;
+mod sources;
 mod stats;
 mod suggest;
 mod template;
@@ -64,6 +65,7 @@ fn main() -> ExitCode {
 fn run() -> Result<ExitCode> {
     let args = profile::expand(std::env::args_os().collect())?;
     let cli = Cli::parse_from(&args);
+    let (args, cli) = promote_dashboard(args, cli)?;
 
     if let Some(shell) = cli.completions {
         clap_complete::generate(shell, &mut Cli::command(), "graft", &mut std::io::stdout());
@@ -135,6 +137,24 @@ fn run() -> Result<ExitCode> {
 }
 
 use crate::setup::Setup;
+
+/// Dashboards with no main source: see `sources::promote`.
+fn promote_dashboard(
+    args: Vec<std::ffi::OsString>,
+    cli: Cli,
+) -> Result<(Vec<std::ffi::OsString>, Cli)> {
+    let strings: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    match sources::promote(&cli, &strings)? {
+        Some(new) => {
+            let cli = Cli::try_parse_from(&new).map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok((new.into_iter().map(Into::into).collect(), cli))
+        }
+        None => Ok((args, cli)),
+    }
+}
 
 /// "No format given", listing the formats that fit a sample of the input.
 fn no_format_error(cli: &Cli, interactive: bool) -> anyhow::Error {
@@ -248,7 +268,16 @@ fn run_once(
             .height
             .unwrap_or_else(|| term.map_or(20, |t| t.1.saturating_sub(reserved).clamp(10, 40)))
             .max(5);
-        let buf = render::render_to_buffer(&ds, opts, width, height);
+        // Panes with their own source: read those too.
+        let views: Vec<render::SourceView> = sources::wanted(opts)
+            .iter()
+            .map(|name| {
+                let mut sub = sources::Sub::open(name, false);
+                sub.load_to_end(&timeframe);
+                sub.view
+            })
+            .collect();
+        let buf = render::render_with_sources(&ds, opts, width, height, &views);
         out.write_all(render::ansi::to_ansi(&buf, color).as_bytes())?;
     }
     // A stats template or JSON format implies --stats.

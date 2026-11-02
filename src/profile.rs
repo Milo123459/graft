@@ -190,6 +190,12 @@ pub fn presets() -> Vec<Preset> {
             args: &["--cmd", "ps -A -o pid= | wc -l", "--every", "2s", "--columns", "1", "--names", "processes", "--title", "Processes"],
             needs: &[Needs::Program("ps"), Needs::Program("wc")],
         },
+        Preset {
+            name: "dashboard", title: "System dashboard", description: "CPU, memory, load and network, side by side",
+            args: &["--pane", "source=cpu", "--pane", "source=memory", "--pane", "source=load",
+                "--pane", "source=network", "--layout", "(1 | 2) / (3 | 4)"],
+            needs: &[],
+        },
     ];
     presets
 }
@@ -488,6 +494,19 @@ mod tests {
                 std::iter::once("graft").chain(p.args.iter().copied()),
             )
             .unwrap_or_else(|e| panic!("{}: {e}", p.name));
+            // Dashboards are made of other presets, which are checked themselves.
+            if !cli.pane.is_empty() && cli.cmd.is_none() {
+                for spec in &cli.pane {
+                    let pane = crate::render::panes::Pane::parse(spec).unwrap();
+                    let src = pane.source.expect("dashboard panes name a source");
+                    assert!(
+                        presets().iter().any(|q| q.name == src),
+                        "{}: unknown source {src}",
+                        p.name
+                    );
+                }
+                continue;
+            }
             assert!(cli.has_parser(), "{} must spell out its format", p.name);
             let script =
                 std::rc::Rc::new(crate::script::ScriptHost::new(None, cli.binary_units).unwrap());

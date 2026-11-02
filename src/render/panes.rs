@@ -17,6 +17,8 @@ pub struct Pane {
     pub series: Vec<String>,
     pub kind: Option<ChartKind>,
     pub lines: Option<Lines>,
+    /// Data from elsewhere: a preset, saved profile or recent chart (`cpu`, `@2`).
+    pub source: Option<String>,
 }
 
 impl Pane {
@@ -29,10 +31,14 @@ impl Pane {
                     <ChartKind as clap::ValueEnum>::from_str(v, true)
                         .map_err(|_| format!("pane: unknown chart type '{v}' (line, scatter, bar, histogram, sparkline)"))?,
                 );
+            } else if let Some(v) = word.strip_prefix("source=") {
+                pane.source = (!v.is_empty()).then(|| v.to_string());
             } else if let Some(v) = word.strip_prefix("lines=") {
                 pane.lines = Some(Lines::parse(v).map_err(|e| format!("pane: {e}"))?);
             } else if word.contains('=') {
-                return Err(format!("pane: unknown setting '{word}' (kind=…, lines=…)"));
+                return Err(format!(
+                    "pane: unknown setting '{word}' (kind=…, lines=…, source=…)"
+                ));
             } else if word != "*" {
                 pane.series
                     .extend(word.split(',').filter(|s| !s.is_empty()).map(String::from));
@@ -52,6 +58,9 @@ impl Pane {
         }
         if let Some(l) = &self.lines {
             words.push(format!("lines={}", l.to_arg()));
+        }
+        if let Some(src) = &self.source {
+            words.push(format!("source={src}"));
         }
         words.join(" ")
     }
@@ -705,7 +714,8 @@ mod tests {
 
     #[test]
     fn pane_specs() {
-        let p = Pane::parse("node1,node2 kind=bar lines=live,avg").unwrap();
+        let p = Pane::parse("node1,node2 kind=bar lines=live,avg source=@2").unwrap();
+        assert_eq!(p.source.as_deref(), Some("@2"));
         assert_eq!(p.series, ["node1", "node2"]);
         assert_eq!(p.kind, Some(ChartKind::Bar));
         assert_eq!(Pane::parse(&p.to_spec()).unwrap(), p);

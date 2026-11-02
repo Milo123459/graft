@@ -251,6 +251,10 @@ const CONSOLE_HELP: &[(&str, &str)] = &[
         "swap with the pane that way; resize_pane(\"right\", 10)",
     ),
     ("even_panes()  single()", "equal sizes / back to one chart"),
+    (
+        "pane_source(\"cpu\")",
+        "the picked pane shows a preset/profile/@recent (\"main\": back)",
+    ),
     ("print(x)", "show a value (several prints are joined)"),
     ("— examples —", ""),
     (
@@ -329,6 +333,8 @@ enum Hit {
     CloseMenu,
     /// Pane panel buttons.
     Pane(PaneOp),
+    /// Source picker: use item `n`.
+    PickSource(usize),
     /// Timeframe dropdown: type a range in the console.
     CustomRange,
     MenuBackground,
@@ -353,6 +359,9 @@ fn parse_dir(s: &str) -> Option<PDir> {
     }
 }
 
+/// An entry in the source picker: its label and the source name (`None`: main chart).
+type SourceChoice = (String, Option<String>);
+
 /// Things the pane panel (and `w` keys, and the console) do to panes.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PaneOp {
@@ -367,6 +376,8 @@ enum PaneOp {
     Lines,
     Series(usize),
     AllSeries,
+    /// Open the source picker for the picked pane.
+    Source,
     Done,
 }
 
@@ -438,6 +449,12 @@ pub struct App {
     pane_menu: bool,
     /// Text to put on the clipboard (written to the terminal by the event loop).
     clipboard: Option<String>,
+    /// Sources of panes with `source=` (presets, profiles, recent charts).
+    subs: Vec<crate::sources::Sub>,
+    /// Their latest data, as drawn.
+    sub_views: Vec<crate::render::SourceView>,
+    /// The source picker for the focused pane: (label, source name).
+    source_menu: Option<(Vec<SourceChoice>, usize)>,
     /// Where the chart area was last drawn (for pane taps and border drags).
     chart_rect: std::cell::Cell<Rect>,
     hits: Hits<Hit>,
@@ -505,6 +522,9 @@ impl App {
             pending: None,
             pane_menu: false,
             clipboard: None,
+            subs: Vec::new(),
+            sub_views: Vec::new(),
+            source_menu: None,
             chart_rect: std::cell::Cell::new(Rect::default()),
             hits: Hits::default(),
             plots: RefCell::new(Vec::new()),
@@ -581,6 +601,25 @@ impl App {
             self.say(e, true);
         }
         self.rebuild(false);
+        self.tick_sources(false);
+    }
+
+    /// Start/stop pane sources to match the panes, then read what they produced.
+    fn tick_sources(&mut self, force: bool) {
+        if self.opts.panes.is_none() && self.subs.is_empty() {
+            return;
+        }
+        crate::sources::sync(&mut self.subs, &self.opts, true);
+        let mut changed = force || self.sub_views.len() != self.subs.len();
+        for sub in &mut self.subs {
+            if sub.pump(Duration::from_millis(10)) && (!self.paused || force) {
+                sub.rebuild(&self.timeframe);
+                changed = true;
+            }
+        }
+        if changed {
+            self.sub_views = self.subs.iter().map(|s| s.view.clone()).collect();
+        }
     }
 
     fn rebuild(&mut self, force: bool) {
@@ -788,6 +827,10 @@ impl App {
         self.selection = None;
         self.anchor = None;
         self.rebuild(true);
+        for sub in &mut self.subs {
+            sub.rebuild(&self.timeframe);
+        }
+        self.sub_views = self.subs.iter().map(|s| s.view.clone()).collect();
         let label = self.timeframe.label(&self.ds);
         self.say(
             format!("timeframe: {label} — stats, trends and forecasts use this range"),
@@ -921,9 +964,13 @@ impl App {
                 self.lines_menu = true;
                 return;
             }
+            PaneOp::Source => {
+                self.ensure_panes();
+                return self.open_source_menu();
+            }
             _ => {}
         }
-        let names: Vec<String> = self.ds.series.iter().map(|s| s.name.clone()).collect();
+        let names = self.pane_series_names();
         let kind = self.opts.kind;
         let p = self.ensure_panes();
         let f = p.focus;
@@ -978,7 +1025,7 @@ impl App {
                 p.panes[f].series.clear();
                 None
             }
-            PaneOp::Done | PaneOp::Single | PaneOp::Lines => None,
+            PaneOp::Done | PaneOp::Single | PaneOp::Lines | PaneOp::Source => None,
         };
         if let Some(c) = complaint {
             self.say(c, false);
@@ -997,6 +1044,7 @@ impl App {
             KeyCode::Char('o') => PaneOp::Single,
             KeyCode::Char('t') => PaneOp::Kind,
             KeyCode::Char('T') => PaneOp::Lines,
+            KeyCode::Char('d') => PaneOp::Source,
             KeyCode::Char('a') => PaneOp::AllSeries,
             KeyCode::Char(d @ '1'..='9') => PaneOp::Series(d as usize - '1' as usize),
             KeyCode::Char('<') => PaneOp::Resize(PDir::Left),
@@ -1026,6 +1074,114 @@ impl App {
         };
         self.pane_op(op);
         true
+    }
+
+    /// Series the picked pane can show: from its own source, or the main chart.
+    fn pane_series_names(&self) -> Vec<String> {
+        let ds = match self.focused_pane().and_then(|p| p.source.as_ref()) {
+            Some(src) => self
+                .sub_views
+                .iter()
+                .find(|v| &v.name == src)
+                .map(|v| &v.ds),
+            None => Some(&self.ds),
+        };
+        ds.map(|d| d.series.iter().map(|s| s.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Give the picked pane a source (`None`: the main chart's data).
+    fn set_pane_source(&mut self, source: Option<String>) {
+        let p = self.ensure_panes();
+        let f = p.focus;
+        let pane = &mut p.panes[f];
+        if pane.source != source {
+            pane.source = source;
+            // Series names belong to the old source.
+            pane.series.clear();
+        }
+        self.source_menu = None;
+        self.tick_sources(true);
+    }
+
+    fn open_source_menu(&mut self) {
+        let mut items = vec![(format!("this chart · {}", self.opts.title), None)];
+        for p in crate::profile::presets() {
+            if p.available() && !items.iter().any(|i| i.1.as_deref() == Some(p.name)) {
+                items.push((
+                    format!("{} · {}", p.title, p.description),
+                    Some(p.name.to_string()),
+                ));
+            }
+        }
+        for (name, _) in crate::profile::saved() {
+            items.push((format!("{name} · saved"), Some(name)));
+        }
+        let now = chrono::Local::now().timestamp();
+        for (i, r) in crate::recent::list().iter().take(5).enumerate() {
+            items.push((
+                format!("{} · recent, {}", r.title(), r.summary(now)),
+                Some(format!("@{}", i + 1)),
+            ));
+        }
+        let current = self.focused_pane().and_then(|p| p.source.clone());
+        let sel = items.iter().position(|i| i.1 == current).unwrap_or(0);
+        self.source_menu = Some((items, sel));
+    }
+
+    fn on_source_menu_key(&mut self, key: KeyEvent) {
+        let Some((items, sel)) = self.source_menu.as_mut() else {
+            return;
+        };
+        let n = items.len();
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => *sel = (*sel + 1) % n,
+            KeyCode::Up | KeyCode::Char('k') => *sel = (*sel + n - 1) % n,
+            KeyCode::Enter => {
+                let src = items[*sel].1.clone();
+                self.set_pane_source(src);
+            }
+            _ => self.source_menu = None,
+        }
+    }
+
+    fn draw_source_menu(&self, f: &mut Frame) {
+        let Some((items, sel)) = &self.source_menu else {
+            return;
+        };
+        let area = f.area();
+        let w = 70.min(area.width);
+        let h = (items.len() as u16 + 2).min(area.height);
+        let rect = Rect {
+            x: (area.width - w) / 2,
+            y: area.height.saturating_sub(h) / 2,
+            width: w,
+            height: h,
+        };
+        Clear.render(rect, f.buffer_mut());
+        let block = Block::bordered()
+            .title(" data for this pane · tap one ")
+            .border_style(Style::default().fg(Color::Yellow));
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        self.hits.push(rect, Hit::MenuBackground);
+        // Scroll so the selection stays visible.
+        let rows = inner.height as usize;
+        let first = sel.saturating_sub(rows.saturating_sub(1));
+        for (row, (i, (label, _))) in items.iter().enumerate().skip(first).take(rows).enumerate() {
+            let r = Rect {
+                y: inner.y + row as u16,
+                height: 1,
+                ..inner
+            };
+            let style = if i == *sel {
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            f.render_widget(Span::styled(format!(" {label}"), style), r);
+            self.hits.push(r, Hit::PickSource(i));
+        }
     }
 
     fn pane_items(&self) -> Vec<Item<Hit>> {
@@ -1060,16 +1216,24 @@ impl App {
             }
         }
         v.push(Item::Break);
+        v.push(Item::Label("source".into()));
+        v.push(b(
+            &pane
+                .source
+                .clone()
+                .map_or_else(|| "this chart ▾".to_string(), |s| format!("{s} ▾")),
+            PaneOp::Source,
+        ));
         v.push(Item::Label("chart".into()));
         v.push(b(pane.kind.unwrap_or(self.opts.kind).name(), PaneOp::Kind));
         v.push(Item::Label("lines".into()));
         v.push(b(&self.cur_lines().label(), PaneOp::Lines));
         v.push(Item::Label("series".into()));
-        for (i, s) in self.ds.series.iter().enumerate() {
-            let on = pane.shows(&s.name);
+        for (i, s) in self.pane_series_names().iter().enumerate() {
+            let on = pane.shows(s);
             v.push(Item::Btn(
                 Button::new(
-                    format!("{} {}", if on { "●" } else { "○" }, s.name),
+                    format!("{} {}", if on { "●" } else { "○" }, s),
                     Hit::Pane(PaneOp::Series(i)),
                 )
                 .active(on),
@@ -1108,7 +1272,7 @@ impl App {
         );
         f.render_widget(
             Span::styled(
-                "keys: v s split · x close · ←→↑↓ pick · shift move · ctrl or < > + - size · t chart · T lines · 1-9 series · Esc",
+                "keys: v s split · x close · ←→↑↓ pick · shift move · ctrl or < > + - size · d source · t chart · T lines · 1-9 series · Esc",
                 Style::default().fg(Color::DarkGray),
             ),
             Rect { y: inner.bottom() - 1, height: 1, ..inner },
@@ -1180,6 +1344,16 @@ impl App {
                     Err(e) => self.say(e, true),
                 }
                 return;
+            }
+            PaneAction::Source(src) => {
+                let src = src.trim();
+                let src = (!src.is_empty() && src != "main").then(|| src.to_string());
+                if let Some(name) = &src
+                    && let Err(e) = crate::sources::cli_for(name)
+                {
+                    return self.say(format!("pane_source: {e:#}"), true);
+                }
+                return self.set_pane_source(src);
             }
             PaneAction::Set(spec) => {
                 match Pane::parse(&spec) {
@@ -2107,6 +2281,10 @@ impl App {
             self.on_range_menu_key(key);
             return Transition::None;
         }
+        if self.source_menu.is_some() {
+            self.on_source_menu_key(key);
+            return Transition::None;
+        }
         if self.pane_menu && self.on_pane_key(key) {
             return Transition::None;
         }
@@ -2309,12 +2487,22 @@ impl App {
                             self.pane_op(op);
                             Transition::None
                         }
+                        Hit::PickSource(i) => {
+                            let src = self
+                                .source_menu
+                                .as_ref()
+                                .and_then(|m| m.0.get(i))
+                                .and_then(|it| it.1.clone());
+                            self.set_pane_source(src);
+                            Transition::None
+                        }
                     };
                 }
-                if self.lines_menu || self.range_menu {
+                if self.lines_menu || self.range_menu || self.source_menu.is_some() {
                     // A tap outside a menu closes it.
                     self.lines_menu = false;
                     self.range_menu = false;
+                    self.source_menu = None;
                     return Transition::None;
                 }
                 // Panes: grab a border to resize, or tap a pane to focus it.
@@ -2571,6 +2759,7 @@ impl App {
             hidden: Some(&self.hidden),
             plots: Some(&self.plots),
             pane_focus: self.opts.panes.as_ref().map(|p| p.focus),
+            sources: Some(&self.sub_views),
         };
         self.chart_rect.set(chart);
         f.render_widget(ChartWidget::new(&self.ds, &self.opts, overlay), chart);
@@ -2605,6 +2794,7 @@ impl App {
         if self.range_menu {
             self.draw_range_menu(f);
         }
+        self.draw_source_menu(f);
         if self.help {
             let mut entries: Vec<(String, String, Color)> = HELP
                 .iter()
@@ -3717,6 +3907,97 @@ mod tests {
         type_str(&mut app, "copy(fmt(\"node1\", last(\"node1\")))");
         key(&mut app, KeyCode::Enter);
         assert_eq!(app.take_clipboard().as_deref(), Some("58.8 GB"));
+    }
+
+    #[test]
+    fn panes_with_their_own_sources() {
+        // The main chart is the log; a second pane runs a command of its own.
+        let mut app = app(&[
+            "graft",
+            LOG,
+            "--pane",
+            "*",
+            "--pane",
+            "source=load kind=stat",
+        ]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut s = String::new();
+        while Instant::now() < deadline {
+            app.tick();
+            s = screen(&app);
+            if s.contains("1 min") && s.contains("15 min") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            s.contains("reclaimable.log") && s.contains("1 min") && s.contains("15 min"),
+            "{s}"
+        );
+        // The pane panel offers sources; pick "this chart" for pane 2 again.
+        key(&mut app, KeyCode::Char('w'));
+        key(&mut app, KeyCode::Tab);
+        assert!(screen(&app).contains("load ▾"));
+        key(&mut app, KeyCode::Char('d'));
+        let s = screen(&app);
+        assert!(
+            s.contains("data for this pane") && s.contains("Load average"),
+            "{s}"
+        );
+        let (x, y) = find(&app, "this chart · reclaimable.log");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert!(app.opts.panes.as_ref().unwrap().panes[1].source.is_none());
+        assert!(
+            app.subs.is_empty() || {
+                app.tick();
+                app.subs.is_empty()
+            }
+        );
+        // And from the console; unknown names are refused.
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, "pane_source(\"nope\")");
+        key(&mut app, KeyCode::Enter);
+        assert!(
+            app.message
+                .as_ref()
+                .is_some_and(|m| m.error && m.text.contains("no profile named 'nope'"))
+        );
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, "pane_source(\"processes\")");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.current_cli().pane[1], "* kind=stat source=processes");
+    }
+
+    #[test]
+    fn a_dashboard_needs_no_main_source() {
+        let args: Vec<String> = [
+            "graft",
+            "--pane",
+            "source=load",
+            "--pane",
+            "source=processes",
+            "--layout",
+            "1 | 2",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let cli = <Cli as clap::Parser>::parse_from(&args);
+        let new = crate::sources::promote(&cli, &args)
+            .unwrap()
+            .expect("promoted");
+        assert!(new.contains(&"cat /proc/loadavg".to_string()), "{new:?}");
+        // Its main source is now a live command: build it without waiting for the end.
+        let cli = <Cli as clap::Parser>::parse_from(&new);
+        let spec = crate::setup::source_spec(&cli, true).unwrap();
+        let setup = crate::setup::build(cli, spec.clone(), false).unwrap();
+        let app = App::new(setup, Live::new(spec));
+        let p = app.opts.panes.as_ref().unwrap();
+        assert_eq!(
+            (p.panes[0].source.as_deref(), p.panes[1].source.as_deref()),
+            (None, Some("processes"))
+        );
     }
 
     #[test]

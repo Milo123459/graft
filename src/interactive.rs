@@ -34,6 +34,13 @@ impl Live {
         Self::from_rx(spec, rx)
     }
 
+    /// A source that has already ended (nothing to read).
+    pub fn closed() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ = tx.send(Event::Eof);
+        Self::from_rx(SourceSpec::Stdin, rx)
+    }
+
     pub fn from_rx(spec: SourceSpec, rx: Receiver<Event>) -> Self {
         Self {
             spec,

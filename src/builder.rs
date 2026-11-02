@@ -1379,9 +1379,15 @@ impl Builder {
         else {
             return Transition::None;
         };
-        let cli = match <Cli as clap::Parser>::try_parse_from(
-            std::iter::once("graft".to_string()).chain(item.args.iter().cloned()),
-        ) {
+        let args: Vec<String> = std::iter::once("graft".to_string())
+            .chain(item.args.iter().cloned())
+            .collect();
+        // A dashboard of other sources: its first source becomes the main one.
+        let args = <Cli as clap::Parser>::try_parse_from(&args)
+            .ok()
+            .and_then(|c| crate::sources::promote(&c, &args).ok().flatten())
+            .unwrap_or(args);
+        let cli = match <Cli as clap::Parser>::try_parse_from(&args) {
             Ok(cli) => cli,
             Err(e) => {
                 self.error(format!(

@@ -249,6 +249,18 @@ pub struct Overlay<'a> {
     pub plots: Option<&'a RefCell<Vec<PlotArea>>>,
     /// The focused pane, outlined when there are several.
     pub pane_focus: Option<usize>,
+    /// Data for panes with a `source=` of their own.
+    pub sources: Option<&'a [SourceView]>,
+}
+
+/// What a pane's own source has produced so far.
+#[derive(Debug, Clone)]
+pub struct SourceView {
+    pub name: String,
+    pub ds: Dataset,
+    /// The source's own chart settings (title, units, y range…).
+    pub opts: ChartOpts,
+    pub error: Option<String>,
 }
 
 impl Overlay<'_> {
@@ -886,7 +898,11 @@ impl<'a> ChartWidget<'a> {
     }
 
     fn render_empty(&self, area: Rect, buf: &mut Buffer, msg: &str) {
-        let block = self.block();
+        self.render_empty_titled(area, buf, &self.opts.title, msg);
+    }
+
+    fn render_empty_titled(&self, area: Rect, buf: &mut Buffer, title: &str, msg: &str) {
+        let block = self.block_titled(title);
         let inner = block.inner(area);
         block.render(area, buf);
         let y = inner.y + inner.height / 2;
@@ -1954,12 +1970,71 @@ impl ChartWidget<'_> {
     /// Several panes, each a chart of its own.
     fn render_panes(&self, p: &panes::Panes, area: Rect, buf: &mut Buffer) {
         for (id, rect) in p.rects(area) {
-            let (ds, opts) = pane_view(self.ds, self.opts, &p.panes[id]);
-            ChartWidget::new(&ds, &opts, self.overlay).render(rect, buf);
+            let pane = &p.panes[id];
+            match &pane.source {
+                None => {
+                    let (ds, opts) = pane_view(self.ds, self.opts, pane);
+                    ChartWidget::new(&ds, &opts, self.overlay).render(rect, buf);
+                }
+                Some(name) => self.render_source_pane(name, pane, rect, buf),
+            }
             if p.count() > 1 && self.overlay.pane_focus == Some(id) {
                 outline(rect, buf, Color::Yellow);
             }
         }
+    }
+}
+
+impl ChartWidget<'_> {
+    /// A pane showing another source's data. Zoom and cursor are shared when the time
+    /// ranges overlap; otherwise the pane shows all of its own data.
+    fn render_source_pane(&self, name: &str, pane: &panes::Pane, rect: Rect, buf: &mut Buffer) {
+        let Some(src) = self
+            .overlay
+            .sources
+            .and_then(|v| v.iter().find(|s| s.name == name))
+        else {
+            return ChartWidget::new(self.ds, self.opts, self.overlay).render_empty_titled(
+                rect,
+                buf,
+                name,
+                &format!("starting {name}…"),
+            );
+        };
+        if src.ds.is_empty() {
+            let msg = src
+                .error
+                .clone()
+                .unwrap_or_else(|| "waiting for data…".into());
+            return ChartWidget::new(self.ds, self.opts, self.overlay).render_empty_titled(
+                rect,
+                buf,
+                &src.opts.title,
+                &msg,
+            );
+        }
+        // The source's own settings, with what's shared across panes.
+        let base = ChartOpts {
+            trend_window: self.opts.trend_window,
+            show_targets: self.opts.show_targets,
+            forecast: self.opts.forecast,
+            split: self.opts.split,
+            log: self.opts.log,
+            ..src.opts.clone()
+        };
+        let (ds, opts) = pane_view(&src.ds, &base, pane);
+        let mut overlay = self.overlay;
+        let overlaps = match (overlay.view, ds.x_range()) {
+            (Some((a, b)), Some((lo, hi))) => lo <= b && hi >= a,
+            (Some(_), None) => false,
+            _ => true,
+        };
+        if !overlaps || ds.x_kind != self.ds.x_kind {
+            overlay.view = None;
+            overlay.cursor = None;
+            overlay.selection = None;
+        }
+        ChartWidget::new(&ds, &opts, overlay).render(rect, buf);
     }
 }
 
@@ -2014,10 +2089,26 @@ impl Widget for ChartWidget<'_> {
 }
 
 /// Render a chart into an off-screen buffer.
+#[cfg(test)]
 pub fn render_to_buffer(ds: &Dataset, opts: &ChartOpts, width: u16, height: u16) -> Buffer {
+    render_with_sources(ds, opts, width, height, &[])
+}
+
+/// Render a chart whose panes may show other sources.
+pub fn render_with_sources(
+    ds: &Dataset,
+    opts: &ChartOpts,
+    width: u16,
+    height: u16,
+    sources: &[SourceView],
+) -> Buffer {
     let area = Rect::new(0, 0, width, height);
     let mut buf = Buffer::empty(area);
-    ChartWidget::new(ds, opts, Overlay::default()).render(area, &mut buf);
+    let overlay = Overlay {
+        sources: Some(sources),
+        ..Overlay::default()
+    };
+    ChartWidget::new(ds, opts, overlay).render(area, &mut buf);
     buf
 }
 

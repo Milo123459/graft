@@ -379,3 +379,39 @@ fn write_snapshots() {
         std::fs::write(PathBuf::from(&dir).join(format!("{name}.ans")), ansi).unwrap();
     }
 }
+
+#[test]
+#[ignore = "runs the system dashboard for a few seconds; set GRAFT_SNAPSHOTS=dir"]
+fn write_dashboard_snapshot() {
+    let Ok(dir) = std::env::var("GRAFT_SNAPSHOTS") else {
+        return;
+    };
+    let args: Vec<String> = ["graft", "-p", "dashboard"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let args: Vec<String> = crate::profile::expand(args.iter().map(Into::into).collect())
+        .unwrap()
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let c = <Cli as clap::Parser>::parse_from(&args);
+    let args = crate::sources::promote(&c, &args).unwrap().unwrap();
+    let c = <Cli as clap::Parser>::parse_from(&args);
+    let spec = crate::setup::source_spec(&c, true).unwrap();
+    let setup = crate::setup::build(c, spec.clone(), false).unwrap();
+    let mut app = App::new(setup, Live::new(spec));
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(6);
+    while std::time::Instant::now() < end {
+        app.tick();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, w, h) in [("view-dashboard", 150, 45), ("phone-dashboard", 46, 40)] {
+        std::fs::write(
+            PathBuf::from(&dir).join(format!("{name}.ans")),
+            screen(&app, w, h),
+        )
+        .unwrap();
+    }
+}

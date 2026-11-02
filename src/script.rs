@@ -90,6 +90,9 @@ pub enum PaneAction {
     Layout(String),
     /// Set the focused pane: `node1,node2 kind=bar lines=live,avg`.
     Set(String),
+    /// Where the focused pane's data comes from: a preset/profile/recent name, or
+    /// "" / "main" for the main chart.
+    Source(String),
 }
 
 /// Toolbar buttons that are on or off.
@@ -721,6 +724,10 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
     let st = state.clone();
     engine.register_fn("pane", move |spec: &str| {
         pane(&st, PaneAction::Set(spec.into()))
+    });
+    let st = state.clone();
+    engine.register_fn("pane_source", move |src: &str| {
+        pane(&st, PaneAction::Source(src.into()))
     });
     let st = state.clone();
     engine.register_fn("zoom_in", move || push(&st, Action::ZoomStep(true)));

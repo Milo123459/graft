@@ -204,7 +204,7 @@ time. `{sum}` in `--stats-template` gives the total.
 |---|---|
 | `-k line\|scatter\|bar\|histogram\|sparkline\|stat` | chart type (bar = latest values; stat = a tile per series with the value in big digits, its change, trend, target ETA and a sparkline — good as a pane above a chart) |
 | `--split` | one panel per series, each with its own y axis |
-| `--pane 'node1 kind=bar lines=live,avg'` | panes: several charts in one view (repeat `--pane`); each picks series (`*` = all), `kind=`, `lines=` |
+| `--pane 'node1 kind=bar lines=live,avg'` | panes: several charts in one view (repeat `--pane`); each picks series (`*` = all), `kind=`, `lines=`, and `source=` (another preset, saved profile or recent chart, with its own command and format) |
 | `--layout '(1 \| 2) / 3'` | how panes are arranged: `\|` side by side, `/` stacked, `\|60%` sizes (default: two side by side, more in a grid) |
 | `-m braille\|dot\|block\|half-block\|bar` | marker |
 | `--log`, `--ymin 0`, `--ymax 500GB` | y axis |
@@ -404,6 +404,20 @@ graft ~/reclaimable.log -F '{time} node1: {node1} node2: {node2}' \
   --layout '(1 / 2) |65% 3'
 ```
 
+**Different data in each pane.** A pane can show another source entirely:
+`source=` takes any preset, saved profile or recent chart (`@2`), which runs
+with its own command and format. In the panel, tap **source** to pick one.
+With no main file or command, the panes alone make a dashboard:
+
+```sh
+graft -p dashboard          # built in: CPU, memory, load and network in a grid
+graft --pane source=cpu --pane 'source=load kind=stat' --pane source=@1 --layout '(1 | 2) / 3'
+graft ~/reclaimable.log -F '…' --pane '*' --pane 'source=disk kind=stat'
+```
+
+Time-based panes share zoom and the cursor when their times overlap; the
+timeframe applies to every pane.
+
 ### The Rhai console and scripts
 
 Press `:` and type `help` to see every command with a short explanation and
@@ -450,6 +464,7 @@ Available functions:
   - panes: `split_right()`, `split_down()`, `close_pane()`,
     `focus_pane(2 | "left")`, `move_pane("left")`, `resize_pane("right"[, 10])`,
     `even_panes()`, `layout("(1 | 2) / 3")`, `pane("node1 kind=bar lines=live,avg")`,
+    `pane_source("cpu" | "@2" | "main")`,
     `single()`. With panes, `chart(…)` and `lines(…)` change the picked pane
 - Output: `print(...)`.
 
