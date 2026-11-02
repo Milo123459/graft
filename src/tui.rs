@@ -1027,6 +1027,18 @@ impl App {
         } else {
             Span::styled("■ ", dim)
         });
+        // Lines are arriving but the format matches none of them: say so, rather than
+        // leaving "waiting for data…" on screen.
+        if self.session.matched == 0 && self.session.lines > 0 {
+            spans.push(Span::styled(
+                format!(
+                    " {} lines read, none matched the format — press F to see them and fix it ",
+                    self.session.lines
+                ),
+                Style::default().fg(Color::Black).bg(Color::Yellow),
+            ));
+            spans.push(Span::raw(" "));
+        }
         for a in &self.firing {
             spans.push(Span::styled(
                 format!(" ALERT {a} "),
@@ -1576,6 +1588,12 @@ mod tests {
         );
         key(&mut app, KeyCode::Esc);
         assert!(app.console.is_none());
+    }
+
+    #[test]
+    fn says_when_nothing_matches() {
+        let app = app(&["graft", LOG, "-F", "nothing like this {x}"]);
+        assert!(screen(&app).contains("29 lines read, none matched the format"));
     }
 
     #[test]
