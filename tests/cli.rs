@@ -324,3 +324,117 @@ fn grep_counts_matching_lines_per_bucket() {
     );
     assert!(out.contains("lines 4 3 5"), "{out}");
 }
+
+/// A stand-in `ssh` that runs the remote command locally (host "denied" fails like a
+/// key-less login), first on PATH.
+fn fake_ssh_path() -> String {
+    let dir = std::env::temp_dir().join(format!("graft-fake-ssh-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("ssh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n\
+         while [ $# -gt 0 ]; do case \"$1\" in -o) shift 2;; --) shift; break;; *) host=$1; shift;; esac; done\n\
+         if [ \"$host\" = denied ]; then echo 'denied: Permission denied (publickey).' >&2; exit 255; fi\n\
+         exec sh -c \"$*\"\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+fn graft_with_path(args: &[&str], path: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_graft"))
+        .args(args)
+        .env("PATH", path)
+        .env(
+            "GRAFT_PROFILES",
+            std::env::temp_dir().join("graft-test-no-profiles.toml"),
+        )
+        .env(
+            "GRAFT_RECENT",
+            std::env::temp_dir().join("graft-test-no-recent.toml"),
+        )
+        .output()
+        .expect("run graft")
+}
+
+#[test]
+fn ssh_runs_commands_and_reads_files_remotely() {
+    let path = fake_ssh_path();
+    // A command, with shell syntax that must reach the remote shell intact.
+    let o = graft_with_path(
+        &[
+            "--ssh",
+            "pi",
+            "-c",
+            "echo \"used=$((2+3))\"",
+            "--kv",
+            "--no-chart",
+            "--stats-template",
+            "{name} {last}",
+        ],
+        &path,
+    );
+    assert_eq!(
+        stdout(&o),
+        "used 5\n",
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    // A file on the remote machine.
+    let log = std::fs::canonicalize(LOG).unwrap();
+    let o = graft_with_path(
+        &[
+            "--ssh",
+            "pi",
+            log.to_str().unwrap(),
+            "-F",
+            FMT,
+            "--no-chart",
+            "--stats-template",
+            "{name} {n}",
+        ],
+        &path,
+    );
+    assert_eq!(
+        stdout(&o),
+        "node1 29\nnode2 29\n",
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    // Presets pick the remote OS's variant.
+    let o = graft_with_path(
+        &[
+            "-p",
+            "load",
+            "--ssh",
+            "pi",
+            "--no-chart",
+            "--stats-template",
+            "{name}",
+        ],
+        &path,
+    );
+    assert!(
+        stdout(&o).contains("1 min"),
+        "{}{}",
+        stdout(&o),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    // Login problems come with advice.
+    let o = graft_with_path(
+        &["--ssh", "denied", "-c", "uptime", "--kv", "--once"],
+        &path,
+    );
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("ssh-copy-id denied"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}

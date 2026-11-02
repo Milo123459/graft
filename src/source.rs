@@ -4,7 +4,7 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -23,6 +23,14 @@ pub enum SourceSpec {
         cmd: String,
         every: Duration,
         count: Option<u64>,
+        /// Run it on this host over ssh.
+        ssh: Option<String>,
+    },
+    /// A file on another machine, read over ssh.
+    Remote {
+        host: String,
+        path: String,
+        follow: bool,
     },
 }
 
@@ -35,14 +43,26 @@ impl SourceSpec {
                 |n| n.to_string_lossy().into_owned(),
             ),
             Self::Stdin => "stdin".into(),
-            Self::Command { cmd, .. } => cmd.clone(),
+            Self::Command { cmd, ssh: None, .. } => cmd.clone(),
+            Self::Command {
+                cmd, ssh: Some(h), ..
+            } => format!("{h}: {cmd}"),
+            Self::Remote { host, path, .. } => format!(
+                "{host}:{}",
+                std::path::Path::new(path)
+                    .file_name()
+                    .map_or_else(|| path.clone(), |n| n.to_string_lossy().into_owned())
+            ),
         }
     }
 
     pub fn is_live(&self) -> bool {
         matches!(
             self,
-            Self::File { follow: true, .. } | Self::Stdin | Self::Command { count: None, .. }
+            Self::File { follow: true, .. }
+                | Self::Remote { follow: true, .. }
+                | Self::Stdin
+                | Self::Command { count: None, .. }
         )
     }
 }
@@ -62,7 +82,13 @@ pub fn spawn(spec: SourceSpec) -> Receiver<Event> {
         let result = match spec {
             SourceSpec::File { path, follow } => read_file(&path, follow, &tx),
             SourceSpec::Stdin => read_lines(std::io::stdin().lock(), &tx, None),
-            SourceSpec::Command { cmd, every, count } => run_command(&cmd, every, count, &tx),
+            SourceSpec::Command {
+                cmd,
+                every,
+                count,
+                ssh,
+            } => run_command(&cmd, every, count, ssh.as_deref(), &tx),
+            SourceSpec::Remote { host, path, follow } => read_remote(&host, &path, follow, &tx),
         };
         if let Err(e) = result {
             let _ = tx.send(Event::Error(e));
@@ -147,10 +173,44 @@ fn read_file(path: &PathBuf, follow: bool, tx: &Sender<Event>) -> Result<(), Str
     }
 }
 
+/// Stream a remote file through `ssh host cat|tail -F`.
+fn read_remote(host: &str, path: &str, follow: bool, tx: &Sender<Event>) -> Result<(), String> {
+    let mut child =
+        crate::remote::command(Some(host), &crate::remote::read_file_command(path, follow))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("failed to run ssh: {e}"))?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    // Read stderr alongside, so a chatty error can't block the stream.
+    let errors = thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr.read_to_string(&mut s);
+        s
+    });
+    read_lines(BufReader::new(stdout), tx, None)?;
+    let status = child.wait().map_err(|e| e.to_string())?;
+    if !status.success() {
+        let stderr = errors.join().unwrap_or_default();
+        return Err(
+            crate::remote::explain_error(host, &stderr).unwrap_or_else(|| {
+                format!(
+                    "{host}:{path}: {}",
+                    stderr.lines().next().unwrap_or("").trim()
+                )
+            }),
+        );
+    }
+    Ok(())
+}
+
 fn run_command(
     cmd: &str,
     every: Duration,
     count: Option<u64>,
+    ssh: Option<&str>,
     tx: &Sender<Event>,
 ) -> Result<(), String> {
     let mut index = 0;
@@ -160,9 +220,7 @@ fn run_command(
             index,
             time: now_secs(),
         };
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
+        let mut child = crate::remote::command(ssh, cmd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -177,10 +235,13 @@ fn run_command(
         let status = child.wait().map_err(|e| e.to_string())?;
         if !status.success() {
             let detail = stderr.lines().next().unwrap_or("").trim();
-            let _ = tx.send(Event::Error(format!(
-                "`{cmd}` {status}{}{detail}",
-                if detail.is_empty() { "" } else { ": " }
-            )));
+            let advice = ssh.and_then(|h| crate::remote::explain_error(h, &stderr));
+            let _ = tx.send(Event::Error(advice.unwrap_or_else(|| {
+                format!(
+                    "`{cmd}` {status}{}{detail}",
+                    if detail.is_empty() { "" } else { ": " }
+                )
+            })));
         }
         if tx.send(Event::SampleDone).is_err() {
             return Ok(());
@@ -234,6 +295,7 @@ mod tests {
             cmd: "echo x=1; echo y=2".into(),
             every: Duration::from_millis(10),
             count: Some(2),
+            ssh: None,
         });
         let events: Vec<Event> = rx.iter().collect();
         let lines: Vec<(String, u64)> = events

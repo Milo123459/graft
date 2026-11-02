@@ -152,6 +152,25 @@ Values are normalised to bytes or seconds and displayed in readable units.
 To debug a format, `--explain` (or `--explain=N` for the first N lines) shows how each line was parsed and why any line
 was skipped.
 
+### Charting another machine (SSH)
+
+`--ssh HOST` runs the command — or reads the file — on another machine and
+charts it here. HOST is anything `ssh` accepts (`pi@raspberrypi`, or a name from
+`~/.ssh/config`).
+
+```sh
+graft --ssh pi -p cpu                                   # presets pick the remote OS's variant
+graft --ssh pi ~/reclaimable.log -F '{time} node1: {node1} node2: {node2}'
+graft --ssh pi /var/log/syslog --grep 'errors=(?i)error' -f   # follow a remote log
+graft --ssh nas -c 'df -kP /volume1' -F '{_} {_} {used:int} {free:int}' -n 30s
+```
+
+One connection is opened and reused (OpenSSH connection sharing, kept for two
+minutes), so sampling every second doesn't log in every second. graft can't
+type passwords for you: use key login (`ssh-copy-id HOST`) or `ssh-add`; if it
+can't log in, it says how to fix it. Remote charts show up in your recent list
+as `HOST: …`.
+
 ### Counting log lines
 
 Some logs don't have numbers worth charting, but *how often* something happens

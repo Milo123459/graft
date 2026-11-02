@@ -196,9 +196,23 @@ pub fn presets() -> Vec<Preset> {
 
 /// Presets by name; where there are per-OS variants, the one that works here wins.
 fn builtin() -> BTreeMap<String, Profile> {
+    builtin_for(None)
+}
+
+/// Presets for this machine, or (`Some(os)`) for a remote one reached over ssh, where
+/// only the OS is known: its files and programs are assumed to be there.
+fn builtin_for(remote_os: Option<&str>) -> BTreeMap<String, Profile> {
     let mut out: BTreeMap<String, (bool, Profile)> = BTreeMap::new();
     for p in presets() {
-        let ok = p.available();
+        let ok = match remote_os {
+            None => p.available(),
+            Some(os) => p.needs.iter().all(|n| match n {
+                Needs::Os(o) => *o == os,
+                // /proc and /sys mean Linux.
+                Needs::File(f) if f.starts_with("/proc") || f.starts_with("/sys") => os == "linux",
+                _ => true,
+            }),
+        };
         if out.get(p.name).is_none_or(|(had, _)| !had && ok) {
             out.insert(p.name.to_string(), (ok, p.profile()));
         }
@@ -245,11 +259,13 @@ fn load_file() -> Result<ProfileFile> {
     }
 }
 
-fn find(name: &str) -> Result<Profile> {
+fn find(name: &str, ssh: Option<&str>) -> Result<Profile> {
     if let Some(p) = load_file()?.profiles.remove(name) {
         return Ok(p);
     }
-    builtin()
+    // Over ssh, pick the variant for the other machine's OS.
+    let remote = ssh.map(|h| crate::remote::remote_os(h).unwrap_or("linux"));
+    builtin_for(remote)
         .remove(name)
         .with_context(|| format!("no profile named '{name}' (see --list-profiles)"))
 }
@@ -298,7 +314,20 @@ pub fn expand(args: Vec<OsString>) -> Result<Vec<OsString>> {
             recent.enter_dir();
             out.extend(recent.args.into_iter().map(OsString::from));
         } else {
-            out.extend(find(&name)?.args.into_iter().map(OsString::from));
+            let ssh = rest.iter().enumerate().find_map(|(i, a)| {
+                let a = a.to_string_lossy();
+                if a == "--ssh" {
+                    rest.get(i + 1).map(|h| h.to_string_lossy().into_owned())
+                } else {
+                    a.strip_prefix("--ssh=").map(String::from)
+                }
+            });
+            out.extend(
+                find(&name, ssh.as_deref())?
+                    .args
+                    .into_iter()
+                    .map(OsString::from),
+            );
         }
     }
     out.extend(rest);
@@ -409,6 +438,24 @@ pub fn list() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_presets_follow_the_remote_os() {
+        let mac = builtin_for(Some("macos"));
+        assert!(
+            mac["cpu"].args.iter().any(|a| a.contains("top -l")),
+            "{:?}",
+            mac["cpu"].args
+        );
+        assert!(mac["load"].args.iter().any(|a| a.contains("sysctl")));
+        let linux = builtin_for(Some("linux"));
+        assert!(
+            linux["load"]
+                .args
+                .iter()
+                .any(|a| a.contains("/proc/loadavg"))
+        );
+    }
 
     fn os(v: &[&str]) -> Vec<OsString> {
         v.iter().map(OsString::from).collect()

@@ -84,9 +84,15 @@ pub fn source_spec(cli: &Cli, interactive: bool) -> Result<SourceSpec> {
                 cmd: cmd.clone(),
                 every: cli.every,
                 count,
+                ssh: cli.ssh.clone(),
             }
         }
         (None, Some(p)) if p.as_os_str() == "-" => SourceSpec::Stdin,
+        (None, Some(p)) if cli.ssh.is_some() => SourceSpec::Remote {
+            host: cli.ssh.clone().expect("checked"),
+            path: p.display().to_string(),
+            follow: cli.follow && interactive,
+        },
         (None, Some(p)) => {
             if !p.exists() {
                 bail!("{}: no such file", p.display());

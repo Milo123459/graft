@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -61,16 +61,19 @@ enum Parser {
     Columns,
     Csv,
     Json,
+    /// Count lines matching patterns (--grep).
+    Grep,
 }
 
 impl Parser {
-    const ALL: [Parser; 7] = [
+    const ALL: [Parser; 8] = [
         Parser::Template,
         Parser::Regex,
         Parser::Kv,
         Parser::Columns,
         Parser::Csv,
         Parser::Json,
+        Parser::Grep,
         Parser::Auto,
     ];
 
@@ -84,11 +87,15 @@ impl Parser {
             Parser::Columns => "columns",
             Parser::Csv => "csv",
             Parser::Json => "json",
+            Parser::Grep => "count lines",
         }
     }
 
     fn takes_text(self) -> bool {
-        matches!(self, Parser::Template | Parser::Regex | Parser::Columns)
+        matches!(
+            self,
+            Parser::Template | Parser::Regex | Parser::Columns | Parser::Grep
+        )
     }
 }
 
@@ -265,6 +272,8 @@ impl Builder {
             (Parser::Csv, String::new())
         } else if cli.json {
             (Parser::Json, String::new())
+        } else if !cli.grep.is_empty() {
+            (Parser::Grep, cli.grep.join("; "))
         } else if cli.auto {
             (Parser::Auto, String::new())
         } else {
@@ -372,6 +381,15 @@ impl Builder {
                 if path.is_empty() {
                     return self.error("enter a file path".into());
                 }
+                // A file on another machine: sample it over ssh.
+                if self.cli.ssh.is_some() {
+                    self.loading = Some(run_sample_command(
+                        format!("head -n {SAMPLE_LINES} {}", crate::cli::shell_quote(&path)),
+                        self.cli.ssh.clone(),
+                    ));
+                    self.message = Some(("reading the file over ssh…".into(), false));
+                    return;
+                }
                 match std::fs::File::open(&path) {
                     Ok(f) => {
                         self.sample = BufReader::new(f)
@@ -410,7 +428,7 @@ impl Builder {
                     self.from_command = true;
                     return self.sample_loaded();
                 }
-                self.loading = Some(run_sample_command(cmd));
+                self.loading = Some(run_sample_command(cmd, self.cli.ssh.clone()));
                 self.message = Some(("running the command for a sample…".into(), false));
             }
             Src::Stdin => {
@@ -516,6 +534,14 @@ impl Builder {
             }
             Parser::Csv => c.csv = true,
             Parser::Json => c.json = true,
+            Parser::Grep => {
+                c.grep = text
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(String::from)
+                    .collect();
+            }
         }
         c.delimiter = if matches!(self.parser, Parser::Csv | Parser::Columns) {
             delimiter
@@ -1202,6 +1228,7 @@ impl Builder {
             let (label, ph) = match self.parser {
                 Parser::Template => ("format ", "{time} name: {value}"),
                 Parser::Regex => ("regex ", "(?P<time>\\S+) (?P<value>\\d+)"),
+                Parser::Grep => ("count ", "errors=ERROR; warnings=WARN  (per minute)"),
                 _ => ("columns ", "all  or  1,3"),
             };
             self.field(f, fmt_rows[0], label, Field::Format, ph);
@@ -1637,13 +1664,11 @@ impl Builder {
 }
 
 /// Run a command once in the background and collect its first lines.
-fn run_sample_command(cmd: String) -> Receiver<Result<Vec<String>, String>> {
+fn run_sample_command(cmd: String, ssh: Option<String>) -> Receiver<Result<Vec<String>, String>> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let result = (|| -> Result<Vec<String>, String> {
-            let mut child = Command::new("sh")
-                .arg("-c")
-                .arg(&cmd)
+            let mut child = crate::remote::command(ssh.as_deref(), &cmd)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -1694,8 +1719,11 @@ fn run_sample_command(cmd: String) -> Receiver<Result<Vec<String>, String>> {
 }
 
 /// Run a command once and return its first lines (for suggestions outside the TUI).
-pub fn sample_command_blocking(cmd: &str) -> Option<Vec<String>> {
-    run_sample_command(cmd.to_string()).recv().ok()?.ok()
+pub fn sample_command_blocking(cmd: &str, ssh: Option<&str>) -> Option<Vec<String>> {
+    run_sample_command(cmd.to_string(), ssh.map(String::from))
+        .recv()
+        .ok()?
+        .ok()
 }
 
 #[cfg(test)]

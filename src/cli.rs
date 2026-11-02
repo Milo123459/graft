@@ -51,6 +51,12 @@ pub struct Cli {
     )]
     pub cmd: Option<String>,
 
+    /// Run --cmd on another machine (or read FILE there): `--ssh pi@raspberrypi`, or
+    /// a host from ~/.ssh/config. Needs key/agent login (no password prompts). Presets
+    /// work too: `graft -p cpu --ssh pi`.
+    #[arg(long, value_name = "HOST", help_heading = "Input")]
+    pub ssh: Option<String>,
+
     /// Interval between --cmd runs.
     #[arg(short = 'n', long, value_name = "DURATION", default_value = "1s", value_parser = parse_duration, help_heading = "Input")]
     pub every: Duration,
@@ -461,6 +467,7 @@ impl Cli {
             }
         };
         opt("--cmd", self.cmd.clone());
+        opt("--ssh", self.ssh.clone());
         opt(
             "--every",
             (self.every != d.every).then(|| fmt_secs(self.every.as_secs_f64())),
@@ -635,6 +642,7 @@ impl Cli {
         self.columns = None;
         self.parse_fn = false;
         self.auto = false;
+        self.grep.clear();
     }
 
     /// Whether a way of parsing the input was chosen (one is always required).

@@ -86,8 +86,10 @@ pub fn list() -> Vec<Recent> {
 pub fn portable(cli: &Cli) -> Cli {
     let abs = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
     let mut c = cli.clone();
+    // Remote paths are the remote machine's business.
     if let Some(p) = &cli.input
         && p.as_os_str() != "-"
+        && cli.ssh.is_none()
     {
         c.input = Some(abs(p));
     }
@@ -99,7 +101,7 @@ pub fn portable(cli: &Cli) -> Cli {
 
 /// Same file or command: the newer view replaces the older.
 fn same_source(a: &Cli, b: &Cli) -> bool {
-    a.input == b.input && a.cmd == b.cmd
+    a.input == b.input && a.cmd == b.cmd && a.ssh == b.ssh
 }
 
 /// Remember a chart that was viewed. Piped input can't be reopened, so it isn't kept.
@@ -187,10 +189,16 @@ impl Recent {
         if let Some(t) = &cli.title {
             return t.clone();
         }
+        let host = cli
+            .ssh
+            .as_ref()
+            .map(|h| format!("{h}: "))
+            .unwrap_or_default();
         if let Some(c) = &cli.cmd {
-            return c.clone();
+            return format!("{host}{c}");
         }
-        cli.input
+        let name = cli
+            .input
             .as_ref()
             .map(|p| {
                 p.file_name().map_or_else(
@@ -198,7 +206,8 @@ impl Recent {
                     |n| n.to_string_lossy().into_owned(),
                 )
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        format!("{host}{name}")
     }
 
     /// "2h ago · 3 panes · bar".

@@ -9,6 +9,7 @@ mod interactive;
 mod parse;
 mod profile;
 mod recent;
+mod remote;
 mod render;
 mod script;
 mod session;
@@ -148,9 +149,14 @@ fn no_format_error(cli: &Cli, interactive: bool) -> anyhow::Error {
         Ok(SourceSpec::File { path, .. }) => std::fs::read_to_string(&path)
             .map(|s| s.lines().take(300).map(String::from).collect())
             .unwrap_or_default(),
-        Ok(SourceSpec::Command { cmd, .. }) => {
-            builder::sample_command_blocking(&cmd).unwrap_or_default()
+        Ok(SourceSpec::Command { cmd, ssh, .. }) => {
+            builder::sample_command_blocking(&cmd, ssh.as_deref()).unwrap_or_default()
         }
+        Ok(SourceSpec::Remote { host, path, .. }) => builder::sample_command_blocking(
+            &format!("head -n 300 {}", cli::shell_quote(&path)),
+            Some(&host),
+        )
+        .unwrap_or_default(),
         Ok(SourceSpec::Stdin) => std::io::stdin()
             .lines()
             .map_while(Result::ok)
