@@ -4,6 +4,7 @@
 pub mod ansi;
 pub mod svg;
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 
 use ratatui::buffer::Buffer;
@@ -12,12 +13,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Bar, BarChart, Block, Chart, Dataset as RDataset, GraphType, LegendPosition, Paragraph,
-    Sparkline, Widget,
+    Axis, Bar, BarChart, Block, Chart, Clear, Dataset as RDataset, GraphType, LegendPosition,
+    Paragraph, Sparkline, Widget,
 };
 
-use crate::cli::{ChartKind, LegendPos, MarkerKind};
-use crate::data::{Dataset, Series};
+use crate::cli::{ChartKind, FitModel, LegendPos, MarkerKind};
+use crate::data::{Dataset, Series, XKind};
+use crate::stats::{Analysis, Fit};
 use crate::units::Unit;
 
 pub const DEFAULT_PALETTE: [Color; 12] = [
@@ -42,6 +44,24 @@ pub struct HLine {
     pub label: Option<String>,
 }
 
+/// How far ahead to project trends.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Horizon {
+    /// Far enough to reach the target if that's within 4× the data span, else half the span.
+    Auto,
+    Span(f64),
+}
+
+impl Horizon {
+    pub fn parse(s: &str) -> anyhow::Result<Self> {
+        Ok(if s == "auto" {
+            Self::Auto
+        } else {
+            Self::Span(crate::time::parse_duration_secs(s)?)
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ChartOpts {
     pub kind: ChartKind,
@@ -56,23 +76,110 @@ pub struct ChartOpts {
     pub bins: usize,
     /// Draw each series in its own panel.
     pub split: bool,
+    /// strftime format for time-axis labels.
+    pub x_format: Option<String>,
+    /// Trend fitting and targets (targets are drawn; forecasts use the fit).
+    pub analysis: Analysis,
+    /// Project trends this far into the future.
+    pub forecast: Option<Horizon>,
+}
+
+impl Default for ChartOpts {
+    fn default() -> Self {
+        Self {
+            kind: ChartKind::Line,
+            marker: MarkerKind::Braille,
+            title: String::new(),
+            palette: DEFAULT_PALETTE.to_vec(),
+            legend: LegendPos::TopRight,
+            log: false,
+            ymin: None,
+            ymax: None,
+            hlines: Vec::new(),
+            bins: 20,
+            split: false,
+            x_format: None,
+            analysis: Analysis::default(),
+            forecast: None,
+        }
+    }
 }
 
 impl ChartOpts {
     pub fn color(&self, idx: usize) -> Color {
         self.palette[idx % self.palette.len()]
     }
+
+    /// Format an x value for an axis label.
+    pub fn fmt_x(&self, ds: &Dataset, x: f64, span: f64) -> String {
+        match (&self.x_format, ds.x_kind) {
+            (Some(f), XKind::Time) => crate::time::format_time_with(x, f),
+            _ => ds.fmt_x(x, span),
+        }
+    }
+
+    /// The projection for one series: its fit and how far ahead to draw it.
+    pub fn projection(&self, s: &Series) -> Option<(Fit, f64)> {
+        let horizon = self.forecast?;
+        let fit = self.analysis.fit(s)?;
+        let span = (fit.x_last - s.points.first()?.0).max(f64::MIN_POSITIVE);
+        let ahead = match horizon {
+            Horizon::Span(h) => h,
+            Horizon::Auto => {
+                let target = self
+                    .analysis
+                    .targets
+                    .resolve(&s.name, Some(&fit), s.points.last()?.1);
+                match target.and_then(|t| fit.eta(t)) {
+                    Some(eta) if eta <= span * 4.0 => eta * 1.1,
+                    _ => span * 0.5,
+                }
+            }
+        };
+        (ahead > 0.0).then_some((fit, ahead))
+    }
+}
+
+/// A plotted area on screen and the x range it shows (for mapping taps to x).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlotArea {
+    pub rect: Rect,
+    pub x0: f64,
+    pub x1: f64,
+}
+
+impl PlotArea {
+    /// The x value under a terminal column.
+    pub fn x_at(&self, col: u16) -> f64 {
+        let frac =
+            (f64::from(col.saturating_sub(self.rect.x)) + 0.5) / f64::from(self.rect.width.max(1));
+        self.x0 + frac.clamp(0.0, 1.0) * (self.x1 - self.x0)
+    }
+
+    /// The terminal column showing x.
+    pub fn col_of(&self, x: f64) -> u16 {
+        let frac = ((x - self.x0) / (self.x1 - self.x0)).clamp(0.0, 1.0);
+        self.rect.x
+            + ((frac * f64::from(self.rect.width)) as u16).min(self.rect.width.saturating_sub(1))
+    }
+
+    pub fn contains(&self, col: u16, row: u16) -> bool {
+        self.rect
+            .contains(ratatui::layout::Position { x: col, y: row })
+    }
 }
 
 /// Interactive state drawn on top of the chart.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Overlay<'a> {
-    /// Visible x range; `None` fits all data.
+    /// Visible x range; `None` fits all data (plus any forecast).
     pub view: Option<(f64, f64)>,
     pub cursor: Option<f64>,
     /// A range being selected (start fixed, end at cursor) or selected.
     pub selection: Option<(f64, f64)>,
     pub hidden: Option<&'a HashSet<String>>,
+    /// Receives the plot areas drawn (one per panel).
+    pub plots: Option<&'a RefCell<Vec<PlotArea>>>,
 }
 
 impl Overlay<'_> {
@@ -103,10 +210,35 @@ fn legend(l: LegendPos) -> Option<LegendPosition> {
     })
 }
 
-/// The x range to display.
+/// The x range of the data alone.
 pub fn x_bounds(ds: &Dataset, view: Option<(f64, f64)>) -> (f64, f64) {
     let (a, b) = view.or_else(|| ds.x_range()).unwrap_or((0.0, 1.0));
     if b > a { (a, b) } else { (a - 0.5, b + 0.5) }
+}
+
+/// The x range to plot: the view, or all data extended by any forecast.
+pub fn plot_x_bounds(
+    ds: &Dataset,
+    opts: &ChartOpts,
+    view: Option<(f64, f64)>,
+    hidden: Option<&HashSet<String>>,
+) -> (f64, f64) {
+    let (a, mut b) = x_bounds(ds, view);
+    if view.is_none()
+        && opts.forecast.is_some()
+        && matches!(opts.kind, ChartKind::Line | ChartKind::Scatter)
+    {
+        for s in ds
+            .series
+            .iter()
+            .filter(|s| !hidden.is_some_and(|h| h.contains(&s.name)))
+        {
+            if let Some((fit, ahead)) = opts.projection(s) {
+                b = b.max(fit.x_last + ahead);
+            }
+        }
+    }
+    (a, b)
 }
 
 /// The unit shared by all given series, or none if they differ.
@@ -156,18 +288,22 @@ pub fn visible_points(s: &Series, x0: f64, x1: f64, buckets: usize) -> Vec<(f64,
     out
 }
 
+/// Points along a fitted trend from `from` to `to`.
+pub fn projection_points(fit: &Fit, from: f64, to: f64) -> Vec<(f64, f64)> {
+    let steps = if fit.model == FitModel::Linear { 1 } else { 48 };
+    (0..=steps)
+        .map(|i| from + (to - from) * i as f64 / steps as f64)
+        .map(|x| (x, fit.at(x)))
+        .collect()
+}
+
 /// Padded y bounds for a set of values, honouring explicit overrides.
 pub fn y_bounds(
     values: impl Iterator<Item = f64>,
     ymin: Option<f64>,
     ymax: Option<f64>,
 ) -> (f64, f64) {
-    let (lo, hi) = values
-        .filter(|v| v.is_finite())
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
-            (lo.min(v), hi.max(v))
-        });
-    let (mut lo, mut hi) = if lo.is_finite() { (lo, hi) } else { (0.0, 1.0) };
+    let (mut lo, mut hi) = min_max(values).unwrap_or((0.0, 1.0));
     if hi - lo < f64::EPSILON * hi.abs().max(1.0) {
         let pad = if lo == 0.0 { 1.0 } else { lo.abs() * 0.05 };
         lo -= pad;
@@ -205,10 +341,40 @@ pub fn spaced(lo: f64, hi: f64, n: usize) -> Vec<f64> {
         .collect()
 }
 
-/// A series' points prepared for drawing, with its palette index.
+/// The value of a series at x: the nearest point, or the projected trend past the end.
+pub fn value_at(s: &Series, opts: &ChartOpts, x: f64) -> Option<(f64, bool)> {
+    let last = s.points.last()?;
+    if x > last.0
+        && let Some((fit, _)) = opts.projection(s)
+    {
+        return Some((fit.at(x), true));
+    }
+    let i = s.points.partition_point(|p| p.0 < x);
+    [i.checked_sub(1), Some(i)]
+        .into_iter()
+        .flatten()
+        .filter_map(|i| s.points.get(i))
+        .min_by(|a, b| (a.0 - x).abs().total_cmp(&(b.0 - x).abs()))
+        .map(|p| (p.1, false))
+}
+
+/// Where ratatui's Chart puts the plotting area (mirrors its layout rules).
+fn graph_area(inner: Rect, y_labels: &[Line], first_x_label: Option<&Line>) -> Rect {
+    let y_w = y_labels.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let x_w = first_x_label.map_or(0, |l| (l.width() as u16).saturating_sub(1));
+    let left = y_w.max(x_w).min(inner.width / 3) + 1;
+    Rect {
+        x: inner.x + left,
+        y: inner.y,
+        width: inner.width.saturating_sub(left),
+        height: inner.height.saturating_sub(2),
+    }
+}
+
+/// A series' prepared line: palette index, series, points (y possibly log-scaled).
 type Prepared<'a> = (usize, &'a Series, Vec<(f64, f64)>);
-/// Reference / cursor / selection lines: points, style, optional legend label.
-type OverlayLine = (Vec<(f64, f64)>, Style, Option<String>);
+/// Reference / cursor / selection / forecast lines: points, style, marker, legend label.
+type OverlayLine = (Vec<(f64, f64)>, Style, Marker, Option<String>);
 
 pub struct ChartWidget<'a> {
     pub ds: &'a Dataset,
@@ -242,6 +408,12 @@ impl<'a> ChartWidget<'a> {
         )];
         if self.opts.log {
             title.push(Span::styled("[log] ", Style::default().fg(Color::DarkGray)));
+        }
+        if self.opts.forecast.is_some() {
+            title.push(Span::styled(
+                "[forecast] ",
+                Style::default().fg(Color::DarkGray),
+            ));
         }
         Block::bordered()
             .border_style(Style::default().fg(Color::DarkGray))
@@ -295,19 +467,22 @@ impl<'a> ChartWidget<'a> {
         title: &str,
         panel: bool,
     ) {
-        let (x0, x1) = x_bounds(self.ds, self.overlay.view);
+        let (x0, x1) = plot_x_bounds(self.ds, self.opts, self.overlay.view, self.overlay.hidden);
         let buckets = area.width.saturating_sub(14).max(10) as usize * 2;
         let log = self.opts.log;
         let ty = |v: f64| if log { v.log10() } else { v };
+        let to_log = |pts: &mut Vec<(f64, f64)>| {
+            if log {
+                pts.retain(|p| p.1 > 0.0);
+                pts.iter_mut().for_each(|p| p.1 = p.1.log10());
+            }
+        };
 
         let mut lines: Vec<Prepared> = visible
             .iter()
             .map(|&(i, s)| {
                 let mut pts = visible_points(s, x0, x1, buckets);
-                if log {
-                    pts.retain(|p| p.1 > 0.0);
-                    pts.iter_mut().for_each(|p| p.1 = p.1.log10());
-                }
+                to_log(&mut pts);
                 (i, s, pts)
             })
             .collect();
@@ -327,9 +502,31 @@ impl<'a> ChartWidget<'a> {
             return;
         }
 
+        // Forecast projections and explicit targets, per series.
+        let mut projections: Vec<(usize, Vec<(f64, f64)>)> = Vec::new();
+        let mut targets: Vec<(usize, &str, f64)> = Vec::new();
+        for &(i, s, _) in &lines {
+            if let Some((fit, _)) = self.opts.projection(s) {
+                // The fitted trend over the data it was fitted to, continued to the
+                // right edge so every series covers the same horizon.
+                let (from, to) = (fit.x_first.max(x0), x1);
+                if to > from {
+                    let mut pts = projection_points(&fit, from, to);
+                    to_log(&mut pts);
+                    projections.push((i, pts));
+                }
+            }
+            if let Some(t) = self.opts.analysis.targets.explicit(&s.name)
+                && (!log || t > 0.0)
+            {
+                targets.push((i, &s.name, ty(t)));
+            }
+        }
+
         let in_range: Vec<f64> = lines
             .iter()
             .flat_map(|l| l.2.iter().filter(|p| p.0 >= x0 && p.0 <= x1).map(|p| p.1))
+            .chain(projections.iter().flat_map(|p| p.1.iter().map(|p| p.1)))
             .collect();
         let data = min_max(in_range.iter().copied());
         let hl = self
@@ -341,7 +538,11 @@ impl<'a> ChartWidget<'a> {
             .map(ty)
             .filter(|&v| !panel || data.is_none_or(|(lo, hi)| hline_near(v, lo, hi)));
         let (y0, y1) = y_bounds(
-            in_range.iter().copied().chain(hl),
+            in_range
+                .iter()
+                .copied()
+                .chain(hl)
+                .chain(targets.iter().map(|t| t.2)),
             self.opts.ymin.map(ty),
             self.opts.ymax.map(ty),
         );
@@ -353,7 +554,7 @@ impl<'a> ChartWidget<'a> {
         let ny = (area.height as usize / 4).clamp(2, 6);
         let x_labels: Vec<Line> = spaced(x0, x1, nx)
             .into_iter()
-            .map(|x| Line::from(self.ds.fmt_x(x, span)))
+            .map(|x| Line::from(self.opts.fmt_x(self.ds, x, span)))
             .collect();
         let y_labels: Vec<Line> = spaced(y0, y1, ny)
             .into_iter()
@@ -370,7 +571,26 @@ impl<'a> ChartWidget<'a> {
             overlays.push((
                 vec![(x0, ty(h.value)), (x1, ty(h.value))],
                 style,
+                Marker::Braille,
                 h.label.clone(),
+            ));
+        }
+        for &(i, name, t) in &targets {
+            let label = format!(
+                "{name} target {}",
+                self.ds
+                    .get(name)
+                    .map_or(String::new(), |s| s.unit.format(if log {
+                        10f64.powf(t)
+                    } else {
+                        t
+                    }))
+            );
+            overlays.push((
+                vec![(x0, t), (x1, t)],
+                Style::default().fg(self.opts.color(i)),
+                Marker::Dot,
+                Some(label),
             ));
         }
         if let Some((a, b)) = self.overlay.selection {
@@ -378,14 +598,24 @@ impl<'a> ChartWidget<'a> {
                 overlays.push((
                     vec![(x, y0), (x, y1)],
                     Style::default().fg(Color::Yellow),
+                    Marker::Braille,
                     None,
                 ));
             }
         }
+        for (i, pts) in &projections {
+            overlays.push((
+                pts.clone(),
+                Style::default().fg(self.opts.color(*i)),
+                Marker::Dot,
+                None,
+            ));
+        }
         if let Some(c) = self.overlay.cursor {
             overlays.push((
                 vec![(c, y0), (c, y1)],
-                Style::default().fg(Color::Gray),
+                Style::default().fg(Color::White),
+                Marker::Braille,
                 None,
             ));
         }
@@ -398,11 +628,11 @@ impl<'a> ChartWidget<'a> {
         let mk = marker(self.opts.marker);
         let mut datasets: Vec<RDataset> = overlays
             .iter()
-            .map(|(pts, style, label)| {
+            .map(|(pts, style, m, label)| {
                 let d = RDataset::default()
                     .data(pts)
                     .graph_type(GraphType::Line)
-                    .marker(Marker::Braille)
+                    .marker(*m)
                     .style(*style);
                 match label {
                     Some(l) => d.name(l.clone()),
@@ -427,9 +657,11 @@ impl<'a> ChartWidget<'a> {
             );
         }
 
+        let block = self.block_titled(title);
+        let plot = graph_area(block.inner(area), &y_labels, x_labels.first());
         let axis_style = Style::default().fg(Color::Gray);
         Chart::new(datasets)
-            .block(self.block_titled(title))
+            .block(block)
             .x_axis(
                 Axis::default()
                     .bounds([x0, x1])
@@ -442,9 +674,82 @@ impl<'a> ChartWidget<'a> {
                     .labels(y_labels)
                     .style(axis_style),
             )
-            .legend_position(legend(self.opts.legend))
+            // With a cursor, its readout box takes the legend's place.
+            .legend_position(if self.overlay.cursor.is_some() {
+                None
+            } else {
+                legend(self.opts.legend)
+            })
             .hidden_legend_constraints((Constraint::Ratio(2, 3), Constraint::Ratio(2, 3)))
             .render(area, buf);
+
+        let plot = PlotArea { rect: plot, x0, x1 };
+        if let Some(plots) = self.overlay.plots {
+            plots.borrow_mut().push(plot);
+        }
+        if let Some(c) = self.overlay.cursor
+            && (x0..=x1).contains(&c)
+        {
+            self.render_readout(
+                buf,
+                &plot,
+                c,
+                &lines.iter().map(|l| (l.0, l.1)).collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    /// A small box beside the cursor listing each series' value there.
+    fn render_readout(
+        &self,
+        buf: &mut Buffer,
+        plot: &PlotArea,
+        x: f64,
+        series: &[(usize, &Series)],
+    ) {
+        let mut lines = vec![Line::styled(
+            self.ds.fmt_x_full(x),
+            Style::default().add_modifier(Modifier::BOLD),
+        )];
+        for &(i, s) in series {
+            if let Some((v, projected)) = value_at(s, self.opts, x) {
+                let text = if projected {
+                    format!("≈{} (forecast)", s.unit.format(v))
+                } else {
+                    s.unit.format(v)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{} ", s.name),
+                        Style::default().fg(self.opts.color(i)),
+                    ),
+                    Span::raw(text),
+                ]));
+            }
+        }
+        let w =
+            (lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16 + 2).min(plot.rect.width);
+        let h = (lines.len() as u16).min(plot.rect.height);
+        if w < 4 || h == 0 {
+            return;
+        }
+        let col = plot.col_of(x);
+        let x_pos = if col + 2 + w <= plot.rect.right() {
+            col + 2
+        } else {
+            col.saturating_sub(w + 1).max(plot.rect.x)
+        };
+        let rect = Rect {
+            x: x_pos,
+            y: plot.rect.y,
+            width: w,
+            height: h,
+        };
+        Clear.render(rect, buf);
+        Paragraph::new(lines)
+            .style(Style::default().bg(Color::Black).fg(Color::White))
+            .block(Block::default().padding(ratatui::widgets::Padding::horizontal(1)))
+            .render(rect, buf);
     }
 
     fn render_bar(self, area: Rect, buf: &mut Buffer) {
@@ -658,6 +963,46 @@ mod tests {
     }
 
     #[test]
+    fn plot_area_maps_columns() {
+        let p = PlotArea {
+            rect: Rect::new(10, 0, 100, 10),
+            x0: 0.0,
+            x1: 100.0,
+        };
+        assert_eq!(p.x_at(10), 0.5);
+        assert_eq!(p.col_of(50.0), 60);
+        assert_eq!(p.x_at(500), 100.0);
+    }
+
+    #[test]
+    fn forecast_extends_bounds_and_values() {
+        let s = Series {
+            name: "a".into(),
+            unit: Unit::default(),
+            points: (0..11).map(|i| (i as f64, 100.0 - i as f64)).collect(),
+        };
+        let ds = Dataset {
+            x_kind: XKind::Index,
+            series: vec![s],
+        };
+        let mut opts = ChartOpts {
+            forecast: Some(Horizon::Span(10.0)),
+            ..ChartOpts::default()
+        };
+        assert_eq!(plot_x_bounds(&ds, &opts, None, None), (0.0, 20.0));
+        assert_eq!(value_at(&ds.series[0], &opts, 15.0), Some((85.0, true)));
+        assert_eq!(value_at(&ds.series[0], &opts, 4.4), Some((96.0, false)));
+        // Auto horizon reaches a near target: 80 is reached 10 x-units after the end.
+        opts.forecast = Some(Horizon::Auto);
+        opts.analysis.targets = crate::stats::Targets::parse(&["a=80".into()], false).unwrap();
+        let (_, ahead) = opts.projection(&ds.series[0]).unwrap();
+        assert!((ahead - 10.0 * 1.1).abs() < 1e-9);
+        // A far target falls back to half the span.
+        opts.analysis.targets = crate::stats::Targets::parse(&["a=-1000".into()], false).unwrap();
+        assert_eq!(opts.projection(&ds.series[0]).unwrap().1, 5.0);
+    }
+
+    #[test]
     fn y_bounds_pad_and_override() {
         assert_eq!(y_bounds([5.0, 5.0].into_iter(), None, None), (4.75, 5.25));
         let (lo, hi) = y_bounds([0.0, 10.0].into_iter(), Some(0.0), None);
@@ -684,13 +1029,7 @@ mod tests {
         ] {
             let opts = ChartOpts {
                 kind,
-                marker: MarkerKind::Braille,
                 title: "t".into(),
-                palette: DEFAULT_PALETTE.to_vec(),
-                legend: LegendPos::TopRight,
-                log: false,
-                ymin: None,
-                ymax: None,
                 hlines: vec![HLine {
                     value: 0.5,
                     color: None,
@@ -698,10 +1037,26 @@ mod tests {
                 }],
                 bins: 10,
                 split: kind == ChartKind::Line,
+                forecast: Some(Horizon::Auto),
+                analysis: Analysis {
+                    targets: crate::stats::Targets::parse(&["a=0.5".into()], false).unwrap(),
+                    ..Analysis::default()
+                },
+                ..ChartOpts::default()
             };
             for (w, h) in [(80, 20), (10, 4), (200, 60)] {
                 let buf = render_to_buffer(&ds, &opts, w, h);
                 assert_eq!(buf.area.width, w);
+                // With a cursor (and readout) too.
+                let area = Rect::new(0, 0, w, h);
+                let mut buf = Buffer::empty(area);
+                let plots = RefCell::new(Vec::new());
+                let overlay = Overlay {
+                    cursor: Some(60.0),
+                    plots: Some(&plots),
+                    ..Overlay::default()
+                };
+                ChartWidget::new(&ds, &opts, overlay).render(area, &mut buf);
             }
         }
     }

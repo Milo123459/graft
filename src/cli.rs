@@ -10,23 +10,32 @@ use crate::time::parse_duration;
 
 const EXAMPLES: &str = "\
 Examples:
+  graft                                         open the builder: pick a source, get format suggestions
   graft reclaimable.log                         auto-detect timestamps and `key: value` pairs
+  graft reclaimable.log -F '{time} node1: {node1} node2: {node2}'   an explicit format template
   graft reclaimable.log --stats --once          print the chart, stats and trend, then exit
+  graft reclaimable.log --forecast=7d --target node1=50GB --fit-window 12h
+  graft app.log -F '{time} {_} took {latency}'  `{_}` skips text; units like `12ms` are understood
   graft app.log -r '(?P<time>\\S+ \\S+) .* took (?P<latency>\\d+ms)'
   graft -c 'cat /proc/meminfo' -n 1s --binary-units -s MemFree,Cached
-  graft -c 'cat /proc/net/dev' --kv --rate --unit B -s 'eth*'
+  graft -c 'df -B1' -F '{key} {_} {used} {avail} {_}' -s '*.avail'
   graft data.csv --csv --resample 1h:max --smooth 3
-  graft --explain -r '(?P<node>node\\d): (?P<value>\\S+ GB)' -g node reclaimable.log
   graft reclaimable.log --alert 'node1 < 50GB' --once --no-chart && echo ok
   graft -p meminfo                              run a saved (or built-in) profile
 
-Interactive keys: press ? inside the viewer.";
+Format templates (-F): {name} captures a number (with optional unit) as series `name`;
+{time} or {time:%d/%m %H:%M} a timestamp; {x} a numeric x; {key} names the series
+(one per distinct value); {_} skips any text; {name:int}, {name:word} and {name:/regex/}
+change what is matched; spaces match any run of whitespace; {{ and }} are literal braces.
+
+Interactive: mouse/touch works everywhere (tap, drag to select, scroll to zoom);
+press ? inside the viewer for keys.";
 
 /// Graph anything: logs, command output, CSV or JSON — right in your terminal.
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug, Clone, PartialEq)]
 #[command(name = "graft", version, about, after_help = EXAMPLES, args_override_self = true)]
 pub struct Cli {
-    /// Input file. Use "-" (or pipe data in) to read stdin.
+    /// Input file. Use "-" (or pipe data in) to read stdin. Omit to open the builder.
     #[arg(value_name = "FILE")]
     pub input: Option<PathBuf>,
 
@@ -58,6 +67,17 @@ pub struct Cli {
     pub window: Option<Window>,
 
     // ───────────── Parsing ─────────────
+    /// Parse lines with a format template, e.g. `{time} node1: {node1} node2: {node2}`
+    /// (see "Format templates" below).
+    #[arg(
+        short = 'F',
+        long,
+        value_name = "TEMPLATE",
+        group = "parser",
+        help_heading = "Parsing"
+    )]
+    pub format: Option<String>,
+
     /// Parse lines with a regex. Named groups become series; special names:
     /// `time` (timestamp), `x` (numeric x), `key`/`series` (series name), `value`, `unit`.
     #[arg(
@@ -81,15 +101,14 @@ pub struct Cli {
     #[arg(long, group = "parser", help_heading = "Parsing")]
     pub json: bool,
 
-    /// Whitespace-separated columns to use (1-based), e.g. `1,3`. Header rows are detected.
+    /// Whitespace-separated columns: `1,3` (1-based) or `all` numeric columns.
     #[arg(
         long,
-        value_name = "N,..",
-        value_delimiter = ',',
+        value_name = "N,..|all",
         group = "parser",
         help_heading = "Parsing"
     )]
-    pub columns: Option<Vec<usize>>,
+    pub columns: Option<String>,
 
     /// Parse each line with the `parse(line)` function from --script (returns a map).
     #[arg(long, group = "parser", requires = "script", help_heading = "Parsing")]
@@ -178,6 +197,10 @@ pub struct Cli {
     #[arg(short = 'k', long, value_enum, default_value_t = ChartKind::Line, help_heading = "Chart")]
     pub kind: ChartKind,
 
+    /// Give each series its own panel and y axis (useful when scales differ a lot).
+    #[arg(long, help_heading = "Chart")]
+    pub split: bool,
+
     /// Point marker for line/scatter charts.
     #[arg(short = 'm', long, value_enum, default_value_t = MarkerKind::Braille, help_heading = "Chart")]
     pub marker: MarkerKind,
@@ -198,10 +221,6 @@ pub struct Cli {
     /// Legend position.
     #[arg(long, value_enum, default_value_t = LegendPos::TopRight, help_heading = "Chart")]
     pub legend: LegendPos,
-
-    /// Give each series its own panel and y axis (useful when scales differ a lot).
-    #[arg(long, help_heading = "Chart")]
-    pub split: bool,
 
     /// Logarithmic y axis.
     #[arg(long, help_heading = "Chart")]
@@ -233,6 +252,10 @@ pub struct Cli {
     #[arg(long, default_value_t = 20, help_heading = "Chart")]
     pub bins: usize,
 
+    /// strftime format for time-axis labels (default: chosen from the visible span).
+    #[arg(long, value_name = "FORMAT", help_heading = "Chart")]
+    pub x_format: Option<String>,
+
     /// Output width in columns (default: terminal width).
     #[arg(long, help_heading = "Chart")]
     pub width: Option<u16>,
@@ -250,18 +273,42 @@ pub struct Cli {
     #[arg(short = 'S', long, help_heading = "Analysis")]
     pub stats: bool,
 
+    /// Stats output: `text` (table + sentences) or `json`.
+    #[arg(long, value_enum, default_value_t = StatsFormat::Text, help_heading = "Analysis")]
+    pub stats_format: StatsFormat,
+
+    /// One line per series from a template, e.g. `{name}: {trend}/{per}, {eta}`. Fields:
+    /// name n first last min max mean median stddev p95 change trend per r2 target eta eta_at
+    /// direction model; append `:raw` for unformatted numbers (`{last:raw}`).
+    #[arg(long, value_name = "TEMPLATE", help_heading = "Analysis")]
+    pub stats_template: Option<String>,
+
     /// Express trends per this duration (default: chosen from the data span).
     #[arg(long, value_name = "DURATION", help_heading = "Analysis")]
     pub per: Option<String>,
 
-    /// Forecast when each series reaches this value (default: 0 for falling series).
+    /// Trend model used for trends and forecasts.
+    #[arg(long, value_enum, default_value_t = FitModel::Linear, help_heading = "Analysis")]
+    pub fit: FitModel,
+
+    /// Fit trends to recent data only: a duration (`12h`) or a number of points.
+    #[arg(long, value_name = "WINDOW", value_parser = parse_window, help_heading = "Analysis")]
+    pub fit_window: Option<Window>,
+
+    /// Forecast target(s): `50GB` for every series, `node1=50GB` for one, `none` to disable.
+    /// Comma separated or repeated. Default: 0 for series that are falling.
     #[arg(
         long,
-        value_name = "VALUE",
+        value_name = "[NAME=]VALUE",
+        value_delimiter = ',',
         allow_hyphen_values = true,
         help_heading = "Analysis"
     )]
-    pub target: Option<String>,
+    pub target: Vec<String>,
+
+    /// Draw the trend projected into the future, e.g. `--forecast` or `--forecast=7d`.
+    #[arg(long, value_name = "HORIZON", num_args = 0..=1, require_equals = true, default_missing_value = "auto", help_heading = "Analysis")]
+    pub forecast: Option<String>,
 
     /// Exit with status 3 if a Rhai condition holds, e.g. `node1 < 50GB` or `slope("node2") < 0`.
     #[arg(long, value_name = "EXPR", action = ArgAction::Append, help_heading = "Analysis")]
@@ -281,8 +328,17 @@ pub struct Cli {
     pub export: Vec<PathBuf>,
 
     /// Show how each input line was parsed (first N lines, default 50) and exit.
-    #[arg(long, value_name = "N", num_args = 0..=1, default_missing_value = "50", help_heading = "Output")]
+    #[arg(long, value_name = "N", num_args = 0..=1, require_equals = true, default_missing_value = "50", help_heading = "Output")]
     pub explain: Option<usize>,
+
+    // ───────────── Interactive ─────────────
+    /// Open the interactive builder (source, format suggestions, live preview) first.
+    #[arg(short = 'b', long, help_heading = "Interactive")]
+    pub build: bool,
+
+    /// Don't capture the mouse (keeps the terminal's own text selection working).
+    #[arg(long, help_heading = "Interactive")]
+    pub no_mouse: bool,
 
     // ───────────── Scripting ─────────────
     /// Rhai script defining functions, key bindings (`bind("k", "code")`) or `parse(line)`.
@@ -309,6 +365,202 @@ pub struct Cli {
     /// Print a man page (roff).
     #[arg(long, help_heading = "Misc")]
     pub man: bool,
+}
+
+impl Cli {
+    /// A default configuration (as if run with no arguments).
+    pub fn empty() -> Self {
+        Self::parse_from(["graft"])
+    }
+
+    /// The arguments that reproduce this configuration (only non-default values),
+    /// excluding one-shot actions like --save-profile or --completions.
+    pub fn to_args(&self) -> Vec<String> {
+        let d = Self::empty();
+        let mut a: Vec<String> = Vec::new();
+        let mut opt = |flag: &str, v: Option<String>| {
+            if let Some(v) = v {
+                a.push(flag.into());
+                a.push(v);
+            }
+        };
+        opt("--cmd", self.cmd.clone());
+        opt(
+            "--every",
+            (self.every != d.every).then(|| fmt_secs(self.every.as_secs_f64())),
+        );
+        opt("--count", self.count.map(|c| c.to_string()));
+        opt("--window", self.window.map(fmt_window));
+        opt("--format", self.format.clone());
+        opt("--regex", self.regex.clone());
+        opt("--columns", self.columns.clone());
+        opt(
+            "--names",
+            (!self.names.is_empty()).then(|| self.names.join(",")),
+        );
+        opt("--delimiter", self.delimiter.map(String::from));
+        opt("--group-by", self.group_by.clone());
+        opt("--time-field", self.time_field.clone());
+        opt("--time-format", self.time_format.clone());
+        opt("--x", (self.x != d.x).then(|| value_name(self.x)));
+        opt("--unit", self.unit.clone());
+        opt(
+            "--select",
+            (!self.select.is_empty()).then(|| self.select.join(",")),
+        );
+        opt(
+            "--exclude",
+            (!self.exclude.is_empty()).then(|| self.exclude.join(",")),
+        );
+        for s in &self.derived {
+            opt("--series", Some(s.clone()));
+        }
+        opt(
+            "--resample",
+            self.resample
+                .map(|r| format!("{}:{}", fmt_secs(r.width), value_name(r.agg))),
+        );
+        opt("--smooth", self.smooth.map(|n| n.to_string()));
+        opt(
+            "--kind",
+            (self.kind != d.kind).then(|| value_name(self.kind)),
+        );
+        opt(
+            "--marker",
+            (self.marker != d.marker).then(|| value_name(self.marker)),
+        );
+        opt("--title", self.title.clone());
+        opt(
+            "--colors",
+            (!self.colors.is_empty()).then(|| self.colors.join(",")),
+        );
+        opt(
+            "--legend",
+            (self.legend != d.legend).then(|| value_name(self.legend)),
+        );
+        opt("--ymin", self.ymin.clone());
+        opt("--ymax", self.ymax.clone());
+        for h in &self.hline {
+            opt("--hline", Some(h.clone()));
+        }
+        opt(
+            "--bins",
+            (self.bins != d.bins).then(|| self.bins.to_string()),
+        );
+        opt("--x-format", self.x_format.clone());
+        opt("--width", self.width.map(|w| w.to_string()));
+        opt("--height", self.height.map(|h| h.to_string()));
+        opt(
+            "--stats-format",
+            (self.stats_format != d.stats_format).then(|| value_name(self.stats_format)),
+        );
+        opt("--stats-template", self.stats_template.clone());
+        opt("--per", self.per.clone());
+        opt("--fit", (self.fit != d.fit).then(|| value_name(self.fit)));
+        opt("--fit-window", self.fit_window.map(fmt_window));
+        opt(
+            "--target",
+            (!self.target.is_empty()).then(|| self.target.join(",")),
+        );
+        for e in &self.alert {
+            opt("--alert", Some(e.clone()));
+        }
+        for e in &self.export {
+            opt("--export", Some(e.display().to_string()));
+        }
+        opt(
+            "--script",
+            self.script.as_ref().map(|p| p.display().to_string()),
+        );
+        let flags = [
+            (self.follow, "--follow"),
+            (self.kv, "--kv"),
+            (self.csv, "--csv"),
+            (self.json, "--json"),
+            (self.parse_fn, "--parse-fn"),
+            (self.binary_units, "--binary-units"),
+            (self.rate, "--rate"),
+            (self.delta, "--delta"),
+            (self.split, "--split"),
+            (self.log, "--log"),
+            (self.no_color, "--no-color"),
+            (self.stats, "--stats"),
+            (self.once, "--once"),
+            (self.no_chart, "--no-chart"),
+            (self.no_mouse, "--no-mouse"),
+        ];
+        a.extend(flags.iter().filter(|f| f.0).map(|f| f.1.to_string()));
+        // Optional-value flags need `=`.
+        if let Some(f) = &self.forecast {
+            a.push(if f == "auto" {
+                "--forecast".into()
+            } else {
+                format!("--forecast={f}")
+            });
+        }
+        if let Some(n) = self.explain {
+            a.push(format!("--explain={n}"));
+        }
+        if let Some(input) = &self.input {
+            let s = input.display().to_string();
+            if s.starts_with('-') && s != "-" {
+                a.push("--".into());
+            }
+            a.push(s);
+        }
+        a
+    }
+
+    /// The command line as a copy-pasteable shell string.
+    pub fn command_line(&self) -> String {
+        std::iter::once("graft".to_string())
+            .chain(self.to_args().iter().map(|a| shell_quote(a)))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Clear every parser choice (so exactly one can be set).
+    pub fn clear_parser(&mut self) {
+        self.format = None;
+        self.regex = None;
+        self.kv = false;
+        self.csv = false;
+        self.json = false;
+        self.columns = None;
+        self.parse_fn = false;
+    }
+}
+
+pub fn shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./,:=@%+".contains(c))
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+pub fn fit_name(m: FitModel) -> String {
+    value_name(m)
+}
+
+fn value_name<T: ValueEnum>(v: T) -> String {
+    v.to_possible_value()
+        .map(|p| p.get_name().to_string())
+        .unwrap_or_default()
+}
+
+fn fmt_secs(s: f64) -> String {
+    crate::time::fmt_duration_compact(s)
+}
+
+fn fmt_window(w: Window) -> String {
+    match w {
+        Window::Points(n) => n.to_string(),
+        Window::Span(s) => fmt_secs(s),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -389,6 +641,20 @@ pub enum LegendPos {
     None,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum StatsFormat {
+    Text,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum FitModel {
+    /// Constant change per unit of time (y = a + b·x).
+    Linear,
+    /// Constant percentage change per unit of time (y = a·e^(b·x)); positive values only.
+    Exp,
+}
+
 /// How much data to retain.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Window {
@@ -398,7 +664,20 @@ pub enum Window {
     Points(usize),
 }
 
-fn parse_window(s: &str) -> Result<Window, String> {
+impl Window {
+    /// The trailing part of `points` (sorted by x) inside this window.
+    pub fn apply<'a>(&self, points: &'a [(f64, f64)]) -> &'a [(f64, f64)] {
+        match *self {
+            Window::Points(n) => &points[points.len().saturating_sub(n)..],
+            Window::Span(span) => match points.last() {
+                Some(&(last, _)) => &points[points.partition_point(|p| p.0 < last - span)..],
+                None => points,
+            },
+        }
+    }
+}
+
+pub fn parse_window(s: &str) -> Result<Window, String> {
     if let Ok(n) = s.parse::<usize>() {
         return Ok(Window::Points(n));
     }
@@ -455,5 +734,93 @@ mod tests {
         assert_eq!(parse_window("10m").unwrap(), Window::Span(600.0));
         let r = parse_resample("1h:max").unwrap();
         assert_eq!((r.width, r.agg), (3600.0, Agg::Max));
+    }
+
+    #[test]
+    fn optional_values_do_not_swallow_the_input() {
+        let cli = Cli::try_parse_from(["graft", "--forecast", "x.log", "--explain"]).unwrap();
+        assert_eq!(cli.forecast.as_deref(), Some("auto"));
+        assert_eq!(cli.explain, Some(50));
+        assert_eq!(cli.input, Some("x.log".into()));
+    }
+
+    #[test]
+    fn to_args_round_trips() {
+        let cases: &[&[&str]] = &[
+            &["graft"],
+            &[
+                "graft",
+                "x.log",
+                "-F",
+                "{time} a: {a}",
+                "--stats",
+                "--split",
+                "--forecast=7d",
+                "--target",
+                "a=5GB,none",
+            ],
+            &[
+                "graft",
+                "-c",
+                "cat /proc/meminfo",
+                "-n",
+                "500ms",
+                "-B",
+                "-s",
+                "Mem*,Cached",
+                "--window",
+                "10m",
+                "--kind",
+                "bar",
+            ],
+            &[
+                "graft",
+                "--resample",
+                "1h:max",
+                "--fit",
+                "exp",
+                "--fit-window",
+                "300",
+                "--x",
+                "index",
+                "--",
+                "-odd-name.log",
+            ],
+            &[
+                "graft",
+                "d.csv",
+                "--csv",
+                "--series",
+                "t = a + b",
+                "--hline",
+                "5:red:x",
+                "--explain=3",
+                "--forecast",
+                "--no-mouse",
+            ],
+        ];
+        for args in cases {
+            let cli = Cli::try_parse_from(*args).unwrap();
+            let again =
+                Cli::try_parse_from(std::iter::once("graft".to_string()).chain(cli.to_args()))
+                    .unwrap();
+            assert_eq!(cli, again, "{args:?} -> {:?}", cli.to_args());
+        }
+    }
+
+    #[test]
+    fn command_line_quotes() {
+        let cli = Cli::try_parse_from(["graft", "-c", "cat /proc/meminfo", "--stats"]).unwrap();
+        assert_eq!(
+            cli.command_line(),
+            "graft --cmd 'cat /proc/meminfo' --stats"
+        );
+    }
+
+    #[test]
+    fn window_apply() {
+        let pts = [(0.0, 1.0), (10.0, 2.0), (20.0, 3.0)];
+        assert_eq!(Window::Span(10.0).apply(&pts), &pts[1..]);
+        assert_eq!(Window::Points(1).apply(&pts), &pts[2..]);
     }
 }

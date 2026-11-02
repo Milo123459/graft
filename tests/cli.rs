@@ -66,7 +66,7 @@ fn alerts_set_exit_status() {
 
 #[test]
 fn explain_reports_each_line() {
-    let out = stdout(&graft(&[LOG, "--explain", "2"]));
+    let out = stdout(&graft(&[LOG, "--explain=2"]));
     assert!(
         out.contains("1 ✓ 2026-11-01 04:00 │ node1=59.9 GB  node2=422.6 GB"),
         "{out}"
@@ -145,4 +145,74 @@ fn bad_arguments_are_reported() {
 fn completions_and_man() {
     assert!(stdout(&graft(&["--completions", "zsh"])).contains("#compdef graft"));
     assert!(stdout(&graft(&["--man"])).contains(".TH graft"));
+}
+
+#[test]
+fn format_template_targets_and_custom_stats_output() {
+    let o = graft(&[
+        LOG,
+        "-F",
+        "{time} node1: {node1} node2: {node2}",
+        "--no-chart",
+        "--target",
+        "node1=50GB,node2=200GB",
+        "--stats-template",
+        "{name}: {trend} → {target} in {eta} ({eta_at})",
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let out = stdout(&o);
+    assert!(
+        out.starts_with("node1: -1.97 GB/day → 50 GB in ~3.7 days (2026-11-0"),
+        "{out}"
+    );
+    assert!(
+        out.contains("node2: -7.69 GB/day → 200 GB in ~27.6 days"),
+        "{out}"
+    );
+}
+
+#[test]
+fn stats_json_and_no_default_target() {
+    let o = graft(&[
+        LOG,
+        "--no-chart",
+        "--stats",
+        "--stats-format",
+        "json",
+        "--target",
+        "none",
+        "--fit",
+        "exp",
+    ]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).expect("valid JSON");
+    assert_eq!(v[0]["name"], "node1");
+    assert_eq!(v[0]["trend"]["model"], "exp");
+    assert!(v[0]["target"].is_null() && v[0]["eta_seconds"].is_null());
+}
+
+#[test]
+fn forecast_is_drawn_in_once_mode() {
+    let out = stdout(&graft(&[
+        LOG,
+        "--once",
+        "--forecast=3d",
+        "--target",
+        "node1=50GB",
+        "-s",
+        "node1",
+        "--width",
+        "80",
+        "--height",
+        "14",
+    ]));
+    assert!(
+        out.contains("[forecast]") && out.contains("node1 target 50 GB"),
+        "{out}"
+    );
+}
+
+#[test]
+fn bad_template_is_reported() {
+    let o = graft(&[LOG, "--once", "-F", "{time} {oops"]);
+    assert!(String::from_utf8_lossy(&o.stderr).contains("unclosed '{'"));
 }

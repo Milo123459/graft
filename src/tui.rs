@@ -1,53 +1,117 @@
-//! Interactive viewer: live updates, zoom/pan, cursor, range selection, stats panel
-//! and a Rhai console.
+//! Interactive viewer: live updates, zoom/pan, a scrubber cursor with a value readout,
+//! range selection, stats panel, forecasts, a Rhai console, and full mouse/touch
+//! support (tap, drag, scroll, toolbar) for use from a phone over SSH.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
 use clap::ValueEnum;
-use ratatui::DefaultTerminal;
 use ratatui::Frame;
 use ratatui::crossterm::event::{
-    self, Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, Widget, Wrap};
 
-use crate::cli::ChartKind;
+use crate::cli::{ChartKind, Cli};
 use crate::data::Dataset;
-use crate::render::{ChartOpts, ChartWidget, HLine, Overlay, x_bounds};
+use crate::interactive::{Live, Transition};
+use crate::render::{
+    ChartOpts, ChartWidget, HLine, Horizon, Overlay, PlotArea, plot_x_bounds, value_at,
+};
 use crate::script::{Action, display};
 use crate::session::Session;
-use crate::source::{Event, SourceSpec};
-use crate::stats::{ReportOpts, Stats, slope_unit};
+use crate::setup::Setup;
+use crate::stats::SeriesReport;
+use crate::ui::{Button, Hits, TextInput, flow_height, render_buttons};
 
 const HELP: &[(&str, &str)] = &[
+    (
+        "tap / click",
+        "put the cursor there (values show beside it)",
+    ),
+    (
+        "drag the cursor",
+        "scrub through the data (and into the forecast)",
+    ),
+    ("drag elsewhere", "select a range — stats switch to it"),
+    ("scroll", "zoom in / out around the pointer (shift: pan)"),
+    (
+        "toolbar / chips",
+        "tap buttons and series names; ⋯ shows more",
+    ),
     ("← → / h l", "pan (moves the cursor when it's on)"),
     ("H L", "pan by half a screen"),
     ("+ / -", "zoom in / out"),
     ("0 / r", "reset view"),
-    ("c", "toggle cursor"),
+    ("c / o", "toggle cursor / cursor follows the pointer"),
     ("Home / End", "cursor to first / last point"),
+    ("v", "start / finish a range selection with the keyboard"),
+    ("1-9 / a", "show or hide a series / show all"),
+    ("t m y x", "chart type, marker, log scale, split panels"),
     (
-        "v",
-        "start / finish a range selection (stats for that range)",
+        "f",
+        "toggle forecast (targets: --target or :target(\"s\", 50GB))",
     ),
-    ("1-9", "show / hide a series"),
-    ("a", "show all series"),
-    ("t", "cycle chart type"),
-    ("m", "cycle marker"),
-    ("y", "toggle log y-axis"),
-    ("x", "split series into separate panels"),
-    ("s", "toggle stats panel"),
-    ("space / p", "pause live updates"),
+    ("s / space", "stats panel / pause live updates"),
+    (
+        "F",
+        "change the format or source (builder, with suggestions)",
+    ),
     ("e", "export the view to an SVG file"),
+    ("M", "toggle mouse capture (off = terminal text selection)"),
     (":", "Rhai console, e.g. :slope(\"node1\", \"1d\")"),
     ("q / Esc", "quit (Esc first clears a selection)"),
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cmd {
+    PanLeft,
+    PanRight,
+    ZoomIn,
+    ZoomOut,
+    Reset,
+    Cursor,
+    Follow,
+    Select,
+    Kind,
+    Split,
+    Log,
+    Stats,
+    Forecast,
+    Pause,
+    Format,
+    Console,
+    Export,
+    Help,
+    Quit,
+    More,
+    Marker,
+    Mouse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Hit {
+    Cmd(Cmd),
+    Series(usize),
+}
+
+/// What a mouse press on the chart turned into.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Drag {
+    /// Pressed; becomes a tap or a selection depending on movement.
+    Pending {
+        col: u16,
+        x: f64,
+    },
+    Selecting,
+    /// Dragging the cursor line.
+    Scrub,
+}
 
 struct Message {
     text: String,
@@ -56,19 +120,17 @@ struct Message {
 }
 
 pub struct App {
+    cli: Cli,
     session: Session,
-    rx: Receiver<Event>,
+    live: Live,
     opts: ChartOpts,
-    report: ReportOpts,
     alerts: Vec<String>,
-    spec: SourceSpec,
     /// Every series (for scripts and alerts).
     full: Dataset,
     /// The selected series being displayed.
     ds: Dataset,
     built_rev: u64,
     last_build: Instant,
-    eof: bool,
     view: Option<(f64, f64)>,
     cursor: Option<f64>,
     anchor: Option<f64>,
@@ -77,49 +139,58 @@ pub struct App {
     show_stats: bool,
     paused: bool,
     help: bool,
-    console: Option<String>,
+    console: Option<TextInput>,
     history: Vec<String>,
     history_pos: Option<usize>,
     message: Option<Message>,
     binds: HashMap<char, String>,
     firing: Vec<String>,
-    quit: bool,
+    mouse: bool,
+    follow_pointer: bool,
+    toolbar_more: bool,
+    drag: Option<Drag>,
+    /// Horizon to use when forecasting is switched on.
+    horizon: Horizon,
+    hits: Hits<Hit>,
+    plots: RefCell<Vec<PlotArea>>,
 }
 
 impl App {
-    pub fn new(
-        session: Session,
-        rx: Receiver<Event>,
-        opts: ChartOpts,
-        report: ReportOpts,
-        alerts: Vec<String>,
-        spec: SourceSpec,
-        show_stats: bool,
-    ) -> Self {
+    pub fn new(setup: Setup, live: Live) -> Self {
+        let Setup {
+            cli,
+            mut session,
+            opts,
+            ..
+        } = setup;
+        // Re-parse history kept from a previous configuration.
+        for (line, meta) in &live.raw {
+            let _ = session.feed(line, meta);
+        }
         let binds = session
             .script
             .binds()
             .into_iter()
             .filter_map(|(k, code)| Some((k.chars().next()?, code)))
             .collect();
-        Self {
+        let horizon = opts.forecast.unwrap_or(Horizon::Auto);
+        let mut app = Self {
+            alerts: cli.alert.clone(),
+            show_stats: cli.stats,
+            mouse: !cli.no_mouse,
+            cli,
             session,
-            rx,
+            live,
             opts,
-            report,
-            alerts,
-            spec,
             full: Dataset::default(),
             ds: Dataset::default(),
             built_rev: u64::MAX,
             last_build: Instant::now() - Duration::from_secs(1),
-            eof: false,
             view: None,
             cursor: None,
             anchor: None,
             selection: None,
             hidden: HashSet::new(),
-            show_stats,
             paused: false,
             help: false,
             console: None,
@@ -128,8 +199,41 @@ impl App {
             message: None,
             binds,
             firing: Vec::new(),
-            quit: false,
-        }
+            follow_pointer: false,
+            toolbar_more: false,
+            drag: None,
+            horizon,
+            hits: Hits::default(),
+            plots: RefCell::new(Vec::new()),
+        };
+        app.rebuild(true);
+        app
+    }
+
+    /// The configuration as currently shown (interactive changes folded back in).
+    pub fn current_cli(&self) -> Cli {
+        let mut c = self.cli.clone();
+        c.kind = self.opts.kind;
+        c.marker = self.opts.marker;
+        c.split = self.opts.split;
+        c.log = self.opts.log;
+        c.stats = self.show_stats;
+        c.no_mouse = !self.mouse;
+        c.target = self.opts.analysis.targets.to_specs();
+        c.forecast = self.opts.forecast.map(|h| match h {
+            Horizon::Auto => "auto".into(),
+            Horizon::Span(s) => crate::time::fmt_duration_compact(s),
+        });
+        c
+    }
+
+    /// Hand over the source (and its history) to a new viewer.
+    pub fn into_live(self) -> Live {
+        self.live
+    }
+
+    pub fn live(&self) -> &Live {
+        &self.live
     }
 
     fn say(&mut self, text: impl Into<String>, error: bool) {
@@ -140,30 +244,25 @@ impl App {
         });
     }
 
-    /// Drain pending input without blocking the UI for too long.
-    fn pump(&mut self) {
-        let deadline = Instant::now() + Duration::from_millis(40);
-        while Instant::now() < deadline {
-            match self.rx.try_recv() {
-                Ok(Event::Line(line, meta)) => {
-                    let _ = self.session.feed(&line, &meta);
-                }
-                Ok(Event::Error(e)) => self.say(e, true),
-                Ok(Event::SampleDone) => {}
-                Ok(Event::Eof) | Err(TryRecvError::Disconnected) => {
-                    self.eof = true;
-                    break;
-                }
-                Err(TryRecvError::Empty) => break,
-            }
+    /// Read input and refresh the view (called every frame).
+    pub fn tick(&mut self) {
+        let session = &mut self.session;
+        let errors = self
+            .live
+            .pump(Duration::from_millis(40), &mut |line, meta| {
+                let _ = session.feed(line, meta);
+            });
+        if let Some(e) = errors.into_iter().last() {
+            self.say(e, true);
         }
+        self.rebuild(false);
     }
 
     fn rebuild(&mut self, force: bool) {
         let rev = self.session.store.revision;
         if !force {
             // Throttle rebuilds while data is streaming in.
-            let due = self.eof || self.last_build.elapsed() > Duration::from_millis(150);
+            let due = self.live.eof || self.last_build.elapsed() > Duration::from_millis(150);
             if self.paused || rev == self.built_rev || !due {
                 return;
             }
@@ -202,7 +301,7 @@ impl App {
     // ───────────── view helpers ─────────────
 
     fn bounds(&self) -> (f64, f64) {
-        x_bounds(&self.ds, self.view)
+        plot_x_bounds(&self.ds, &self.opts, self.view, Some(&self.hidden))
     }
 
     /// The range stats and the console operate on.
@@ -223,15 +322,17 @@ impl App {
         xs
     }
 
-    fn zoom(&mut self, factor: f64) {
+    fn zoom_at(&mut self, factor: f64, centre: Option<f64>) {
         let (x0, x1) = self.bounds();
-        let centre = self.cursor.unwrap_or((x0 + x1) / 2.0);
+        let centre = centre.or(self.cursor).unwrap_or((x0 + x1) / 2.0);
         let (lo, hi) = (
             centre - (centre - x0) * factor,
             centre + (x1 - centre) * factor,
         );
         match self.ds.x_range() {
-            Some((a, b)) if factor > 1.0 && hi - lo >= b - a => self.view = None,
+            Some((a, b)) if factor > 1.0 && hi - lo >= b - a && self.opts.forecast.is_none() => {
+                self.view = None
+            }
             _ if hi - lo > 1e-9 => self.view = Some((lo, hi)),
             _ => {}
         }
@@ -257,7 +358,6 @@ impl App {
         };
         if let Some(&x) = next {
             self.cursor = Some(x);
-            // Keep the cursor on screen.
             if x < x0 || x > x1 {
                 let half = (x1 - x0) / 2.0;
                 self.view = Some((x - half, x + half));
@@ -295,6 +395,106 @@ impl App {
             Ok(()) => self.say(format!("saved {name}"), false),
             Err(e) => self.say(format!("export failed: {e:#}"), true),
         }
+    }
+
+    fn toggle_forecast(&mut self) {
+        self.opts.forecast = match self.opts.forecast {
+            Some(h) => {
+                self.horizon = h;
+                None
+            }
+            None => Some(self.horizon),
+        };
+        if self.opts.forecast.is_some() && self.view.is_none() {
+            self.say("forecast on: dotted lines project each trend (set targets with :target(\"name\", 50GB))", false);
+        }
+    }
+
+    fn start_selection(&mut self) {
+        if self.cursor.is_none() {
+            let (a, b) = self.bounds();
+            self.set_cursor_near((a + b) / 2.0);
+        }
+        match (self.anchor.take(), self.cursor) {
+            (None, Some(c)) => {
+                self.anchor = Some(c);
+                self.selection = None;
+                self.say(
+                    "selecting: move the cursor (or drag), then press v / tap select again",
+                    false,
+                );
+            }
+            (Some(a), Some(c)) => {
+                self.selection = Some((a.min(c), a.max(c)));
+                self.show_stats = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn run_cmd(&mut self, cmd: Cmd) -> Transition {
+        match cmd {
+            Cmd::PanLeft if self.cursor.is_some() => self.move_cursor(-1),
+            Cmd::PanRight if self.cursor.is_some() => self.move_cursor(1),
+            Cmd::PanLeft => self.pan(-0.1),
+            Cmd::PanRight => self.pan(0.1),
+            Cmd::ZoomIn => self.zoom_at(0.5, None),
+            Cmd::ZoomOut => self.zoom_at(2.0, None),
+            Cmd::Reset => {
+                self.view = None;
+                self.selection = None;
+                self.anchor = None;
+            }
+            Cmd::Cursor => {
+                if self.cursor.take().is_none() {
+                    let (a, b) = self.bounds();
+                    self.set_cursor_near((a + b) / 2.0);
+                } else {
+                    self.follow_pointer = false;
+                }
+            }
+            Cmd::Follow => {
+                self.follow_pointer = !self.follow_pointer;
+                if self.follow_pointer {
+                    self.say(
+                        "cursor follows the pointer (needs a terminal that reports mouse movement)",
+                        false,
+                    );
+                }
+            }
+            Cmd::Select => self.start_selection(),
+            Cmd::Kind => self.opts.kind = self.opts.kind.next(),
+            Cmd::Marker => self.opts.marker = self.opts.marker.next(),
+            Cmd::Split => self.opts.split = !self.opts.split,
+            Cmd::Log => self.opts.log = !self.opts.log,
+            Cmd::Stats => self.show_stats = !self.show_stats,
+            Cmd::Forecast => self.toggle_forecast(),
+            Cmd::Pause => {
+                self.paused = !self.paused;
+                if !self.paused {
+                    self.rebuild(true);
+                }
+            }
+            Cmd::Format => return Transition::OpenBuilder,
+            Cmd::Console => self.console = Some(TextInput::default()),
+            Cmd::Export => self.export_view(),
+            Cmd::Help => self.help = !self.help,
+            Cmd::Quit => return Transition::Quit,
+            Cmd::More => self.toolbar_more = !self.toolbar_more,
+            Cmd::Mouse => {
+                self.mouse = !self.mouse;
+                self.say(
+                    if self.mouse {
+                        "mouse on"
+                    } else {
+                        "mouse off: terminal text selection works; M turns it back on"
+                    },
+                    false,
+                );
+                return Transition::Mouse(self.mouse);
+            }
+        }
+        Transition::None
     }
 
     // ───────────── console ─────────────
@@ -349,6 +549,11 @@ impl App {
                 Ok(kind) => self.opts.kind = kind,
                 Err(_) => self.say(format!("unknown chart type '{k}'"), true),
             },
+            Action::Target(name, value) => self.opts.analysis.targets.set(&name, value),
+            Action::Forecast(h) => match h.map(|h| Horizon::parse(&h)).transpose() {
+                Ok(h) => self.opts.forecast = h,
+                Err(e) => self.say(format!("forecast: {e}"), true),
+            },
         }
     }
 
@@ -359,7 +564,7 @@ impl App {
         match key.code {
             KeyCode::Esc => self.console = None,
             KeyCode::Enter => {
-                let code = std::mem::take(input);
+                let code = std::mem::take(&mut input.value);
                 self.console = None;
                 self.history_pos = None;
                 if !code.trim().is_empty() {
@@ -367,10 +572,6 @@ impl App {
                     self.eval(&code);
                 }
             }
-            KeyCode::Backspace => {
-                input.pop();
-            }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => input.clear(),
             KeyCode::Up | KeyCode::Down if !self.history.is_empty() => {
                 let last = self.history.len() - 1;
                 let pos = match (key.code, self.history_pos) {
@@ -380,107 +581,251 @@ impl App {
                     _ => last,
                 };
                 self.history_pos = Some(pos);
-                *input = self.history[pos].clone();
+                input.set(self.history[pos].clone());
             }
-            KeyCode::Char(c) => input.push(c),
-            _ => {}
+            _ => {
+                input.key(key);
+            }
         }
     }
 
-    fn on_key(&mut self, key: KeyEvent) {
+    // ───────────── events ─────────────
+
+    pub fn on_event(&mut self, ev: &TermEvent) -> Transition {
+        match ev {
+            TermEvent::Key(k) if k.kind == KeyEventKind::Press => self.on_key(*k),
+            TermEvent::Mouse(m) => self.on_mouse(*m),
+            _ => Transition::None,
+        }
+    }
+
+    fn on_key(&mut self, key: KeyEvent) -> Transition {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.quit = true;
-            return;
+            return Transition::Quit;
         }
         if self.console.is_some() {
-            return self.on_console_key(key);
+            self.on_console_key(key);
+            return Transition::None;
         }
         if self.help {
             self.help = false;
-            return;
+            return Transition::None;
         }
         if let KeyCode::Char(c) = key.code
             && let Some(code) = self.binds.get(&c).cloned()
         {
-            return self.eval(&code);
+            self.eval(&code);
+            return Transition::None;
         }
-        match key.code {
-            KeyCode::Char('q') => self.quit = true,
+        let cmd = match key.code {
+            KeyCode::Char('q') => Cmd::Quit,
             KeyCode::Esc if self.selection.is_some() || self.anchor.is_some() => {
                 self.selection = None;
                 self.anchor = None;
+                return Transition::None;
             }
-            KeyCode::Esc => self.quit = true,
-            KeyCode::Char('?') => self.help = true,
-            KeyCode::Char(':') => self.console = Some(String::new()),
-            KeyCode::Left | KeyCode::Char('h') if self.cursor.is_some() => self.move_cursor(-1),
-            KeyCode::Right | KeyCode::Char('l') if self.cursor.is_some() => self.move_cursor(1),
-            KeyCode::Left | KeyCode::Char('h') => self.pan(-0.1),
-            KeyCode::Right | KeyCode::Char('l') => self.pan(0.1),
-            KeyCode::Char('H') => self.pan(-0.5),
-            KeyCode::Char('L') => self.pan(0.5),
-            KeyCode::Char('+' | '=') => self.zoom(0.5),
-            KeyCode::Char('-' | '_') => self.zoom(2.0),
-            KeyCode::Char('0' | 'r') => {
+            KeyCode::Esc => Cmd::Quit,
+            KeyCode::Char('?') => Cmd::Help,
+            KeyCode::Char(':') => Cmd::Console,
+            KeyCode::Left | KeyCode::Char('h') => Cmd::PanLeft,
+            KeyCode::Right | KeyCode::Char('l') => Cmd::PanRight,
+            KeyCode::Char('H') => {
+                self.pan(-0.5);
+                return Transition::None;
+            }
+            KeyCode::Char('L') => {
+                self.pan(0.5);
+                return Transition::None;
+            }
+            KeyCode::Char('+' | '=') => Cmd::ZoomIn,
+            KeyCode::Char('-' | '_') => Cmd::ZoomOut,
+            KeyCode::Char('0' | 'r') => Cmd::Reset,
+            KeyCode::Char('c') => Cmd::Cursor,
+            KeyCode::Char('o') => Cmd::Follow,
+            KeyCode::Home | KeyCode::End => {
+                let xs = self.visible_xs();
+                self.cursor = if key.code == KeyCode::Home {
+                    xs.first()
+                } else {
+                    xs.last()
+                }
+                .copied();
                 self.view = None;
-                self.selection = None;
-                self.anchor = None;
+                return Transition::None;
             }
-            KeyCode::Char('c') => {
-                if self.cursor.take().is_none() {
-                    let (a, b) = self.bounds();
-                    self.set_cursor_near((a + b) / 2.0);
+            KeyCode::Char('v') => Cmd::Select,
+            KeyCode::Char(d @ '1'..='9') => {
+                self.toggle_series(d as usize - '1' as usize);
+                return Transition::None;
+            }
+            KeyCode::Char('a') => {
+                self.hidden.clear();
+                return Transition::None;
+            }
+            KeyCode::Char('t') => Cmd::Kind,
+            KeyCode::Char('m') => Cmd::Marker,
+            KeyCode::Char('y') => Cmd::Log,
+            KeyCode::Char('x') => Cmd::Split,
+            KeyCode::Char('s') => Cmd::Stats,
+            KeyCode::Char('f') => Cmd::Forecast,
+            KeyCode::Char('F') => Cmd::Format,
+            KeyCode::Char('M') => Cmd::Mouse,
+            KeyCode::Char(' ' | 'p') => Cmd::Pause,
+            KeyCode::Char('e') => Cmd::Export,
+            _ => return Transition::None,
+        };
+        self.run_cmd(cmd)
+    }
+
+    fn plot_at(&self, col: u16, row: u16) -> Option<PlotArea> {
+        self.plots
+            .borrow()
+            .iter()
+            .find(|p| p.contains(col, row))
+            .copied()
+    }
+
+    /// Any plot (they share an x axis) — for drags that leave the plot area.
+    fn any_plot(&self) -> Option<PlotArea> {
+        self.plots.borrow().first().copied()
+    }
+
+    fn on_mouse(&mut self, m: MouseEvent) -> Transition {
+        let (col, row) = (m.column, m.row);
+        if self.help {
+            if matches!(m.kind, MouseEventKind::Down(_)) {
+                self.help = false;
+            }
+            return Transition::None;
+        }
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((_, hit)) = self.hits.at(col, row) {
+                    return match hit {
+                        Hit::Cmd(cmd) => self.run_cmd(cmd),
+                        Hit::Series(i) => {
+                            self.toggle_series(i);
+                            Transition::None
+                        }
+                    };
+                }
+                if let Some(plot) = self.plot_at(col, row) {
+                    let on_cursor = self
+                        .cursor
+                        .is_some_and(|c| plot.col_of(c).abs_diff(col) <= 1);
+                    self.drag = Some(if on_cursor {
+                        Drag::Scrub
+                    } else {
+                        Drag::Pending {
+                            col,
+                            x: plot.x_at(col),
+                        }
+                    });
                 }
             }
-            KeyCode::Home => {
-                let xs = self.visible_xs();
-                self.cursor = xs.first().copied();
-                self.view = None;
-            }
-            KeyCode::End => {
-                let xs = self.visible_xs();
-                self.cursor = xs.last().copied();
-                self.view = None;
-            }
-            KeyCode::Char('v') => {
-                if self.cursor.is_none() {
-                    let (a, b) = self.bounds();
-                    self.set_cursor_near((a + b) / 2.0);
-                }
-                match (self.anchor.take(), self.cursor) {
-                    (None, Some(c)) => {
-                        self.anchor = Some(c);
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(plot) = self.plot_at(col, row).or_else(|| self.any_plot()) else {
+                    return Transition::None;
+                };
+                let x = plot.x_at(col);
+                match self.drag {
+                    Some(Drag::Scrub) => self.cursor = Some(x),
+                    Some(Drag::Pending { col: c0, x: x0 }) if c0.abs_diff(col) >= 2 => {
+                        self.drag = Some(Drag::Selecting);
+                        self.anchor = Some(x0);
                         self.selection = None;
-                        self.say("selecting: move the cursor, then press v again", false);
+                        self.cursor = Some(x);
                     }
-                    (Some(a), Some(c)) => {
-                        self.selection = Some((a.min(c), a.max(c)));
-                        self.show_stats = true;
-                    }
+                    Some(Drag::Selecting) => self.cursor = Some(x),
                     _ => {}
                 }
             }
-            KeyCode::Char(d @ '1'..='9') => self.toggle_series(d as usize - '1' as usize),
-            KeyCode::Char('a') => self.hidden.clear(),
-            KeyCode::Char('t') => self.opts.kind = self.opts.kind.next(),
-            KeyCode::Char('m') => self.opts.marker = self.opts.marker.next(),
-            KeyCode::Char('y') => self.opts.log = !self.opts.log,
-            KeyCode::Char('x') => self.opts.split = !self.opts.split,
-            KeyCode::Char('s') => self.show_stats = !self.show_stats,
-            KeyCode::Char(' ' | 'p') => {
-                self.paused = !self.paused;
-                if !self.paused {
-                    self.rebuild(true);
+            MouseEventKind::Up(MouseButton::Left) => match self.drag.take() {
+                Some(Drag::Pending { x, .. }) => self.cursor = Some(x),
+                Some(Drag::Selecting) => {
+                    if let (Some(a), Some(c)) = (self.anchor.take(), self.cursor) {
+                        self.selection = Some((a.min(c), a.max(c)));
+                        self.show_stats = true;
+                    }
+                }
+                _ => {}
+            },
+            MouseEventKind::Moved if self.follow_pointer => {
+                if let Some(plot) = self.plot_at(col, row) {
+                    self.cursor = Some(plot.x_at(col));
                 }
             }
-            KeyCode::Char('e') => self.export_view(),
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                if let Some(plot) = self.plot_at(col, row) {
+                    let up = m.kind == MouseEventKind::ScrollUp;
+                    if m.modifiers.contains(KeyModifiers::SHIFT) {
+                        self.pan(if up { -0.1 } else { 0.1 });
+                    } else {
+                        self.zoom_at(if up { 0.8 } else { 1.25 }, Some(plot.x_at(col)));
+                    }
+                }
+            }
+            MouseEventKind::ScrollLeft => self.pan(-0.1),
+            MouseEventKind::ScrollRight => self.pan(0.1),
             _ => {}
         }
+        Transition::None
     }
 
     // ───────────── drawing ─────────────
 
-    fn draw(&self, f: &mut Frame) {
+    fn toolbar(&self) -> Vec<Button<Hit>> {
+        let b = |l: &str, c: Cmd| Button::new(l, Hit::Cmd(c));
+        let mut v = vec![
+            b("◀", Cmd::PanLeft),
+            b("▶", Cmd::PanRight),
+            b("+", Cmd::ZoomIn),
+            b("−", Cmd::ZoomOut),
+            b("reset", Cmd::Reset).active(self.view.is_some()),
+            b("cursor", Cmd::Cursor).active(self.cursor.is_some()),
+            b("select", Cmd::Select).active(self.anchor.is_some() || self.selection.is_some()),
+            b("stats", Cmd::Stats).active(self.show_stats),
+            b("forecast", Cmd::Forecast).active(self.opts.forecast.is_some()),
+            b(if self.toolbar_more { "less" } else { "⋯" }, Cmd::More).active(self.toolbar_more),
+        ];
+        if self.toolbar_more {
+            v.extend([
+                b(self.opts.kind.name(), Cmd::Kind),
+                b("split", Cmd::Split).active(self.opts.split),
+                b("log", Cmd::Log).active(self.opts.log),
+                b("follow", Cmd::Follow).active(self.follow_pointer),
+                b(if self.paused { "resume" } else { "pause" }, Cmd::Pause).active(self.paused),
+                b("format", Cmd::Format),
+                b(":", Cmd::Console),
+                b("svg", Cmd::Export),
+                b("mouse", Cmd::Mouse).active(self.mouse),
+                b("?", Cmd::Help),
+                b("quit", Cmd::Quit),
+            ]);
+        }
+        v
+    }
+
+    fn chips(&self) -> Vec<Button<Hit>> {
+        self.ds
+            .series
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let shown = !self.hidden.contains(&s.name);
+                Button::new(
+                    format!("{} {}", if shown { "●" } else { "○" }, s.name),
+                    Hit::Series(i),
+                )
+                .active(shown)
+            })
+            .collect()
+    }
+
+    pub fn draw(&self, f: &mut Frame) {
+        self.hits.clear();
+        self.plots.borrow_mut().clear();
+        let area = f.area();
         let n_stats = self
             .ds
             .series
@@ -488,18 +833,29 @@ impl App {
             .filter(|s| !self.hidden.contains(&s.name))
             .count() as u16;
         let stats_h = if self.show_stats {
-            (n_stats + 3).min(f.area().height / 2)
+            (n_stats + 3).min(area.height / 3).max(4)
         } else {
             0
         };
+        let (chips, toolbar) = (self.chips(), self.toolbar());
+        let (chips_h, tool_h) = if self.mouse {
+            (
+                flow_height(&chips, area.width).min(2),
+                flow_height(&toolbar, area.width),
+            )
+        } else {
+            (0, 0)
+        };
         let console_h = u16::from(self.console.is_some());
-        let [chart, stats, status, console] = Layout::vertical([
-            Constraint::Min(5),
+        let [chart, stats, chips_area, tool_area, status, console] = Layout::vertical([
+            Constraint::Min(6),
             Constraint::Length(stats_h),
+            Constraint::Length(chips_h),
+            Constraint::Length(tool_h),
             Constraint::Length(1),
             Constraint::Length(console_h),
         ])
-        .areas(f.area());
+        .areas(area);
 
         let selection = match (self.anchor, self.cursor) {
             (Some(a), Some(c)) => Some((a.min(c), a.max(c))),
@@ -510,36 +866,63 @@ impl App {
             cursor: self.cursor,
             selection,
             hidden: Some(&self.hidden),
+            plots: Some(&self.plots),
         };
         f.render_widget(ChartWidget::new(&self.ds, &self.opts, overlay), chart);
         if self.show_stats {
             self.draw_stats(f, stats);
         }
-        f.render_widget(self.status_line(), status);
+        if self.mouse {
+            self.draw_chips(&chips, chips_area, f);
+            render_buttons(&toolbar, tool_area, f.buffer_mut(), &self.hits);
+        }
+        f.render_widget(Paragraph::new(self.status_line()), status);
         if let Some(input) = &self.console {
-            let line = Line::from(vec![
+            let [prompt, field] =
+                Layout::horizontal([Constraint::Length(1), Constraint::Min(1)]).areas(console);
+            f.render_widget(
                 Span::styled(":", Style::default().fg(Color::Yellow)),
-                Span::raw(input.as_str()),
-                Span::styled("▏", Style::default().fg(Color::Yellow)),
-            ]);
-            f.render_widget(Paragraph::new(line), console);
+                prompt,
+            );
+            input.render(field, f.buffer_mut(), true, "");
         }
         if self.help {
             self.draw_help(f);
         }
     }
 
+    fn draw_chips(&self, chips: &[Button<Hit>], area: Rect, f: &mut Frame) {
+        let (rects, _) = crate::ui::flow(chips, area.width);
+        for ((i, chip), r) in chips.iter().enumerate().zip(rects) {
+            if r.y >= area.height {
+                break;
+            }
+            let rect = Rect {
+                x: area.x + r.x,
+                y: area.y + r.y,
+                ..r
+            };
+            let color = self.opts.color(i);
+            let style = if chip.active {
+                Style::default().fg(Color::Black).bg(color)
+            } else {
+                Style::default().fg(color).bg(Color::Rgb(30, 30, 30))
+            };
+            f.render_widget(Span::styled(format!(" {} ", chip.label), style), rect);
+            self.hits.push(rect, chip.action);
+        }
+    }
+
     fn status_line(&self) -> Line<'_> {
         let dim = Style::default().fg(Color::DarkGray);
         let mut spans = Vec::new();
-        let state = if self.paused {
+        spans.push(if self.paused {
             Span::styled("⏸ paused ", Style::default().fg(Color::Yellow))
-        } else if self.spec.is_live() && !self.eof {
+        } else if self.live.spec.is_live() && !self.live.eof {
             Span::styled("● live ", Style::default().fg(Color::Green))
         } else {
             Span::styled("■ ", dim)
-        };
-        spans.push(state);
+        });
         for a in &self.firing {
             spans.push(Span::styled(
                 format!(" ALERT {a} "),
@@ -550,6 +933,10 @@ impl App {
             ));
             spans.push(Span::raw(" "));
         }
+        let message = self
+            .message
+            .as_ref()
+            .filter(|m| m.at.elapsed() < Duration::from_secs(8) || m.error);
         if let Some(c) = self.cursor {
             spans.push(Span::styled(
                 self.ds.fmt_x_full(c),
@@ -562,60 +949,57 @@ impl App {
                 .enumerate()
                 .filter(|(_, s)| !self.hidden.contains(&s.name))
             {
-                let idx = s.points.partition_point(|p| p.0 < c);
-                let near = [idx.checked_sub(1), Some(idx)]
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|i| s.points.get(i))
-                    .min_by(|a, b| (a.0 - c).abs().total_cmp(&(b.0 - c).abs()));
-                if let Some(&(_, y)) = near {
+                if let Some((y, projected)) = value_at(s, &self.opts, c) {
                     spans.push(Span::styled(
                         format!("  {}=", s.name),
                         Style::default().fg(self.opts.color(i)),
                     ));
-                    spans.push(Span::raw(s.unit.format(y)));
+                    spans.push(Span::raw(format!(
+                        "{}{}",
+                        if projected { "≈" } else { "" },
+                        s.unit.format(y)
+                    )));
                 }
             }
-        } else if let Some(m) = self
-            .message
-            .as_ref()
-            .filter(|m| m.at.elapsed() < Duration::from_secs(8) || m.error)
-        {
-            let style = if m.error {
-                Style::default().fg(Color::LightRed)
-            } else {
-                Style::default()
-            };
-            spans.push(Span::styled(m.text.clone(), style));
+            if let Some(m) = message {
+                spans.push(Span::styled(
+                    format!("   {}", m.text),
+                    if m.error {
+                        Style::default().fg(Color::LightRed)
+                    } else {
+                        dim
+                    },
+                ));
+            }
+        } else if let Some(m) = message {
+            spans.push(Span::styled(
+                m.text.clone(),
+                if m.error {
+                    Style::default().fg(Color::LightRed)
+                } else {
+                    Style::default()
+                },
+            ));
         } else {
             let points: usize = self.ds.series.iter().map(|s| s.points.len()).sum();
+            let hint = if self.mouse {
+                "tap to inspect · drag to select · ? help"
+            } else {
+                "? help  : console  q quit"
+            };
             spans.push(Span::styled(
                 format!(
-                    "{} · {} series · {points} points · {} lines{}   ? help  : console  q quit",
+                    "{} · {} series · {points} pts{}   {hint}",
                     self.opts.kind.name(),
                     self.ds.series.len(),
-                    self.session.lines,
                     if self.view.is_some() {
-                        " · zoomed (0 resets)"
+                        " · zoomed"
                     } else {
                         ""
-                    },
+                    }
                 ),
                 dim,
             ));
-        }
-        if self.cursor.is_some()
-            && let Some(m) = self
-                .message
-                .as_ref()
-                .filter(|m| m.at.elapsed() < Duration::from_secs(8))
-        {
-            let style = if m.error {
-                Style::default().fg(Color::LightRed)
-            } else {
-                dim
-            };
-            spans.push(Span::styled(format!("   {}", m.text), style));
         }
         Line::from(spans)
     }
@@ -628,77 +1012,78 @@ impl App {
                 .iter_mut()
                 .for_each(|s| s.points = s.range(a, b).to_vec());
         }
-        let (per, label) = slope_unit(&sub, self.report.per);
-        let header = [
-            "series",
-            "n",
-            "last",
-            "min",
-            "mean",
-            "max",
-            "σ",
-            &format!("Δ/{label}"),
-            "R²",
-            "forecast",
-        ];
-        // (cells, colour of the name, colour of the trend)
-        let mut rows: Vec<(Vec<String>, Color, Color)> = Vec::new();
-        for (i, s) in sub
+        let reports: Vec<(usize, SeriesReport)> = sub
             .series
             .iter()
             .enumerate()
             .filter(|(_, s)| !self.hidden.contains(&s.name))
-        {
-            let Some(st) = Stats::compute(&s.points) else {
-                continue;
-            };
-            let f = |v: f64| s.unit.format(v);
-            let trend = st.slope * per;
-            let target = self
-                .report
-                .target
-                .or_else(|| (st.slope < 0.0 && st.last > 0.0).then_some(0.0));
-            let eta = match (target, sub.x_kind) {
-                (Some(t), crate::data::XKind::Time) if !st.is_flat() => st
-                    .eta(t)
-                    .map(|d| format!("{} in {}", f(t), crate::time::fmt_duration(d)))
-                    .unwrap_or_default(),
-                _ => String::new(),
-            };
-            let (trend_text, r2, trend_color) = if st.count < 2 {
-                ("—".into(), "—".into(), Color::Gray)
-            } else {
-                let color = if st.is_flat() {
-                    Color::Gray
-                } else if trend < 0.0 {
-                    Color::LightRed
-                } else {
-                    Color::LightGreen
+            .filter_map(|(i, s)| Some((i, self.opts.analysis.report(&sub, s)?)))
+            .collect();
+        let label = reports
+            .first()
+            .map_or("day".to_string(), |r| r.1.per_label.clone());
+        // Columns in order of importance: narrow screens drop from the end.
+        let delta = format!("Δ/{label}");
+        let headers = [
+            "series",
+            delta.as_str(),
+            "forecast",
+            "last",
+            "R²",
+            "min",
+            "max",
+            "mean",
+            "σ",
+            "n",
+        ];
+        let rows: Vec<(Vec<String>, Color, Color)> = reports
+            .iter()
+            .map(|(i, r)| {
+                let f = |v: f64| r.unit.format(v);
+                let st = &r.stats;
+                let trend_color = match r.direction() {
+                    "falling" => Color::LightRed,
+                    "rising" => Color::LightGreen,
+                    _ => Color::Gray,
                 };
-                (
-                    format!(
-                        "{}{}",
-                        if trend < 0.0 { "▼ -" } else { "▲ +" },
-                        f(trend.abs())
-                    ),
-                    format!("{:.2}", st.r2),
-                    color,
-                )
-            };
-            let cells = vec![
-                format!("{} {}", i + 1, s.name),
-                st.count.to_string(),
-                f(st.last),
-                f(st.min),
-                f(st.mean),
-                f(st.max),
-                f(st.stddev),
-                trend_text,
-                r2,
-                eta,
-            ];
-            rows.push((cells, self.opts.color(i), trend_color));
+                let trend = r
+                    .trend_text()
+                    .trim_end_matches(&format!("/{label}"))
+                    .to_string();
+                let cells = vec![
+                    format!("{} {}", i + 1, r.name),
+                    match r.direction() {
+                        "falling" => format!("▼ {trend}"),
+                        "rising" => format!("▲ {trend}"),
+                        _ => trend,
+                    },
+                    r.forecast_cell(),
+                    f(st.last),
+                    r.fit.map_or("—".into(), |fit| format!("{:.2}", fit.r2)),
+                    f(st.min),
+                    f(st.max),
+                    f(st.mean),
+                    f(st.stddev),
+                    st.count.to_string(),
+                ];
+                (cells, self.opts.color(*i), trend_color)
+            })
+            .collect();
+        let mut widths: Vec<u16> = (0..headers.len())
+            .map(|c| {
+                rows.iter()
+                    .map(|r| r.0[c].chars().count())
+                    .chain([headers[c].chars().count()])
+                    .max()
+                    .unwrap_or(1) as u16
+            })
+            .collect();
+        let inner_w = area.width.saturating_sub(2);
+        let mut ncols = headers.len();
+        while ncols > 2 && widths[..ncols].iter().sum::<u16>() + 2 * (ncols as u16 - 1) > inner_w {
+            ncols -= 1;
         }
+        widths.truncate(ncols);
         let title = match (self.selection, range) {
             (Some((a, b)), _) => format!(
                 " stats · selection {} → {} ",
@@ -708,31 +1093,20 @@ impl App {
             (None, Some(_)) => " stats · visible range ".into(),
             _ => " stats ".into(),
         };
-        let widths: Vec<Constraint> = (0..header.len())
-            .map(|c| {
-                let w = rows
-                    .iter()
-                    .map(|r| r.0[c].chars().count())
-                    .chain([header[c].chars().count()])
-                    .max()
-                    .unwrap_or(1);
-                Constraint::Length(w as u16)
-            })
-            .collect();
         let rows = rows.into_iter().map(|(cells, name_color, trend_color)| {
-            Row::new(cells.into_iter().enumerate().map(|(c, text)| {
+            Row::new(cells.into_iter().take(ncols).enumerate().map(|(c, text)| {
                 let style = match c {
                     0 => Style::default().fg(name_color),
-                    7 => Style::default().fg(trend_color),
+                    1 => Style::default().fg(trend_color),
                     _ => Style::default(),
                 };
                 Cell::from(text).style(style)
             }))
         });
-        let table = Table::new(rows, widths)
+        let table = Table::new(rows, widths.iter().map(|w| Constraint::Length(*w)))
             .column_spacing(2)
             .header(
-                Row::new(header.map(String::from))
+                Row::new(headers.iter().take(ncols).map(|h| h.to_string()))
                     .style(Style::default().add_modifier(Modifier::BOLD)),
             )
             .block(
@@ -745,34 +1119,34 @@ impl App {
 
     fn draw_help(&self, f: &mut Frame) {
         let area = f.area();
-        let w = 64.min(area.width);
-        let h = (HELP.len() as u16 + 4 + self.binds.len() as u16).min(area.height);
-        let rect = Rect {
-            x: (area.width - w) / 2,
-            y: (area.height - h) / 2,
-            width: w,
-            height: h,
-        };
+        let w = 72.min(area.width);
         let mut lines: Vec<Line> = HELP
             .iter()
             .map(|(k, d)| {
                 Line::from(vec![
-                    Span::styled(format!("{k:>12}  "), Style::default().fg(Color::Yellow)),
+                    Span::styled(format!("{k:>16}  "), Style::default().fg(Color::Yellow)),
                     Span::raw(*d),
                 ])
             })
             .collect();
         for (k, code) in &self.binds {
             lines.push(Line::from(vec![
-                Span::styled(format!("{k:>12}  "), Style::default().fg(Color::Cyan)),
+                Span::styled(format!("{k:>16}  "), Style::default().fg(Color::Cyan)),
                 Span::raw(format!("script: {code}")),
             ]));
         }
-        f.render_widget(Clear, rect);
+        let h = (lines.len() as u16 + 2).min(area.height);
+        let rect = Rect {
+            x: (area.width - w) / 2,
+            y: (area.height - h) / 2,
+            width: w,
+            height: h,
+        };
+        Clear.render(rect, f.buffer_mut());
         f.render_widget(
-            Paragraph::new(lines).block(
+            Paragraph::new(lines).wrap(Wrap { trim: false }).block(
                 Block::bordered()
-                    .title(" graft keys · any key closes ")
+                    .title(" graft · tap or press any key to close ")
                     .border_style(Style::default().fg(Color::Yellow)),
             ),
             rect,
@@ -780,138 +1154,218 @@ impl App {
     }
 }
 
-pub fn run(mut app: App) -> Result<()> {
-    let mut terminal = ratatui::init();
-    let result = event_loop(&mut app, &mut terminal);
-    ratatui::restore();
-    result
-}
-
-fn event_loop(app: &mut App, terminal: &mut DefaultTerminal) -> Result<()> {
-    while !app.quit {
-        app.pump();
-        app.rebuild(false);
-        terminal.draw(|f| app.draw(f))?;
-        if event::poll(Duration::from_millis(100))?
-            && let TermEvent::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            app.on_key(key);
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::Cli;
-    use crate::render::DEFAULT_PALETTE;
-    use crate::script::ScriptHost;
+    use crate::interactive::Live;
     use clap::Parser;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use std::rc::Rc;
 
-    fn app(args: &[&str]) -> App {
+    pub(crate) fn app(args: &[&str]) -> App {
         let cli = Cli::parse_from(args);
-        let script = Rc::new(ScriptHost::new(cli.script.as_deref(), false).unwrap());
-        let session = Session::new(&cli, script).unwrap();
-        let spec = SourceSpec::File {
-            path: cli.input.clone().unwrap(),
-            follow: false,
-        };
-        let opts = ChartOpts {
-            kind: cli.kind,
-            marker: cli.marker,
-            title: "test".into(),
-            palette: DEFAULT_PALETTE.to_vec(),
-            legend: cli.legend,
-            log: false,
-            ymin: None,
-            ymax: None,
-            hlines: vec![],
-            bins: 10,
-            split: false,
-        };
-        let report = ReportOpts {
-            per: None,
-            target: None,
-            color: false,
-        };
-        let mut app = App::new(
-            session,
-            crate::source::spawn(spec.clone()),
-            opts,
-            report,
-            cli.alert.clone(),
-            spec,
-            cli.stats,
-        );
-        while !app.eof {
-            app.pump();
+        let spec = crate::setup::source_spec(&cli, true).unwrap();
+        let setup = crate::setup::build(cli, spec.clone(), false).unwrap();
+        let mut app = App::new(setup, Live::new(spec));
+        while !app.live.eof {
+            app.tick();
         }
         app.rebuild(true);
         app
     }
 
-    fn key(app: &mut App, code: KeyCode) {
-        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    fn key(app: &mut App, code: KeyCode) -> Transition {
+        app.on_event(&TermEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+    }
+
+    fn mouse(app: &mut App, kind: MouseEventKind, col: u16, row: u16) -> Transition {
+        app.on_event(&TermEvent::Mouse(MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
     }
 
     fn type_str(app: &mut App, s: &str) {
-        s.chars().for_each(|c| key(app, KeyCode::Char(c)));
+        s.chars().for_each(|c| {
+            key(app, KeyCode::Char(c));
+        });
+    }
+
+    fn screen_sized(app: &App, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        crate::render::ansi::to_ansi(term.backend().buffer(), false)
     }
 
     fn screen(app: &App) -> String {
-        let mut term = Terminal::new(TestBackend::new(110, 32)).unwrap();
-        term.draw(|f| app.draw(f)).unwrap();
-        let buf = term.backend().buffer().clone();
-        crate::render::ansi::to_ansi(&buf, false)
+        screen_sized(app, 110, 34)
+    }
+
+    /// Screen position of a toolbar button / chip label.
+    fn find(app: &App, text: &str) -> (u16, u16) {
+        let s = screen(app);
+        for (row, line) in s.lines().enumerate() {
+            if let Some(byte) = line.find(text) {
+                return (line[..byte].chars().count() as u16, row as u16);
+            }
+        }
+        panic!("'{text}' not on screen:\n{s}");
     }
 
     const LOG: &str = "examples/reclaimable.log";
 
     #[test]
-    fn draws_chart_and_stats() {
+    fn draws_chart_stats_and_toolbar() {
         let mut app = app(&["graft", LOG, "--stats"]);
         assert_eq!(app.ds.series.len(), 2);
         let s = screen(&app);
         assert!(s.contains("node1 58.8 GB"), "{s}");
-        assert!(s.contains("stats"), "{s}");
         assert!(s.contains("▼ -1.97 GB"), "{s}");
-        // Every chart type renders.
+        assert!(s.contains(" forecast ") && s.contains(" ● node1 "), "{s}");
         for _ in 0..5 {
             key(&mut app, KeyCode::Char('t'));
             screen(&app);
         }
         assert_eq!(app.opts.kind, ChartKind::Line);
+        // Phone-sized screens still render (toolbar wraps, stats columns drop).
+        let small = screen_sized(&app, 44, 22);
+        assert!(small.contains("node1"), "{small}");
     }
 
     #[test]
-    fn cursor_zoom_and_selection() {
+    fn keyboard_cursor_zoom_and_selection() {
         let mut app = app(&["graft", LOG]);
         key(&mut app, KeyCode::Home);
         assert_eq!(app.cursor, app.ds.x_range().map(|r| r.0));
         assert!(screen(&app).contains("2026-11-01 04:00  node1=59.9 GB  node2=422.6 GB"));
         key(&mut app, KeyCode::Char('v'));
-        (0..6).for_each(|_| key(&mut app, KeyCode::Right));
+        (0..6).for_each(|_| {
+            key(&mut app, KeyCode::Right);
+        });
         key(&mut app, KeyCode::Char('v'));
         let (a, b) = app.selection.expect("selection");
         assert_eq!(b - a, 6.0 * 3600.0);
-        assert!(app.show_stats);
         assert!(screen(&app).contains("selection 2026-11-01 04:00 → 2026-11-01 10:00"));
         key(&mut app, KeyCode::Esc);
-        assert!(app.selection.is_none() && !app.quit);
+        assert!(app.selection.is_none());
         key(&mut app, KeyCode::Char('+'));
-        let (x0, x1) = app.view.expect("zoomed");
-        assert!(x1 - x0 < 28.0 * 3600.0);
+        assert!(app.view.is_some());
         key(&mut app, KeyCode::Char('0'));
         assert!(app.view.is_none());
         key(&mut app, KeyCode::Char('2'));
         assert!(app.hidden.contains("node2"));
-        key(&mut app, KeyCode::Char('q'));
-        assert!(app.quit);
+        assert_eq!(key(&mut app, KeyCode::Char('q')), Transition::Quit);
+    }
+
+    #[test]
+    fn mouse_tap_scrub_select_zoom_and_buttons() {
+        let mut app = app(&["graft", LOG]);
+        screen(&app);
+        let plot = app.plots.borrow()[0];
+        let mid = plot.rect.x + plot.rect.width / 2;
+        let row = plot.rect.y + 2;
+        // Tap → cursor and readout.
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), mid, row);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), mid, row);
+        let c = app.cursor.expect("cursor");
+        assert!((plot.col_of(c) as i32 - mid as i32).abs() <= 1);
+        assert!(screen(&app).contains("node2 4"), "readout box shows values");
+        // Drag the cursor line → scrub.
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), mid, row);
+        mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            mid + 10,
+            row,
+        );
+        mouse(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            mid + 10,
+            row,
+        );
+        assert!(app.cursor.unwrap() > c && app.selection.is_none());
+        // Drag elsewhere → selection.
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            plot.rect.x + 2,
+            row,
+        );
+        mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            plot.rect.x + 20,
+            row,
+        );
+        mouse(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            plot.rect.x + 20,
+            row,
+        );
+        let (a, b) = app.selection.expect("selection");
+        assert!(b > a && app.show_stats);
+        // Scroll zooms around the pointer.
+        mouse(&mut app, MouseEventKind::ScrollUp, mid, row);
+        assert!(app.view.is_some());
+        // Toolbar buttons and series chips are tappable.
+        let (x, y) = find(&app, " reset ");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert!(app.view.is_none());
+        let (x, y) = find(&app, "● node2");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert!(app.hidden.contains("node2"));
+        let (x, y) = find(&app, " ⋯ ");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        let (x, y) = find(&app, " format ");
+        assert_eq!(
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y),
+            Transition::OpenBuilder
+        );
+        // Follow-pointer mode moves the cursor without clicking.
+        key(&mut app, KeyCode::Char('o'));
+        mouse(&mut app, MouseEventKind::Moved, plot.rect.x + 3, row);
+        assert!((plot.col_of(app.cursor.unwrap()) as i32 - (plot.rect.x + 3) as i32).abs() <= 1);
+    }
+
+    #[test]
+    fn forecast_targets_and_scrubbing_into_the_future() {
+        let mut app = app(&[
+            "graft",
+            LOG,
+            "--target",
+            "node1=50GB,node2=200GB",
+            "--forecast",
+        ]);
+        let s = screen(&app);
+        assert!(s.contains("node1 target 50 GB"), "{s}");
+        key(&mut app, KeyCode::Char('s'));
+        let s = screen(&app);
+        assert!(
+            s.contains("50 GB in ~3.7 days") && s.contains("200 GB in ~27.6 days"),
+            "{s}"
+        );
+        // Past the data, the cursor shows projected values.
+        let last = app.ds.x_range().unwrap().1;
+        app.cursor = Some(last + 86400.0);
+        let s = screen(&app);
+        assert!(s.contains("(forecast)"), "{s}");
+        // Toggle off and on; set a target from the console.
+        key(&mut app, KeyCode::Char('f'));
+        assert!(app.opts.forecast.is_none());
+        key(&mut app, KeyCode::Char('f'));
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, "target(\"node2\", 300GB)");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.opts.analysis.targets.explicit("node2"), Some(300e9));
+        assert!(
+            app.current_cli().target.contains(&"node2=300G".to_string()),
+            "{:?}",
+            app.current_cli().target
+        );
     }
 
     #[test]
@@ -927,7 +1381,6 @@ mod tests {
             app.message.as_ref().map(|m| m.text.as_str()),
             Some("356.9 GB")
         );
-        // Console sees series hidden from the chart, and script functions.
         key(&mut app, KeyCode::Char('D'));
         let msg = &app.message.as_ref().unwrap().text;
         assert!(
@@ -935,16 +1388,17 @@ mod tests {
             "{msg}"
         );
         key(&mut app, KeyCode::Char('W'));
-        assert_eq!(app.opts.hlines.len(), 1);
         assert_eq!(app.opts.hlines[0].value, 50e9);
         key(&mut app, KeyCode::Char(':'));
         type_str(&mut app, "nope(");
         key(&mut app, KeyCode::Enter);
         assert!(app.message.as_ref().unwrap().error);
-        // History recall.
         key(&mut app, KeyCode::Char(':'));
         key(&mut app, KeyCode::Up);
-        assert_eq!(app.console.as_deref(), Some("nope("));
+        assert_eq!(
+            app.console.as_ref().map(|c| c.value.as_str()),
+            Some("nope(")
+        );
         key(&mut app, KeyCode::Esc);
         assert!(app.console.is_none());
     }

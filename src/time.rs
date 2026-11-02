@@ -212,6 +212,20 @@ pub fn format_time(secs: f64, span: f64) -> String {
     dt.format(fmt).to_string()
 }
 
+/// Format a timestamp with a strftime format.
+pub fn format_time_with(secs: f64, fmt: &str) -> String {
+    use std::fmt::Write;
+    let Some(dt) = to_naive(secs) else {
+        return format!("{secs}");
+    };
+    let mut out = String::new();
+    // An invalid format string makes chrono's Display fail; fall back gracefully.
+    if write!(out, "{}", dt.format(fmt)).is_err() {
+        return format_time_full(secs);
+    }
+    out
+}
+
 /// Full, unambiguous timestamp format.
 pub fn format_time_full(secs: f64) -> String {
     match to_naive(secs) {
@@ -270,6 +284,30 @@ pub fn fmt_duration(secs: f64) -> String {
     )
 }
 
+/// Compact, re-parseable duration: `500ms`, `1s`, `10m`, `1.5h`, `2d`.
+pub fn fmt_duration_compact(secs: f64) -> String {
+    let units = [
+        (86400.0, "d"),
+        (3600.0, "h"),
+        (60.0, "m"),
+        (1.0, "s"),
+        (1e-3, "ms"),
+    ];
+    for (mult, unit) in units {
+        let v = secs / mult;
+        if v >= 1.0 {
+            let text = crate::units::fmt_sig(v);
+            if text
+                .parse::<f64>()
+                .is_ok_and(|t| (t * mult - secs).abs() <= 1e-9 * secs.max(1.0))
+            {
+                return format!("{text}{unit}");
+            }
+        }
+    }
+    format!("{secs}s")
+}
+
 /// A named time unit for expressing slopes, e.g. "per day".
 pub fn per_label(secs: f64) -> String {
     match secs {
@@ -324,6 +362,27 @@ mod tests {
         let tp = TimeParser::default();
         assert!(tp.detect("12 34 56").is_none());
         assert!(tp.detect("node1: 5").is_none());
+    }
+
+    #[test]
+    fn compact_durations_round_trip() {
+        for s in [
+            0.5,
+            1.0,
+            1.5,
+            60.0,
+            600.0,
+            3600.0,
+            5400.0,
+            86400.0,
+            7.0 * 86400.0,
+            90.0,
+        ] {
+            let text = fmt_duration_compact(s);
+            assert_eq!(parse_duration_secs(&text).unwrap(), s, "{text}");
+        }
+        assert_eq!(fmt_duration_compact(600.0), "10m");
+        assert_eq!(fmt_duration_compact(0.5), "500ms");
     }
 
     #[test]

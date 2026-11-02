@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use crate::data::{LineMeta, SampleInfo};
 use crate::time::now_secs;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SourceSpec {
     File {
         path: PathBuf,

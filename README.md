@@ -1,38 +1,49 @@
 # graft
 
 Graph anything in your terminal: log files, command output, CSV or JSON. Charts
-resize to fit the terminal, everything is set with command-line flags, and an
-interactive viewer lets you zoom, inspect, select ranges and run analysis with
-[Rhai](https://rhai.rs) scripts.
+resize to fit the terminal and everything can be set with command-line flags.
+You can also build a chart interactively: graft suggests formats for your data
+and shows a live preview as you edit them. The viewer works with a mouse or a
+touchscreen as well as the keyboard, which helps over SSH from a phone. You can
+zoom, scrub through values, select ranges, forecast towards your own targets,
+and run analysis with [Rhai](https://rhai.rs) scripts.
+
+graft makes no hidden assumptions. Auto-detection is a starting point, and every
+guess can be replaced: the input format (`-F` templates, regexes and more),
+timestamps (`-t`), units (`-B`, `-u`), the trend model (`--fit`), the data it's
+fitted to (`--fit-window`), forecast targets (`--target`) and the output format
+(`--stats-template`, `--stats-format json`).
 
 ```
-$ graft reclaimable.log --once --stats --split
-┌ reclaimable.log · node1 ─────────────────────────────────────────────────┐
-│60 GB     │⠒⠒⠒⠒⠒⠒⠒⠒⠒⠒⠒⠢⡀                                   ┌─────────────┐│
-│          │            ⠈⠢⠤⠤⡀                               │node1 58.8 GB││
-│          │                ⠘⢄                              └─────────────┘│
-│          │                  ⠉⠑⠒⠊⠉⠉⠉⠉⠉⠑⢄                              ⢠⠃  │
-│          │                             ⠉⠑⠒⢄                         ⢠⠃   │
-│57.4 GB   │                                ⠈⠢⠤⠒⠒⠤⠤⠔⠒⠒⠒⠒⠒⠒⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠁    │
-│          └───────────────────────────────────────────────────────────────│
-│11-01 04:00                 11-01 13:20    11-01 22:40         11-02 08:00│
-└──────────────────────────────────────────────────────────────────────────┘
-┌ reclaimable.log · node2 ─────────────────────────────────────────────────┐
-│423.3 GB  │⠒⠒⠒⠤⣀⣀⣀⣀⣀⡀                                     ┌──────────────┐│
-│          │         ⠈⠑⠤⢄⣀⣀⣀⣀                              │node2 415.7 GB││
-│          │                 ⠉⠉⠑⠒⠢⠤⣀                       └──────────────┘│
-│          │                        ⠑⠒⠒⠒⠢⠤⢄⣀⣀                          ⢀⣀⣀⣀│
-│          │                                 ⠉⠉⠉⠉⠒⠢⢄        ⡠⠒⠒⠒⠒⠉⠉⠉⠉⠉⠉⠁   │
-│411.7 GB  │                                        ⠉⠑⠒⠒⠤⠤⠤⠔⠁              │
-│          └───────────────────────────────────────────────────────────────│
-│11-01 04:00                 11-01 13:20    11-01 22:40         11-02 08:00│
-└──────────────────────────────────────────────────────────────────────────┘
-series   n      last       min      mean       max         σ  trend/day    R²
-node1   29   58.8 GB   57.5 GB   58.5 GB   59.9 GB  882.6 MB   -1.97 GB  0.61
-node2   29  415.7 GB  412.2 GB  417.1 GB  422.8 GB   3.14 GB   -7.69 GB  0.73
+$ graft reclaimable.log --once --stats --split --forecast --target node1=50GB,node2=200GB
+┌ reclaimable.log · node1 [forecast] ────────────────────────────────────────┐
+│60.4 GB   │⠒⠒⠲⣀                                         ┌──────────────────┐│
+│          │    ⠉⠉⠑⢆⣀⣀⡠⠤⠤⠤⠋                              │node1 target 50 GB││
+│          │              •••••••                        │node1 58.8 GB     ││
+│          │                     ••••••••••••            └──────────────────┘│
+│          │                                 •••••••••••••                   │
+│          │•••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••│
+│48.7 GB   │                                                          •••••••│
+│          └─────────────────────────────────────────────────────────────────│
+│11-01 04:00                   11-02 22:09     11-04 16:19        11-06 10:28│
+└────────────────────────────────────────────────────────────────────────────┘
+┌ reclaimable.log · node2 [forecast] ────────────────────────────────────────┐
+│433.9 GB  │⠒⠒⠢⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤⠤                             ┌───────────────────┐│
+│          │              ••••••••••••••••••••••••••••••│node2 target 200 GB││
+│          │                                            │node2 415.7 GB     ││
+│          │                                            └───────────────────┘│
+│          │                                                                 │
+│          │                                                                 │
+│188.9 GB  │•••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••│
+│          └─────────────────────────────────────────────────────────────────│
+│11-01 04:00                   11-02 22:09     11-04 16:19        11-06 10:28│
+└────────────────────────────────────────────────────────────────────────────┘
+series   n      last       min      mean       max         σ  trend/day    R²  forecast
+node1   29   58.8 GB   57.5 GB   58.5 GB   59.9 GB  882.6 MB   -1.97 GB  0.61  50 GB in ~3.7 days
+node2   29  415.7 GB  412.2 GB  417.1 GB  422.8 GB   3.14 GB   -7.69 GB  0.73  200 GB in ~27.6 days
 
-• node1: falling by an average of 1.97 GB/day (R² 0.61); reaches 0 B in ~29.1 days (around 2026-12-01 10:46)
-• node2: falling by an average of 7.69 GB/day (R² 0.73); reaches 0 B in ~53.6 days (around 2026-12-25 23:00)
+• node1: falling by an average of 1.97 GB/day (R² 0.61); reaches 50 GB in ~3.7 days (around 2026-11-06 01:32)
+• node2: falling by an average of 7.69 GB/day (R² 0.73); reaches 200 GB in ~27.6 days (around 2026-11-29 23:09)
 ```
 
 ## Install
@@ -45,7 +56,9 @@ cargo install --path . --features png  # also PNG export (pulls in resvg)
 ## Quick tour
 
 ```sh
-graft app.log                          # auto-detects timestamps and key: value pairs
+graft                                  # open the builder: pick a source, get format suggestions
+graft app.log -F '{time} {_} took {ms}' # parse with an explicit format template
+graft app.log                          # or auto-detect timestamps and key: value pairs
 graft app.log --once                   # print the chart and exit (also used when piped)
 graft -c 'cat /proc/meminfo' -n 1s -B  # run a command every second, graph it live
 some-command | graft                   # graph stdin
@@ -64,7 +77,28 @@ graft -p meminfo                       # run a profile (see --list-profiles)
 
 ### Parsing
 
-The default parser looks for `key: value` / `key=value` pairs. If it finds
+**Format templates** (`-F, --format`) are the easiest way to describe a line:
+
+```sh
+graft reclaimable.log -F '{time} node1: {node1} node2: {node2}'
+graft app.log         -F '[{time:%d/%m/%Y %H:%M}] {_} took {latency}'
+graft -c 'df -B1'     -F '{key} {_:word} {used} {avail} {_}'      # one series per filesystem
+```
+
+| Placeholder | Matches |
+|---|---|
+| `{name}` | a number with an optional unit (`59.9 GB`, `12ms`, `40%`), stored as series `name` |
+| `{time}` / `{time:%d/%m %H:%M}` | a timestamp, auto-detected or in the strftime format you give |
+| `{x}` | a numeric x value |
+| `{key}` | the series name, giving one series per distinct value |
+| `{_}` / `{_:word}` | any text to skip / one word to skip |
+| `{name:int}`, `{name:word}`, `{name:/regex/}` | change what's matched |
+| `{{` `}}` | literal braces |
+
+Spaces in a template match any run of whitespace. Series names can be anything,
+for example `{Active(anon)}`.
+
+When no format is given, the parser looks for `key: value` / `key=value` pairs. If it finds
 none, it falls back to whitespace-separated numeric columns and uses a header
 row for names if there is one. Timestamps at the start of a line are detected
 automatically: ISO-8601 and similar formats, syslog `Nov  2 08:00:01`, a bare
@@ -72,10 +106,11 @@ automatically: ISO-8601 and similar formats, syslog `Nov  2 08:00:01`, a bare
 
 | Format | Flags |
 |---|---|
+| Template | `-F '{time} load: {load}'` |
 | key/value | `--kv` |
 | Regex | `-r '(?P<time>\S+ \S+) .*took (?P<latency>\d+ms)'` |
 | Regex, one series per captured name | `-r '(?P<node>node\d): (?P<value>\S+ GB)' -g node` |
-| Columns | `--columns 1,3 --names load1,load15` (`-d ,` for another delimiter) |
+| Columns | `--columns 1,3 --names load1,load15`, or `--columns all` (`-d ,` for another delimiter) |
 | CSV | `--csv` (header and time column auto-detected; `--time-field ts`) |
 | JSON / NDJSON | `--json` (nested keys become `mem.used`; multi-line documents work) |
 | Anything else | `--script parse.rhai --parse-fn` (see below) |
@@ -96,7 +131,7 @@ Values are normalised to bytes or seconds and displayed in readable units.
 `-B, --binary-units` treats `kB`/`MB`/`G` as 1024-based, which is what
 `/proc/meminfo`, `df -h` and `free -h` use. Use `-u B` to give unitless values a unit.
 
-To debug a format, `--explain` shows how each line was parsed and why any line
+To debug a format, `--explain` (or `--explain=N` for the first N lines) shows how each line was parsed and why any line
 was skipped.
 
 ### Choosing and transforming series
@@ -123,13 +158,35 @@ was skipped.
 | `--width`, `--height` | size for `--once` (default: fit the terminal) |
 | `-o out.svg` / `.png` / `.csv` / `.json` | export (repeatable) |
 
-### Analysis
+### Analysis and forecasting
 
 `-S, --stats` prints, for each series:
 - min, max, mean, σ and the latest value
-- a least-squares trend, expressed per a natural unit of time (`--per 1h` to choose)
-- R², showing how well a straight line fits the data
-- a forecast of when the trend reaches 0, or `--target VALUE`
+- the trend per unit of time, from a fitted model
+- R², showing how well the model fits the data
+- a forecast of when the trend reaches a target
+
+```
+$ graft reclaimable.log --no-chart --stats --target node1=50GB,node2=200GB
+• node1: falling by an average of 1.97 GB/day (R² 0.61); reaches 50 GB in ~3.7 days (around 2026-11-06 01:32)
+• node2: falling by an average of 7.69 GB/day (R² 0.73); reaches 200 GB in ~27.6 days (around 2026-11-29 23:09)
+```
+
+Every part of this is configurable:
+
+| | |
+|---|---|
+| `--target node1=50GB,node2=200GB` | targets per series; `--target 100GB` sets one for all, `none` turns them off. Without targets, a falling series is forecast to reach 0 |
+| `--fit linear\|exp` | constant change per unit of time, or constant percentage change (growth/decay) |
+| `--fit-window 12h` / `--fit-window 50` | fit only recent data (a duration or a number of points) |
+| `--per 1h` | the unit trends are expressed in (default: chosen from the data's span) |
+| `--forecast` / `--forecast=7d` | draw the projected trend on the chart, plus target lines |
+| `--stats-template '{name}: {trend} → {target} in {eta}'` | your own output line per series |
+| `--stats-format json` | machine-readable output |
+
+Template fields: `name n first last min max mean median stddev p95 change trend
+per r2 target eta eta_at direction model unit`. Add `:raw` (e.g. `{last:raw}`)
+for unformatted numbers.
 
 `--alert EXPR` evaluates a Rhai condition and exits with status 3 if it holds,
 so graft works in cron jobs and scripts:
@@ -139,9 +196,40 @@ graft /var/log/reclaimable.log --no-chart \
   --alert 'node1 < 50GB' --alert 'slope("node2", "1d") < -10GB' || notify-send "disk"
 ```
 
+## Building a chart interactively
+
+Run `graft` with no arguments, or `graft FILE --build`, to open the builder:
+
+1. **Source:** a file, a command (run every `N` seconds), or piped stdin. Tap
+   *load* to read a sample.
+2. **Suggestions:** graft tries a generated template, key/value, CSV, JSON and
+   columns on the sample. They're ranked by how many lines parse. Tap one to use it.
+3. **Format:** edit the template or regex, group-by or time format. A per-line
+   preview shows what each line parses to, or why it didn't.
+4. **Series, chart and forecast:** tap series to include or exclude them, toggle
+   chart options, and type targets such as `node1=50GB,node2=200GB`.
+5. **Start**, or **save profile**. The equivalent command line is shown as you
+   go and printed when you quit, so it's easy to reuse.
+
+Press `F` in the viewer to come back here and change the format. For commands
+and stdin, the history already received is re-parsed with the new format.
+
 ## Interactive viewer
 
-Opens by default when stdout is a terminal. Press `?` for help.
+Opens by default when stdout is a terminal. Mouse and touch work everywhere,
+including over SSH from a phone.
+
+| Mouse / touch | Action |
+|---|---|
+| tap | put the cursor there; a box beside it shows every series' value |
+| drag the cursor line | scrub through the data, and past it into the forecast |
+| drag anywhere else | select a range; the stats panel switches to it |
+| scroll | zoom around the pointer (shift + scroll pans) |
+| toolbar / series chips | ◀ ▶ + − reset cursor select stats forecast; `⋯` shows more: chart type, split, log, follow, pause, format, console, export, mouse, help, quit |
+
+The **follow** button (key `o`) makes the cursor follow the pointer without
+clicking, in terminals that report mouse movement. **mouse** (key `M`) turns
+mouse capture off, so your terminal's own text selection works.
 
 | Key | Action |
 |---|---|
@@ -149,14 +237,17 @@ Opens by default when stdout is a terminal. Press `?` for help.
 | `H L` | pan by half a screen |
 | `+ -` | zoom in / out |
 | `0` / `r` | reset |
-| `c` | cursor (shows exact values) |
+| `c` / `o` | cursor / cursor follows the pointer |
 | `Home` / `End` | cursor to first / last point |
-| `v` … `v` | select a range; the stats panel switches to it |
+| `v` … `v` | select a range from the keyboard |
 | `1`–`9` / `a` | toggle a series / show all |
 | `t` / `m` / `y` / `x` | chart type / marker / log scale / split panels |
+| `f` | forecast on/off |
+| `F` | change the format or source (builder) |
 | `s` | stats panel |
 | `space` | pause live updates |
 | `e` | export the current view to SVG |
+| `M` | mouse capture on/off |
 | `:` | Rhai console |
 | `q` | quit |
 
@@ -171,6 +262,7 @@ Functions work on the visible range, or on the selection if you've made one:
 :fmt("node2", slope("node2", "1d"))         // …formatted: "-7.69 GB"
 :fmt_dur(eta("node1", 50GB))                // time until node1 hits 50 GB
 :hline(mean("node2"), "mean"); zoom("12h")
+:target("node2", 200GB); forecast("14d")    // set a target and show the projection
 ```
 
 Available functions:
@@ -181,7 +273,8 @@ Available functions:
 - Data: `values`, `xs`.
 - Formatting: `fmt(name, v)`, `fmt_dur`, `fmt_time`, `bytes`.
 - Viewer actions: `hline(v[, label])`, `clear_hlines()`, `zoom("6h")`,
-  `reset()`, `show(name)`, `hide(name)`, `chart("bar")`.
+  `reset()`, `show(name)`, `hide(name)`, `chart("bar")`,
+  `target(name, v)`, `clear_target(name)`, `forecast("7d" | "auto" | "off")`.
 - Output: `print(...)`.
 
 Unit literals such as `50GB`, `200ms` and `1d` work in all expressions.

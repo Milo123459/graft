@@ -183,10 +183,25 @@ fn xy(
 ) {
     let log = opts.log;
     let ty = |v: f64| if log { v.log10() } else { v };
-    let (x0, x1) = super::x_bounds(ds, None);
+    let (x0, x1) = super::plot_x_bounds(ds, opts, None, None);
+    // Fitted trends (continued as forecasts) and explicit targets.
+    let projections: Vec<(usize, Vec<(f64, f64)>)> = series
+        .iter()
+        .filter_map(|&(i, s)| {
+            let (fit, _) = opts.projection(s)?;
+            Some((i, super::projection_points(&fit, fit.x_first, x1)))
+        })
+        .collect();
+    let targets: Vec<(usize, &str, f64)> = series
+        .iter()
+        .filter_map(|&(i, s)| Some((i, s.name.as_str(), opts.analysis.targets.explicit(&s.name)?)))
+        .filter(|t| !log || t.2 > 0.0)
+        .collect();
     let values: Vec<f64> = series
         .iter()
         .flat_map(|(_, s)| s.points.iter().map(|p| p.1))
+        .chain(projections.iter().flat_map(|p| p.1.iter().map(|p| p.1)))
+        .chain(targets.iter().map(|t| t.2))
         .filter(|v| !log || *v > 0.0)
         .map(ty)
         .collect();
@@ -264,7 +279,7 @@ fn xy(
             out,
             r#"<text x="{x:.1}" y="{}" text-anchor="{anchor}" stroke="none">{}</text>"#,
             f.top + f.h + 18.0,
-            esc(&ds.fmt_x(t, span))
+            esc(&opts.fmt_x(ds, t, span))
         );
     }
     let _ = writeln!(out, "</g>");
@@ -301,6 +316,38 @@ fn xy(
                 esc(label)
             );
         }
+    }
+    for &(i, name, t) in &targets {
+        let y = f.py(ty(t));
+        let c = hex(opts.color(i));
+        let unit = ds.get(name).map(|s| s.unit.format(t)).unwrap_or_default();
+        let _ = writeln!(
+            out,
+            r#"<line x1="{}" x2="{}" y1="{y:.1}" y2="{y:.1}" stroke="{c}" stroke-dasharray="2 3"/>"#,
+            f.left,
+            f.left + f.w
+        );
+        let _ = writeln!(
+            out,
+            r#"<text x="{}" y="{:.1}" fill="{c}" text-anchor="end">{} target {}</text>"#,
+            f.left + f.w - 6.0,
+            y - 4.0,
+            esc(name),
+            esc(&unit)
+        );
+    }
+    for (i, pts) in &projections {
+        let c = hex(opts.color(*i));
+        let path: Vec<String> = pts
+            .iter()
+            .filter(|p| !log || p.1 > 0.0)
+            .map(|p| format!("{:.1},{:.1}", f.px(p.0), f.py(ty(p.1))))
+            .collect();
+        let _ = writeln!(
+            out,
+            r#"<polyline fill="none" stroke="{c}" stroke-width="1.5" stroke-dasharray="5 4" opacity="0.8" points="{}"/>"#,
+            path.join(" ")
+        );
     }
     for &(i, s) in series {
         let c = hex(opts.color(i));

@@ -36,6 +36,10 @@ pub enum Action {
     Show(String),
     Hide(String),
     Chart(String),
+    /// Set (`Some`) or remove (`None`) a series' forecast target.
+    Target(String, Option<f64>),
+    /// Forecast horizon (`"auto"`, `"7d"`), or `None` to turn forecasting off.
+    Forecast(Option<String>),
 }
 
 /// State shared between the host and registered functions.
@@ -497,6 +501,32 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
     engine.register_fn("hide", move |n: &str| push(&st, Action::Hide(n.into())));
     let st = state.clone();
     engine.register_fn("chart", move |k: &str| push(&st, Action::Chart(k.into())));
+    let st = state.clone();
+    engine.register_fn("target", move |n: &str, v: Dynamic| -> FnResult<()> {
+        push(
+            &st,
+            Action::Target(
+                n.into(),
+                Some(dyn_to_f64(&v).ok_or("target needs a number, e.g. target(\"node1\", 50GB)")?),
+            ),
+        );
+        Ok(())
+    });
+    let st = state.clone();
+    engine.register_fn("clear_target", move |n: &str| {
+        push(&st, Action::Target(n.into(), None))
+    });
+    let st = state.clone();
+    engine.register_fn("forecast", move |h: &str| {
+        push(
+            &st,
+            Action::Forecast((!matches!(h, "off" | "none" | "false")).then(|| h.to_string())),
+        );
+    });
+    let st = state.clone();
+    engine.register_fn("forecast", move |on: bool| {
+        push(&st, Action::Forecast(on.then(|| "auto".to_string())))
+    });
     let st = state.clone();
     engine.register_fn(
         "bind",

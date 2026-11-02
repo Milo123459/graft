@@ -1,5 +1,6 @@
 //! Line parsers: turn raw text into named numeric values plus an optional x value.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::LazyLock;
 
@@ -57,8 +58,28 @@ pub trait LineParser {
 pub fn build(cli: &Cli, script: Rc<ScriptHost>) -> Result<Box<dyn LineParser>> {
     let time = TimeParser::new(cli.time_format.clone());
     let binary = cli.binary_units;
-    Ok(if let Some(re) = &cli.regex {
-        Box::new(RegexParser::new(re, cli.group_by.as_deref(), time, binary)?)
+    Ok(if let Some(src) = &cli.format {
+        let t = crate::template::compile(src)?;
+        let time = if cli.time_format.is_some() {
+            time
+        } else {
+            TimeParser::new(t.time_format)
+        };
+        Box::new(RegexParser::new(
+            &t.regex,
+            cli.group_by.as_deref(),
+            time,
+            binary,
+            t.rename,
+        )?)
+    } else if let Some(re) = &cli.regex {
+        Box::new(RegexParser::new(
+            re,
+            cli.group_by.as_deref(),
+            time,
+            binary,
+            HashMap::new(),
+        )?)
     } else if cli.csv {
         Box::new(CsvParser::new(cli, time))
     } else if cli.json {
@@ -69,11 +90,9 @@ pub fn build(cli: &Cli, script: Rc<ScriptHost>) -> Result<Box<dyn LineParser>> {
             binary,
         })
     } else if let Some(cols) = &cli.columns {
-        if cols.contains(&0) {
-            bail!("--columns are 1-based");
-        }
+        let select = parse_columns(cols)?;
         Box::new(ColumnsParser::new(
-            Some(cols.clone()),
+            select,
             cli.names.clone(),
             cli.delimiter,
             time,
@@ -87,7 +106,7 @@ pub fn build(cli: &Cli, script: Rc<ScriptHost>) -> Result<Box<dyn LineParser>> {
         })
     } else {
         if cli.group_by.is_some() {
-            bail!("--group-by needs --regex");
+            bail!("--group-by needs --regex or --format");
         }
         let kv = KvParser {
             time: time.clone(),
@@ -104,6 +123,25 @@ pub fn build(cli: &Cli, script: Rc<ScriptHost>) -> Result<Box<dyn LineParser>> {
             })
         }
     })
+}
+
+/// `all` → every numeric column; `1,3` → those columns (1-based).
+pub fn parse_columns(spec: &str) -> Result<Option<Vec<usize>>> {
+    if spec.trim().eq_ignore_ascii_case("all") || spec.trim().is_empty() {
+        return Ok(None);
+    }
+    let cols = spec
+        .split(',')
+        .map(|c| {
+            c.trim().parse::<usize>().map_err(|_| {
+                anyhow::anyhow!("--columns: '{c}' is not a column number (use e.g. 1,3 or all)")
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if cols.contains(&0) {
+        bail!("--columns are 1-based");
+    }
+    Ok(Some(cols))
 }
 
 fn time_x(time: &TimeParser, line: &str) -> (Option<XVal>, usize) {
@@ -339,6 +377,8 @@ pub struct RegexParser {
     group_by: Option<String>,
     /// Named captures that hold values.
     values: Vec<String>,
+    /// Group name → series name (for template names that aren't valid group names).
+    rename: HashMap<String, String>,
 }
 
 impl RegexParser {
@@ -347,6 +387,7 @@ impl RegexParser {
         group_by: Option<&str>,
         time: TimeParser,
         binary: bool,
+        rename: HashMap<String, String>,
     ) -> Result<Self> {
         let re = Regex::new(pattern)?;
         let names: Vec<&str> = re.capture_names().flatten().collect();
@@ -374,6 +415,7 @@ impl RegexParser {
             binary,
             group_by,
             values,
+            rename,
         })
     }
 }
@@ -404,7 +446,9 @@ impl LineParser for RegexParser {
                 .and_then(|g| caps.name(g))
                 .map(|m| m.as_str());
             let unit = caps.name("unit").map_or("", |m| m.as_str());
+            let rename = &self.rename;
             let mut push = |name: &str, text: &str| {
+                let name = rename.get(name).map_or(name, String::as_str);
                 if let Some((value, u)) = value(&format!("{text}{unit}"), self.binary) {
                     let series = match (key, name) {
                         (Some(k), "value") => k.to_string(),
@@ -752,6 +796,7 @@ mod tests {
             Some("node"),
             TimeParser::default(),
             false,
+            HashMap::new(),
         )
         .unwrap();
         let r = p
@@ -775,6 +820,7 @@ mod tests {
             None,
             TimeParser::default(),
             false,
+            HashMap::new(),
         )
         .unwrap();
         let r = p.parse("2026-11-01 04:00:01 GET / took 12ms").unwrap();
