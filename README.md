@@ -8,14 +8,15 @@ touchscreen as well as the keyboard, which helps over SSH from a phone. You can
 zoom, scrub through values, select ranges, forecast towards your own targets,
 and run analysis with [Rhai](https://rhai.rs) scripts.
 
-graft makes no hidden assumptions. Auto-detection is a starting point, and every
-guess can be replaced: the input format (`-F` templates, regexes and more),
-timestamps (`-t`), units (`-B`, `-u`), the trend model (`--fit`), the data it's
-fitted to (`--fit-window`), forecast targets (`--target`) and the output format
-(`--stats-template`, `--stats-format json`).
+graft doesn't guess. You always say how to parse your input, either with a
+format flag or by picking one of graft's suggestions in the builder. Everything
+else can be set explicitly too: timestamps (`-t`), units (`-B`, `-u`), the trend
+model (`--fit`), the data it's fitted to (`--fit-window`, `--last`), forecast
+targets (`--target`) and the output format (`--stats-template`,
+`--stats-format json`).
 
 ```
-$ graft reclaimable.log --once --stats --split --forecast --target node1=50GB,node2=200GB
+$ graft reclaimable.log -F '{time} node1: {node1} node2: {node2}' --once --stats --split --forecast --target node1=50GB,node2=200GB
 ┌ reclaimable.log · node1 [forecast] ────────────────────────────────────────┐
 │60.4 GB   │⠒⠒⠲⣀                                         ┌──────────────────┐│
 │          │    ⠉⠉⠑⢆⣀⣀⡠⠤⠤⠤⠋⣀                             │node1 target 50 GB││
@@ -57,12 +58,12 @@ cargo install --path . --features png  # also PNG export (pulls in resvg)
 
 ```sh
 graft                                  # open the builder: pick a source, get format suggestions
-graft app.log -F '{time} {_} took {ms}' # parse with an explicit format template
-graft app.log                          # or auto-detect timestamps and key: value pairs
-graft app.log --once                   # print the chart and exit (also used when piped)
-graft -c 'cat /proc/meminfo' -n 1s -B  # run a command every second, graph it live
-some-command | graft                   # graph stdin
-graft app.log -f                       # follow a growing file like tail -f
+graft app.log                          # no format given: opens the builder with suggestions
+graft app.log -F '{time} {_} took {ms}' # graph it with an explicit format template
+graft app.log -F '…' --once            # print the chart and exit (also used when piped)
+graft -c 'cat /proc/meminfo' -n 1s -B -F '{key}: {value}'   # run a command every second
+some-command | graft --columns all     # graph stdin
+graft app.log --kv -f                  # follow a growing file like tail -f
 graft -p meminfo                       # run a profile (see --list-profiles)
 ```
 
@@ -99,16 +100,32 @@ graft -c 'df -B1'     -F '{key} {_:word} {used} {avail} {_}'      # one series p
 Spaces in a template match any run of whitespace. Series names can be anything,
 for example `{Active(anon)}`.
 
-When no format is given, the parser looks for `key: value` / `key=value` pairs. If it finds
-none, it falls back to whitespace-separated numeric columns and uses a header
-row for names if there is one. Timestamps at the start of a line are detected
-automatically: ISO-8601 and similar formats, syslog `Nov  2 08:00:01`, a bare
-`HH:MM:SS`, and Unix epochs in seconds or milliseconds.
+**A format is always required.** With no format flag:
+- in a terminal, graft opens the builder with your source loaded and suggests
+  formats, and you pick one;
+- with `--once`, exports or piped output, it stops and lists the formats that
+  fit as ready-to-run commands:
+
+```
+$ graft reclaimable.log --once
+graft: no format given for reclaimable.log. graft doesn't guess: choose how to parse it. Formats that fit:
+  graft --format '{time} node1: {node1} node2: {node2}' --once reclaimable.log
+      (29 of 29 sample lines)
+  graft --kv --once reclaimable.log
+      (29 of 29 sample lines)
+  …
+```
+
+`--auto` opts in to guessing: `key: value` pairs if there are any, else numeric
+columns. Timestamps written at the start of a line in a common shape are
+recognised: ISO-8601 and similar, syslog `Nov  2 08:00:01`, a bare `HH:MM:SS`,
+and Unix epochs. You can always spell the format out with `{time:%…}` or `-t`.
 
 | Format | Flags |
 |---|---|
 | Template | `-F '{time} load: {load}'` |
 | key/value | `--kv` |
+| Guess (opt-in) | `--auto` |
 | Regex | `-r '(?P<time>\S+ \S+) .*took (?P<latency>\d+ms)'` |
 | Regex, one series per captured name | `-r '(?P<node>node\d): (?P<value>\S+ GB)' -g node` |
 | Columns | `--columns 1,3 --names load1,load15`, or `--columns all` (`-d ,` for another delimiter) |
@@ -168,7 +185,7 @@ was skipped.
 - a forecast of when the trend reaches a target
 
 ```
-$ graft reclaimable.log --no-chart --stats --target node1=50GB,node2=200GB
+$ graft reclaimable.log -F '{key}: {value}' --no-chart --stats --target node1=50GB,node2=200GB
 • node1: falling by an average of 1.97 GB/day (R² 0.61); reaches 50 GB in about 3.7 days (around 2026-11-06 01:32)
 • node2: falling by an average of 7.69 GB/day (R² 0.73); reaches 200 GB in about 27.6 days (around 2026-11-29 23:09)
 ```
@@ -196,18 +213,21 @@ for unformatted numbers.
 so graft works in cron jobs and scripts:
 
 ```sh
-graft /var/log/reclaimable.log --no-chart \
+graft /var/log/reclaimable.log -F '{key}: {value}' --no-chart \
   --alert 'node1 < 50GB' --alert 'slope("node2", "1d") < -10GB' || notify-send "disk"
 ```
 
 ## Building a chart interactively
 
-Run `graft` with no arguments, or `graft FILE --build`, to open the builder:
+Run `graft` with no arguments, `graft FILE` without a format, or add `--build`, to
+open the builder:
 
 1. **Source:** a file, a command (run every `N` seconds), or piped stdin. Tap
    *load* to read a sample.
 2. **Suggestions:** graft tries a generated template, key/value, CSV, JSON and
-   columns on the sample. They're ranked by how many lines parse. Tap one to use it.
+   columns on the sample. They're ranked by how many lines parse. Nothing is
+   chosen for you: tap one (or use ↑/↓) to use it. Until then you see the raw
+   sample, and *start* stays disabled.
 3. **Format:** edit the template or regex, group-by or time format. A per-line
    preview shows what each line parses to, or why it didn't.
 4. **Series, chart and forecast:** tap series to include or exclude them, toggle
@@ -309,7 +329,7 @@ values plus an optional `time`, or `()` to skip the line.
 ## Profiles
 
 ```sh
-graft /var/log/reclaimable.log --stats --split --save-profile reclaim
+graft /var/log/reclaimable.log -F '{key}: {value}' --stats --split --save-profile reclaim
 graft -p reclaim                 # later; extra flags override the profile
 graft --list-profiles            # saved + built-in: meminfo, loadavg, net, cpu-temp
 ```

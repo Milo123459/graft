@@ -83,7 +83,14 @@ fn run() -> Result<ExitCode> {
         !cli.once && !cli.no_chart && cli.explain.is_none() && cli.export.is_empty() && stdout_tty;
     let no_source = cli.cmd.is_none() && cli.input.is_none();
 
-    if interactive && (cli.build || (no_source && std::io::stdin().is_terminal())) {
+    // The format is never guessed: without one, the builder offers suggestions to pick
+    // from (interactive), or the error lists them as commands.
+    let open_builder =
+        cli.build || !cli.has_parser() || (no_source && std::io::stdin().is_terminal());
+    if !interactive && !cli.has_parser() {
+        return Err(no_format_error(&cli, interactive));
+    }
+    if interactive && open_builder {
         // Piped data can still be shaped in the builder.
         let live = (no_source && !std::io::stdin().is_terminal())
             .then(|| interactive::Live::new(SourceSpec::Stdin));
@@ -123,6 +130,56 @@ fn run() -> Result<ExitCode> {
 }
 
 use crate::setup::Setup;
+
+/// "No format given", listing the formats that fit a sample of the input.
+fn no_format_error(cli: &Cli, interactive: bool) -> anyhow::Error {
+    let what = cli
+        .cmd
+        .as_deref()
+        .map(|c| format!("`{c}`"))
+        .or_else(|| cli.input.as_ref().map(|p| p.display().to_string()))
+        .unwrap_or_else(|| "stdin".into());
+    let mut msg =
+        format!("no format given for {what}. graft doesn't guess: choose how to parse it");
+    let sample: Vec<String> = match setup::source_spec(cli, interactive) {
+        Ok(SourceSpec::File { path, .. }) => std::fs::read_to_string(&path)
+            .map(|s| s.lines().take(300).map(String::from).collect())
+            .unwrap_or_default(),
+        Ok(SourceSpec::Command { cmd, .. }) => {
+            builder::sample_command_blocking(&cmd).unwrap_or_default()
+        }
+        Ok(SourceSpec::Stdin) => std::io::stdin()
+            .lines()
+            .map_while(Result::ok)
+            .take(300)
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    let from_command = cli.cmd.is_some();
+    let script = std::rc::Rc::new(
+        script::ScriptHost::new(None, cli.binary_units).expect("plain script host"),
+    );
+    let suggestions = suggest::suggest(&sample, cli, from_command, &script);
+    if suggestions.is_empty() {
+        msg.push_str(
+            " with -F/--format, --regex, --kv, --csv, --json or --columns (--auto to guess)",
+        );
+    } else {
+        msg.push_str(". Formats that fit:\n");
+        for s in suggestions.iter().take(4) {
+            msg.push_str(&format!(
+                "  {}\n      ({} of {} sample lines)\n",
+                s.cli.command_line(),
+                s.matched,
+                s.total
+            ));
+        }
+        msg.push_str(
+            "Run without --once in a terminal to pick one interactively, or add --auto to guess.",
+        );
+    }
+    anyhow::anyhow!(msg)
+}
 
 /// Terminal size, from the tty or $COLUMNS/$LINES.
 fn terminal_size() -> Option<(u16, u16)> {

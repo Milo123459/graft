@@ -11,16 +11,16 @@ use crate::time::parse_duration;
 const EXAMPLES: &str = "\
 Examples:
   graft                                         open the builder: pick a source, get format suggestions
-  graft reclaimable.log                         auto-detect timestamps and `key: value` pairs
-  graft reclaimable.log -F '{time} node1: {node1} node2: {node2}'   an explicit format template
-  graft reclaimable.log --stats --once          print the chart, stats and trend, then exit
-  graft reclaimable.log --forecast=7d --target node1=50GB --fit-window 12h
+  graft reclaimable.log                         no format given: opens the builder with suggestions
+  graft reclaimable.log -F '{time} node1: {node1} node2: {node2}'   graph it with this format
+  graft reclaimable.log -F '{key}: {value}' --stats --once           print chart + stats, then exit
+  graft reclaimable.log --kv --forecast=7d --target node1=50GB --fit-window 12h
   graft app.log -F '{time} {_} took {latency}'  `{_}` skips text; units like `12ms` are understood
   graft app.log -r '(?P<time>\\S+ \\S+) .* took (?P<latency>\\d+ms)'
   graft -c 'cat /proc/meminfo' -n 1s --binary-units -s MemFree,Cached
   graft -c 'df -B1' -F '{key} {_} {used} {avail} {_}' -s '*.avail'
   graft data.csv --csv --resample 1h:max --smooth 3
-  graft reclaimable.log --alert 'node1 < 50GB' --once --no-chart && echo ok
+  graft reclaimable.log --kv --alert 'node1 < 50GB' --once --no-chart && echo ok
   graft -p meminfo                              run a saved (or built-in) profile
 
 Format templates (-F): {name} captures a number (with optional unit) as series `name`;
@@ -89,9 +89,14 @@ pub struct Cli {
     )]
     pub regex: Option<String>,
 
-    /// Parse `key: value` / `key=value` pairs (the default when nothing else is chosen).
+    /// Parse `key: value` / `key=value` pairs.
     #[arg(long, group = "parser", help_heading = "Parsing")]
     pub kv: bool,
+
+    /// Guess the format: `key: value` pairs if there are any, else numeric columns.
+    /// (A format is never guessed unless you ask for it.)
+    #[arg(long, group = "parser", help_heading = "Parsing")]
+    pub auto: bool,
 
     /// Parse CSV (header row auto-detected).
     #[arg(long, group = "parser", help_heading = "Parsing")]
@@ -499,6 +504,7 @@ impl Cli {
         let flags = [
             (self.follow, "--follow"),
             (self.kv, "--kv"),
+            (self.auto, "--auto"),
             (self.csv, "--csv"),
             (self.json, "--json"),
             (self.parse_fn, "--parse-fn"),
@@ -554,6 +560,19 @@ impl Cli {
         self.json = false;
         self.columns = None;
         self.parse_fn = false;
+        self.auto = false;
+    }
+
+    /// Whether a way of parsing the input was chosen (one is always required).
+    pub fn has_parser(&self) -> bool {
+        self.format.is_some()
+            || self.regex.is_some()
+            || self.kv
+            || self.auto
+            || self.csv
+            || self.json
+            || self.columns.is_some()
+            || self.parse_fn
     }
 }
 

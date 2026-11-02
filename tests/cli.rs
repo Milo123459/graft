@@ -4,6 +4,7 @@ use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
 const LOG: &str = "examples/reclaimable.log";
+const FMT: &str = "{time} node1: {node1} node2: {node2}";
 
 fn graft(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_graft"))
@@ -40,7 +41,9 @@ fn stdout(o: &Output) -> String {
 
 #[test]
 fn once_draws_chart_and_trend() {
-    let o = graft(&[LOG, "--once", "--stats", "--width", "90", "--height", "16"]);
+    let o = graft(&[
+        LOG, "-F", FMT, "--once", "--stats", "--width", "90", "--height", "16",
+    ]);
     assert!(o.status.success());
     let out = stdout(&o);
     assert!(!out.contains('\x1b'), "no colour when piped");
@@ -57,16 +60,23 @@ fn once_draws_chart_and_trend() {
 
 #[test]
 fn alerts_set_exit_status() {
-    let fired = graft(&[LOG, "--no-chart", "--alert", "node1 < 59GB"]);
+    let fired = graft(&[LOG, "-F", FMT, "--no-chart", "--alert", "node1 < 59GB"]);
     assert_eq!(fired.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&fired.stderr).contains("ALERT: node1 < 59GB"));
-    let quiet = graft(&[LOG, "--no-chart", "--alert", "last(\"node1\") < 10GB"]);
+    let quiet = graft(&[
+        LOG,
+        "-F",
+        FMT,
+        "--no-chart",
+        "--alert",
+        "last(\"node1\") < 10GB",
+    ]);
     assert_eq!(quiet.status.code(), Some(0));
 }
 
 #[test]
 fn explain_reports_each_line() {
-    let out = stdout(&graft(&[LOG, "--explain=2"]));
+    let out = stdout(&graft(&[LOG, "-F", FMT, "--explain=2"]));
     assert!(
         out.contains("1 ✓ 2026-11-01 04:00 │ node1=59.9 GB  node2=422.6 GB"),
         "{out}"
@@ -79,6 +89,8 @@ fn csv_export_round_trips() {
     let path = std::env::temp_dir().join(format!("graft-test-{}.csv", std::process::id()));
     let o = graft(&[
         LOG,
+        "-F",
+        FMT,
         "--no-chart",
         "--resample",
         "12h:max",
@@ -98,7 +110,15 @@ fn csv_export_round_trips() {
 #[test]
 fn stdin_columns_with_header() {
     let o = graft_stdin(
-        &["--once", "--no-chart", "--stats", "-s", "free"],
+        &[
+            "--columns",
+            "all",
+            "--once",
+            "--no-chart",
+            "--stats",
+            "-s",
+            "free",
+        ],
         "r b free\n1 0 100\n2 0 80\n1 1 60\n",
     );
     let out = stdout(&o);
@@ -113,6 +133,7 @@ fn command_source() {
     let o = graft(&[
         "-c",
         "echo used=40%; echo free=60%",
+        "--kv",
         "--once",
         "-k",
         "bar",
@@ -127,17 +148,17 @@ fn command_source() {
 
 #[test]
 fn helpful_error_when_nothing_parses() {
-    let o = graft_stdin(&["--once"], "hello\nworld\n");
+    let o = graft_stdin(&["--once", "--kv"], "hello\nworld\n");
     assert_eq!(o.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&o.stderr).contains("--explain"));
 }
 
 #[test]
 fn bad_arguments_are_reported() {
-    let o = graft(&[LOG, "--once", "--hline", "lots"]);
+    let o = graft(&[LOG, "-F", FMT, "--once", "--hline", "lots"]);
     assert!(!o.status.success());
     assert!(String::from_utf8_lossy(&o.stderr).contains("--hline: 'lots' is not a number"));
-    let o = graft(&[LOG, "--once", "--series", "oops"]);
+    let o = graft(&[LOG, "-F", FMT, "--once", "--series", "oops"]);
     assert!(String::from_utf8_lossy(&o.stderr).contains("NAME=EXPR"));
 }
 
@@ -175,6 +196,8 @@ fn format_template_targets_and_custom_stats_output() {
 fn stats_json_and_no_default_target() {
     let o = graft(&[
         LOG,
+        "-F",
+        FMT,
         "--no-chart",
         "--stats",
         "--stats-format",
@@ -194,6 +217,8 @@ fn stats_json_and_no_default_target() {
 fn forecast_is_drawn_in_once_mode() {
     let out = stdout(&graft(&[
         LOG,
+        "-F",
+        FMT,
         "--once",
         "--forecast=3d",
         "--target",
@@ -221,6 +246,8 @@ fn bad_template_is_reported() {
 fn timeframe_flags() {
     let o = graft(&[
         LOG,
+        "-F",
+        FMT,
         "--no-chart",
         "--stats-template",
         "{name} {n}",
@@ -230,6 +257,8 @@ fn timeframe_flags() {
     assert_eq!(stdout(&o), "node1 7\nnode2 7\n");
     let o = graft(&[
         LOG,
+        "-F",
+        FMT,
         "--no-chart",
         "--stats-template",
         "{name} {n}",
@@ -239,6 +268,30 @@ fn timeframe_flags() {
         "2026-11-02 03:00",
     ]);
     assert_eq!(stdout(&o), "node1 4\nnode2 4\n");
-    let o = graft(&[LOG, "--no-chart", "--since", "yesterday"]);
+    let o = graft(&[LOG, "-F", FMT, "--no-chart", "--since", "yesterday"]);
     assert!(String::from_utf8_lossy(&o.stderr).contains("--since: can't read 'yesterday'"));
+}
+
+#[test]
+fn a_format_is_required_and_suggested() {
+    let o = graft(&[LOG, "--once"]);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("no format given for examples/reclaimable.log"),
+        "{err}"
+    );
+    assert!(
+        err.contains(
+            "graft --format '{time} node1: {node1} node2: {node2}' --once examples/reclaimable.log"
+        ),
+        "{err}"
+    );
+    assert!(err.contains("(29 of 29 sample lines)"), "{err}");
+    // Guessing is opt-in.
+    assert!(
+        graft(&[LOG, "--once", "--auto", "--no-chart"])
+            .status
+            .success()
+    );
 }

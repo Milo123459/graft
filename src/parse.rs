@@ -114,6 +114,7 @@ pub fn build(cli: &Cli, script: Rc<ScriptHost>) -> Result<Box<dyn LineParser>> {
         };
         let cols = ColumnsParser::new(None, cli.names.clone(), cli.delimiter, time, binary);
         if cli.kv {
+            // (--auto and "nothing chosen" both use the auto parser below.)
             Box::new(kv)
         } else {
             Box::new(AutoParser {

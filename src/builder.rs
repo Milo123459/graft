@@ -52,6 +52,8 @@ enum Src {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Parser {
+    /// Nothing chosen yet (a format is required to start).
+    Unset,
     Auto,
     Template,
     Regex,
@@ -74,7 +76,8 @@ impl Parser {
 
     fn name(self) -> &'static str {
         match self {
-            Parser::Auto => "auto",
+            Parser::Unset => "?",
+            Parser::Auto => "auto-detect",
             Parser::Template => "template",
             Parser::Regex => "regex",
             Parser::Kv => "key: value",
@@ -179,8 +182,10 @@ impl Builder {
             (Parser::Csv, String::new())
         } else if cli.json {
             (Parser::Json, String::new())
-        } else {
+        } else if cli.auto {
             (Parser::Auto, String::new())
+        } else {
+            (Parser::Unset, String::new())
         };
         let selected = (!cli.select.is_empty()).then(|| cli.select.iter().cloned().collect());
         let script = Rc::new(
@@ -343,14 +348,14 @@ impl Builder {
             self.from_command,
             &self.script,
         );
-        // Nothing chosen yet: start from the best suggestion (shown, and editable).
-        if self.parser == Parser::Auto
-            && let Some(s) = self.suggestions.first().cloned()
-        {
-            self.use_suggestion(&s);
-        }
+        // Nothing is chosen for you: the suggestions wait for a tap.
         if self.sample.is_empty() {
             self.error("the source produced no lines".into());
+        } else if self.parser == Parser::Unset && !self.suggestions.is_empty() {
+            self.message = Some((
+                "pick a format: tap a suggestion (or ↑/↓), or choose a parser and write one".into(),
+                false,
+            ));
         }
         self.refresh();
     }
@@ -402,7 +407,8 @@ impl Builder {
         c.clear_parser();
         let text = self.format.value.clone();
         match self.parser {
-            Parser::Auto => {}
+            Parser::Unset => {}
+            Parser::Auto => c.auto = true,
             Parser::Template => c.format = Some(text),
             Parser::Regex => c.regex = Some(text),
             Parser::Kv => c.kv = true,
@@ -455,13 +461,30 @@ impl Builder {
             }
             Err(e) => self.error(format!("{e:#}")),
         }
-        self.preview = suggest::preview(
-            &self.cli,
-            &self.sample,
-            self.from_command,
-            &self.script,
-            300,
-        );
+        self.preview = if self.parser == Parser::Unset {
+            // No format, no parsing — just show the raw sample.
+            Preview {
+                lines: self
+                    .sample
+                    .iter()
+                    .take(300)
+                    .map(|l| suggest::LineResult {
+                        raw: l.clone(),
+                        result: Err("no format yet".into()),
+                    })
+                    .collect(),
+                total: self.sample.len(),
+                ..Preview::default()
+            }
+        } else {
+            suggest::preview(
+                &self.cli,
+                &self.sample,
+                self.from_command,
+                &self.script,
+                300,
+            )
+        };
     }
 
     /// Validate and build the viewer.
@@ -469,6 +492,9 @@ impl Builder {
         self.apply()?;
         if self.cli.input.is_none() && self.cli.cmd.is_none() {
             bail!("choose a source first");
+        }
+        if self.parser == Parser::Unset {
+            bail!("pick a format first: tap a suggestion, or choose a parser and write one");
         }
         if let Some(e) = &self.preview.error {
             bail!("{e}");
@@ -859,8 +885,11 @@ impl Builder {
 
     fn action_buttons(&self) -> Vec<Button<Hit>> {
         vec![
-            Button::new("▶ start", Hit::Start)
-                .active(self.preview.error.is_none() && self.preview.matched > 0),
+            Button::new("▶ start", Hit::Start).active(
+                self.parser != Parser::Unset
+                    && self.preview.error.is_none()
+                    && self.preview.matched > 0,
+            ),
             Button::new(
                 if self.save_name.is_some() {
                     "save ✓"
@@ -1068,6 +1097,13 @@ impl Builder {
             Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(rows[6]);
         let p = &self.preview;
         let header = match &p.error {
+            None if self.parser == Parser::Unset => Line::from(vec![
+                Span::styled("sample ", heading),
+                Span::styled(
+                    format!("{} lines · pick a format to see how they parse", p.total),
+                    Style::default().fg(Color::Gray),
+                ),
+            ]),
             Some(e) => Line::styled(
                 format!("format error: {e}"),
                 Style::default().fg(Color::LightRed),
@@ -1108,6 +1144,9 @@ impl Builder {
                     Span::styled("✓ ", Style::default().fg(Color::Green)),
                     Span::raw(summary.clone()),
                 ]),
+                Err(_) if self.parser == Parser::Unset => {
+                    Line::styled(l.raw.clone(), Style::default().fg(Color::Gray))
+                }
                 Err(reason) => Line::from(vec![
                     Span::styled("✗ ", Style::default().fg(Color::Red)),
                     Span::styled(format!("{reason} │ "), Style::default().fg(Color::Yellow)),
@@ -1219,6 +1258,11 @@ fn run_sample_command(cmd: String) -> Receiver<Result<Vec<String>, String>> {
     rx
 }
 
+/// Run a command once and return its first lines (for suggestions outside the TUI).
+pub fn sample_command_blocking(cmd: &str) -> Option<Vec<String>> {
+    run_sample_command(cmd.to_string()).recv().ok()?.ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1269,7 +1313,12 @@ mod tests {
 
     #[test]
     fn suggests_and_previews_a_file() {
-        let b = builder(&["graft", "examples/reclaimable.log", "--build"]);
+        let mut b = builder(&["graft", "examples/reclaimable.log", "--build"]);
+        // Nothing is chosen until you pick: the sample is shown raw and start is refused.
+        assert_eq!(b.parser, Parser::Unset);
+        assert!(screen(&b, 100, 40).contains("29 lines · pick a format"));
+        assert!(b.launch().is_err());
+        assert_eq!(tap(&mut b, "▸ template"), Transition::None);
         assert_eq!(b.parser, Parser::Template);
         assert_eq!(b.format.value, "{time} node1: {node1} node2: {node2}");
         assert_eq!(b.preview.matched, 29);
@@ -1289,6 +1338,7 @@ mod tests {
     #[test]
     fn editing_the_format_updates_the_preview() {
         let mut b = builder(&["graft", "examples/reclaimable.log"]);
+        key(&mut b, KeyCode::Down); // the first suggestion
         let (x, y) = find(&b, "format  {time}");
         b.on_event(&TermEvent::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -1362,6 +1412,7 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(b.sample.len(), 2);
+        key(&mut b, KeyCode::Down); // pick the first suggestion
         assert_eq!(
             b.preview
                 .series
