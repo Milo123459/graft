@@ -188,7 +188,8 @@ pub fn run(start: Start) -> Result<ExitCode> {
                 }
                 (Screen::Viewer(mut a), Transition::EditSource) => {
                     let (name, cli) = a.take_source_edit();
-                    Screen::Builder(Box::new(Builder::for_source(name, cli, a)))
+                    let pane = a.take_pane_to_edit();
+                    Screen::Builder(Box::new(Builder::for_source(name, cli, a, pane)))
                 }
                 (Screen::Builder(mut b), Transition::Back) => match b.take_previous() {
                     Some(app) => Screen::Viewer(app),

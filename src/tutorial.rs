@@ -543,7 +543,7 @@ The expression can go in quotes or be written as code: add_line("total", user + 
     Step {
         title: "getting data in",
         text: r#"Three kinds of source: a file (read once, or followed as it grows), a command (run every few seconds, like watch) or stdin (a pipe). Any of them can run on another machine with --ssh, and more sources can share one chart: their series are named after them (cb, or cb.price when there are several).
-The sources menu lists them all: the main one, merged ones (edit in the builder with a live preview, add, remove), and in a dashboard each pane's own source (change picks another).
+The sources menu lists them all: the main one, merged ones (edit in the builder with a live preview, add, remove), and in a dashboard each pane's own source (edit it, or change picks another). An edited pane source is kept with the chart as a named source.
 From here on the steps are a reference: read what's useful, skip the rest with Enter."#,
         keys: &[
             (
@@ -587,6 +587,10 @@ From here on the steps are a reference: read what's useful, skip the rest with E
             (
                 "graft --build",
                 "open the builder first (graft alone does too)",
+            ),
+            (
+                r#"--source 'mem = -c "cat /proc/meminfo" --kv' --pane 'source=mem'"#,
+                "a named source for a pane (it replaces a preset with that name)",
             ),
         ],
         ..BASE

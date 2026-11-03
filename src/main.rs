@@ -333,7 +333,7 @@ fn run_once(
         let views: Vec<render::SourceView> = sources::wanted(opts)
             .iter()
             .map(|name| {
-                let mut sub = sources::Sub::open(name, false, cli.ssh.as_deref());
+                let mut sub = sources::Sub::open(name, false, cli.ssh.as_deref(), &cli.source);
                 sub.load_to_end(&timeframe);
                 sub.view
             })

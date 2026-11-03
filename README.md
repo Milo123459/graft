@@ -233,7 +233,11 @@ first becomes the main source. In the viewer, the **sources** button (`S`)
 lists them: **edit** opens one in the builder (source, format, live preview) and
 puts it back with **merge into the chart**; **+ add source** makes a new one;
 **✕** removes one. In a dashboard it also lists each pane's own source
-(`--pane source=memory`), with **change** to pick another. Custom lines can then combine them, e.g. ETH
+(`--pane source=memory`), with **change** to pick another and **edit** to change
+what it runs in the builder. An edited pane source is kept with the chart as a
+named source, `--source 'memory = -c "…" --kv'`, which a pane shows with
+`source=memory` and which takes the place of a preset or profile of that name
+for this chart only. Custom lines can then combine them, e.g. ETH
 from two exchanges, their average, and an EMA30 of it:
 
 ```sh

@@ -152,6 +152,8 @@ pub struct Builder {
     /// it had (`None`: a new one).
     merge_name: Option<TextInput>,
     merge_old: Option<String>,
+    /// …and it's a pane's own source: that pane.
+    merge_pane: Option<usize>,
     focus: Option<Field>,
     sample: Vec<String>,
     /// When each sample line arrived, if it came from a running viewer (else empty).
@@ -312,6 +314,7 @@ impl Builder {
             save_name: None,
             merge_name: None,
             merge_old: None,
+            merge_pane: None,
             focus: None,
             sample: Vec::new(),
             sample_meta: Vec::new(),
@@ -356,13 +359,16 @@ impl Builder {
 
     /// Edit a merged source of `chart` (`name` it's merged as, `cli` its arguments),
     /// or make a new one: start puts it back into the chart.
-    pub fn for_source(name: String, cli: Cli, chart: Box<App>) -> Self {
-        let new = !chart
-            .current_cli()
-            .merge
-            .iter()
-            .any(|s| crate::sources::Merge::parse(s).is_ok_and(|m| m.name == name));
+    /// `pane`: it's that pane's own source (it goes back to the pane, not merged in).
+    pub fn for_source(name: String, cli: Cli, chart: Box<App>, pane: Option<usize>) -> Self {
+        let new = pane.is_none()
+            && !chart
+                .current_cli()
+                .merge
+                .iter()
+                .any(|s| crate::sources::Merge::parse(s).is_ok_and(|m| m.name == name));
         let mut b = Builder::new(cli, None, Some(chart));
+        b.merge_pane = pane;
         b.merge_old = (!new).then(|| name.clone());
         b.merge_name = Some(TextInput::new(name));
         if new {
@@ -710,7 +716,11 @@ impl Builder {
             .previous
             .take()
             .ok_or_else(|| anyhow::anyhow!("there's no chart to add the source to"))?;
-        if let Err(e) = app.set_merged_source(self.merge_old.as_deref(), spec) {
+        let done = match self.merge_pane {
+            Some(id) => app.set_pane_source_def(id, self.merge_old.as_deref(), spec),
+            None => app.set_merged_source(self.merge_old.as_deref(), spec),
+        };
+        if let Err(e) = done {
             self.previous = Some(app);
             return Err(e);
         }
@@ -1137,7 +1147,9 @@ impl Builder {
     fn action_buttons(&self) -> Vec<Button<Hit>> {
         vec![
             Button::new(
-                if self.merge_name.is_some() {
+                if self.merge_pane.is_some() {
+                    "▶ use in the pane"
+                } else if self.merge_name.is_some() {
                     "▶ merge into the chart"
                 } else {
                     "▶ start"
@@ -1242,7 +1254,11 @@ impl Builder {
                 Layout::horizontal([Constraint::Length(30), Constraint::Min(10)]).areas(rows[0]);
             f.render_widget(
                 Span::styled(
-                    " graft · a source to merge ",
+                    if self.merge_pane.is_some() {
+                        " graft · a pane's source "
+                    } else {
+                        " graft · a source to merge "
+                    },
                     Style::default()
                         .fg(Color::Black)
                         .bg(Color::Cyan)
@@ -2027,7 +2043,7 @@ mod tests {
         assert_eq!(ev(&mut app, '1'), T::EditSource);
         let (name, cli) = app.take_source_edit();
         assert_eq!(name, "b");
-        let mut b = Builder::for_source(name, cli, Box::new(app));
+        let mut b = Builder::for_source(name, cli, Box::new(app), None);
         let start = Instant::now();
         while b.loading.is_some() && start.elapsed() < Duration::from_secs(5) {
             b.tick();
@@ -2059,7 +2075,7 @@ mod tests {
         let (name, _) = app.take_source_edit();
         assert_eq!(name, "source2");
         let cli = Cli::parse_from(["graft", log, "--kv"]);
-        let mut b = Builder::for_source(name, cli, Box::new(app));
+        let mut b = Builder::for_source(name, cli, Box::new(app), None);
         let start = Instant::now();
         while b.loading.is_some() && start.elapsed() < Duration::from_secs(5) {
             b.tick();
@@ -2087,6 +2103,48 @@ mod tests {
             },
         ));
         assert_eq!(app.current_cli().merge.len(), 1);
+    }
+
+    #[test]
+    fn a_panes_source_can_be_edited() {
+        use crate::interactive::Transition as T;
+        let log = "examples/reclaimable.log";
+        let mut app =
+            crate::tui::tests::app(&["graft", log, "--kv", "--pane", "*", "--pane", "source=load"]);
+        app.on_event(&ratatui::crossterm::event::Event::Key(KeyEvent::new(
+            KeyCode::Char('S'),
+            KeyModifiers::NONE,
+        )));
+        let s = crate::tui::tests::screen_of(&app, 100, 40);
+        assert!(
+            s.contains("pane 2 · load") && s.contains(" edit ") && s.contains(" change "),
+            "{s}"
+        );
+        // edit: the builder gets the pane's source, and puts it back in the pane.
+        assert_eq!(app.edit_pane_source_for_test(1), T::EditSource);
+        let (name, cli) = app.take_source_edit();
+        let pane = app.take_pane_to_edit();
+        assert_eq!((name.as_str(), pane), ("load", Some(1)));
+        assert_eq!(cli.cmd.as_deref(), Some("cat /proc/loadavg"));
+        let mut b = Builder::for_source(name, cli, Box::new(app), pane);
+        let start = Instant::now();
+        while b.loading.is_some() && start.elapsed() < Duration::from_secs(5) {
+            b.tick();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(screen(&b, 100, 40).contains("use in the pane"));
+        b.merge_name.as_mut().unwrap().set("myload");
+        let app = b.launch().expect("back in the pane");
+        let cli = app.current_cli();
+        assert_eq!(cli.source.len(), 1);
+        assert!(cli.source[0].starts_with("myload = "), "{:?}", cli.source);
+        assert_eq!(cli.pane[1], "* source=myload");
+        // A named source takes the place of a preset with the same name.
+        let c = crate::sources::cli_for("load", None, &[format!("load = {log} --kv")]).unwrap();
+        assert_eq!(
+            c.input.as_ref().map(|p| p.display().to_string()),
+            Some(log.to_string())
+        );
     }
 
     #[test]

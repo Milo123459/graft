@@ -205,8 +205,9 @@ enum Hit {
     /// Sources menu: edit one (`None`: the main source), remove a merged one, add one.
     SourceEdit(Option<usize>),
     SourceRemove(usize),
-    /// Pick another source for pane `n`.
+    /// Pick another source for pane `n`, or edit the one it has.
     SourcePane(usize),
+    SourcePaneEdit(usize),
     SourceAdd,
     CloseSources,
     /// A console suggestion (by position in the hint row).
@@ -462,6 +463,8 @@ pub struct App {
     popup_kind: std::cell::Cell<u8>,
     /// The source the builder is to edit: `Some(None)` is a new one.
     source_to_edit: Option<Option<String>>,
+    /// …or a pane's own source: that pane.
+    pane_to_edit: Option<usize>,
     /// The console's last output (a result or an error), shown above the status line.
     console_note: Option<Message>,
     /// Tab pressed: the suggestions being cycled through, and the input before.
@@ -589,6 +592,7 @@ impl App {
             popup_focus: std::cell::Cell::new(0),
             popup_kind: std::cell::Cell::new(0),
             source_to_edit: None,
+            pane_to_edit: None,
             error_at: None,
             tab_cycle: None,
             tutorial_rect: std::cell::Cell::new(Rect::default()),
@@ -731,7 +735,13 @@ impl App {
         if self.opts.panes.is_none() && self.subs.is_empty() {
             return;
         }
-        crate::sources::sync(&mut self.subs, &self.opts, true, self.cli.ssh.as_deref());
+        crate::sources::sync(
+            &mut self.subs,
+            &self.opts,
+            true,
+            self.cli.ssh.as_deref(),
+            &self.cli.source,
+        );
         let mut changed = force || self.sub_views.len() != self.subs.len();
         for sub in &mut self.subs {
             if sub.pump(Duration::from_millis(10)) && (!self.paused || force) {
@@ -2527,7 +2537,8 @@ impl App {
                 let src = src.trim();
                 let src = (!src.is_empty() && src != "main").then(|| src.to_string());
                 if let Some(name) = &src
-                    && let Err(e) = crate::sources::cli_for(name, self.cli.ssh.as_deref())
+                    && let Err(e) =
+                        crate::sources::cli_for(name, self.cli.ssh.as_deref(), &self.cli.source)
                 {
                     return self.say(format!("pane_source: {e:#}"), true);
                 }
@@ -3794,10 +3805,11 @@ impl App {
             .enumerate()
             .filter_map(|(id, pane)| {
                 let name = pane.source.clone()?;
-                let what = crate::sources::cli_for(&name, self.cli.ssh.as_deref())
-                    .ok()
-                    .and_then(|c| crate::setup::source_spec(&c, false).ok())
-                    .map_or_else(|| "a profile or recent chart".to_string(), |s| s.describe());
+                let what =
+                    crate::sources::cli_for(&name, self.cli.ssh.as_deref(), &self.cli.source)
+                        .ok()
+                        .and_then(|c| crate::setup::source_spec(&c, false).ok())
+                        .map_or_else(|| "a profile or recent chart".to_string(), |s| s.describe());
                 Some((id, name, what))
             })
             .collect()
@@ -3829,7 +3841,33 @@ impl App {
         self.ds.series.iter().map(|s| s.name.clone()).collect()
     }
 
+    /// For editing a pane's own source: which pane (taken by the builder).
+    #[cfg(test)]
+    pub fn edit_pane_source_for_test(&mut self, id: usize) -> Transition {
+        self.sources_menu = false;
+        self.pane_to_edit = Some(id);
+        Transition::EditSource
+    }
+
+    pub fn take_pane_to_edit(&mut self) -> Option<usize> {
+        self.pane_to_edit.take()
+    }
+
     pub fn take_source_edit(&mut self) -> (String, Cli) {
+        // A pane's source: its name and what it runs now.
+        if let Some(id) = self.pane_to_edit
+            && let Some(name) = self
+                .opts
+                .panes
+                .as_ref()
+                .and_then(|p| p.panes.get(id))
+                .and_then(|p| p.source.clone())
+        {
+            self.source_to_edit = None;
+            let cli = crate::sources::cli_for(&name, self.cli.ssh.as_deref(), &self.cli.source)
+                .unwrap_or_else(|_| <Cli as clap::Parser>::parse_from(["graft"]));
+            return (name, cli);
+        }
         let name = self.source_to_edit.take().flatten();
         let found = name.as_ref().and_then(|n| {
             self.cli
@@ -3849,6 +3887,35 @@ impl App {
                 (name, <Cli as clap::Parser>::parse_from(["graft"]))
             }
         }
+    }
+
+    /// A pane's source, edited in the builder: kept as a named source of this chart
+    /// (`--source 'NAME = ARGS'`, in place of a preset of that name) and shown in pane
+    /// `id` (`old`: the name it had).
+    pub fn set_pane_source_def(
+        &mut self,
+        id: usize,
+        old: Option<&str>,
+        spec: String,
+    ) -> anyhow::Result<()> {
+        let m = crate::sources::Merge::parse(&spec)?;
+        self.cli
+            .source
+            .retain(|s| crate::sources::Merge::parse(s).map_or(true, |o| o.name != m.name));
+        self.cli.source.push(m.spec);
+        if let Some(p) = self.opts.panes.as_mut()
+            && let Some(pane) = p.panes.get_mut(id)
+        {
+            pane.source = Some(m.name.clone());
+            p.focus = id;
+        }
+        // Start it again with its new arguments.
+        self.subs
+            .retain(|s| s.name != m.name && Some(s.name.as_str()) != old);
+        self.tick_sources(true);
+        self.rebuild(true);
+        self.say(format!("pane {} now reads '{}'", id + 1, m.name), false);
+        Ok(())
     }
 
     /// Add or replace a merged source (from the builder): `old` is the name it had.
@@ -4038,7 +4105,10 @@ impl App {
                 y,
                 &format!("pane {} · {name}", id + 1),
                 what,
-                vec![Button::new("change", Hit::SourcePane(*id))],
+                vec![
+                    Button::new("edit", Hit::SourcePaneEdit(*id)),
+                    Button::new("change", Hit::SourcePane(*id)),
+                ],
             );
             y += 2;
         }
@@ -5372,6 +5442,11 @@ impl App {
                         }
                         Hit::SourceEdit(i) => self.edit_source(i),
                         Hit::SourceAdd => self.edit_source(Some(usize::MAX)),
+                        Hit::SourcePaneEdit(id) => {
+                            self.sources_menu = false;
+                            self.pane_to_edit = Some(id);
+                            Transition::EditSource
+                        }
                         Hit::SourcePane(id) => {
                             // Pick that pane, then choose its source as the pane panel does.
                             self.sources_menu = false;

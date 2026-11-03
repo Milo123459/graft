@@ -58,6 +58,12 @@ pub struct Cli {
     #[arg(long, value_name = "NAME[ = ARGS]", help_heading = "Input")]
     pub merge: Vec<String>,
 
+    /// A named source for panes, with its own arguments: `--source 'mem = -c "free -b"
+    /// --kv'`, shown by `--pane 'source=mem'` (repeatable). It takes the place of a
+    /// preset or profile with the same name, for this chart only.
+    #[arg(long = "source", value_name = "NAME = ARGS", help_heading = "Input")]
+    pub source: Vec<String>,
+
     /// With --merge, redraw as soon as any source has new data, instead of waiting
     /// for a round with something new from every live source.
     #[arg(long, help_heading = "Input")]
@@ -532,6 +538,9 @@ impl Cli {
         opt("--as", self.as_name.clone());
         for m in &self.merge {
             opt("--merge", Some(m.clone()));
+        }
+        for s in &self.source {
+            opt("--source", Some(s.clone()));
         }
         opt(
             "--every",
