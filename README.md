@@ -248,8 +248,8 @@ graft -c 'curl -s --json "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"{coin
   --line 'ema30 = ema(values("close"), 30)' --line 'ema50 = ema(values("close"), 50)' \
   --line 'rsi14:% = rsi(values("close"), 14)' --line 'overbought:% = 70' --line 'oversold:% = 30' \
   --line 'macd = macd(values("close"))' --line 'signal = ema(values("macd"), 9)' \
-  --mark 'name == "ema30" && prev < ema50_prev && value >= ema50 => golden cross | ▲ cyan badge' \
-  --mark 'name == "ema30" && prev > ema50_prev && value <= ema50 => death cross | ▼ magenta badge' \
+  --mark 'cross_above(ema30, ema50) => golden cross | ▲ cyan badge' \
+  --mark 'cross_below(ema30, ema50) => death cross | ▼ magenta badge' \
   --pane 'ema30,ema50 kind=candles title={coin} {interval}' --pane 'rsi14,overbought,oversold front=rsi14' --pane 'macd,signal front=macd' --pane volume \
   --layout '1 /60% ((2 | 3) / 4)' --title '{coin} {interval}'
 ```
@@ -361,7 +361,11 @@ literals work. The label after `=>` can use `{name} {value} {prev} {delta}
 and `--stats` lists them. In a `--script` file or the console:
 `mark_when("delta < -1GB", "dropped {delta}")`; `mark("deploy")` drops one by
 hand at the cursor (or the newest data); `clear_marks()` removes them all.
-Give a rule its own look after `|` so different events read differently: a symbol
+Crossings have a shorthand: `cross_above(a, b)` holds where `a` went from below `b`
+to at or above it (`b` a series or a number, e.g. `cross_above(rsi14, 70)`),
+`cross_below(a, b)` the other way and `cross(a, b)` either way. A rule like that is
+checked once per point of the first series it names (which the marker goes on), not
+once for every series. Give a rule its own look after `|` so different events read differently: a symbol
 (upward ones sit below the point, the rest above), a colour (the terminal's names,
 plus orange, purple, pink, gold, teal, brown, lime, sky, violet; `#ff8800`; `208`),
 effects (`bold`, `italic`, `underline`, `dim`, `reverse`) and a background
@@ -369,8 +373,8 @@ effects (`bold`, `italic`, `underline`, `dim`, `reverse`) and a background
 tell apart from candles or lines in the same colours:
 
 ```sh
---mark 'name == "eth" && prev < ema30_prev && value >= ema30 => above EMA30 | ▲ green'
---mark 'name == "eth" && prev > ema30_prev && value <= ema30 => below EMA30 | ▼ red'
+--mark 'cross_above(eth, ema30) => above EMA30 | ▲ green'
+--mark 'cross_below(eth, ema30) => below EMA30 | ▼ red'
 --mark 'notify value > 4000 => over 4k | ★ yellow'     # notify: tell me about new ones
 --mark 'value > 4200 => ATH | ★ orange badge'            # a tag in orange
 ```

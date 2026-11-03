@@ -463,6 +463,10 @@ The database spikes now and then: mark it."#,
                 r#"--mark 'name == "db" && value > 60ms => slow'"#,
                 "one series only",
             ),
+            (
+                "--mark 'cross_above(api, db) => api passed db'",
+                "where one series crosses another (cross_below(), cross() either way; or a number: cross_above(api, 50ms); in the console they say whether it just crossed). is_num(x) says whether a series has a value there yet",
+            ),
         ],
         task: Some(r#"press : and type  mark_when("value > 60ms", "spike")"#),
         check: Check::Marker,
@@ -988,7 +992,7 @@ The next pages are recipes for real use: copy puts one on your clipboard."#,
         title: "recipe: a trading dashboard",
         text: "Hyperliquid candles (500 of them, polled every 5 s; --replace keeps the newest up to date instead of piling up copies) drawn as candlesticks (kind=candles, from the open/high/low/close series), with EMA30/EMA50 over them and crossover markers, RSI, MACD and volume in panes. coin ▾ and interval ▾ switch asset and candle size; press ← (or scroll back to the oldest candle) and older ones load. RSI and MACD are built in (rsi(values, 14), macd(values)).",
         command: Some(
-            r#"graft -c 'curl -s --json "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"{coin}\",\"interval\":\"{interval}\",\"startTime\":{from_ms:500*{interval}},\"endTime\":{now_ms}}}" https://api.hyperliquid.xyz/info' --param 'coin = ETH | BTC | SOL | HYPE' --param 'interval = 1m | 5m | 15m | 1h | 4h | 1d' -n 5s --json --time-field t --replace --series 'open:USD = o' --series 'high:USD = h' --series 'low:USD = l' --series 'close:USD = c' --series 'volume:{coin} = v' --select open,high,low,close,volume --line 'ema30 = ema(values("close"), 30)' --line 'ema50 = ema(values("close"), 50)' --line 'rsi14:% = rsi(values("close"), 14)' --line 'overbought:% = 70' --line 'oversold:% = 30' --line 'macd = macd(values("close"))' --line 'signal = ema(values("macd"), 9)' --mark 'name == "ema30" && prev < ema50_prev && value >= ema50 => golden cross | ▲ cyan badge' --mark 'name == "ema30" && prev > ema50_prev && value <= ema50 => death cross | ▼ magenta badge' --pane 'ema30,ema50 kind=candles title={coin} {interval}' --pane 'rsi14,overbought,oversold front=rsi14' --pane 'macd,signal front=macd' --pane volume --layout '1 /60% ((2 | 3) / 4)' --title '{coin} {interval}'"#,
+            r#"graft -c 'curl -s --json "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"{coin}\",\"interval\":\"{interval}\",\"startTime\":{from_ms:500*{interval}},\"endTime\":{now_ms}}}" https://api.hyperliquid.xyz/info' --param 'coin = ETH | BTC | SOL | HYPE' --param 'interval = 1m | 5m | 15m | 1h | 4h | 1d' -n 5s --json --time-field t --replace --series 'open:USD = o' --series 'high:USD = h' --series 'low:USD = l' --series 'close:USD = c' --series 'volume:{coin} = v' --select open,high,low,close,volume --line 'ema30 = ema(values("close"), 30)' --line 'ema50 = ema(values("close"), 50)' --line 'rsi14:% = rsi(values("close"), 14)' --line 'overbought:% = 70' --line 'oversold:% = 30' --line 'macd = macd(values("close"))' --line 'signal = ema(values("macd"), 9)' --mark 'cross_above(ema30, ema50) => golden cross | ▲ cyan badge' --mark 'cross_below(ema30, ema50) => death cross | ▼ magenta badge' --pane 'ema30,ema50 kind=candles title={coin} {interval}' --pane 'rsi14,overbought,oversold front=rsi14' --pane 'macd,signal front=macd' --pane volume --layout '1 /60% ((2 | 3) / 4)' --title '{coin} {interval}'"#,
         ),
         ..BASE
     },
@@ -996,7 +1000,7 @@ The next pages are recipes for real use: copy puts one on your clipboard."#,
         title: "recipe: combine feeds",
         text: "Merge sources into one chart and build on them: two exchanges' prices, their mean, an EMA, and a marker when it crosses.",
         command: Some(
-            r#"graft --merge 'coinbase = -c "curl -s https://api.coinbase.com/v2/prices/ETH-USD/spot" --regex "amount\W+(?P<p>[0-9.]+)" -n 2s -u USD' --merge 'binance = -c "curl -s https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT" --regex "price\W+(?P<p>[0-9.]+)" -n 2s -u USD' --line 'eth = mean_of(["coinbase", "binance"])' --line 'ema30 = ema(values("eth"), 30)' --mark 'name == "eth" && prev < ema30_prev && value >= ema30 => above EMA30 | ▲ green' --hide coinbase,binance --title ETH"#,
+            r#"graft --merge 'coinbase = -c "curl -s https://api.coinbase.com/v2/prices/ETH-USD/spot" --regex "amount\W+(?P<p>[0-9.]+)" -n 2s -u USD' --merge 'binance = -c "curl -s https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT" --regex "price\W+(?P<p>[0-9.]+)" -n 2s -u USD' --line 'eth = mean_of(["coinbase", "binance"])' --line 'ema30 = ema(values("eth"), 30)' --mark 'cross_above(eth, ema30) => above EMA30 | ▲ green' --hide coinbase,binance --title ETH"#,
         ),
         ..BASE
     },

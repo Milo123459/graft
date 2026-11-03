@@ -686,6 +686,26 @@ pub const USAGE: &[(&str, &str, &str)] = &[
         "a marker wherever it holds",
     ),
     ("mark", r#"mark("deploy")"#, "a marker at the cursor"),
+    (
+        "cross_above",
+        r#"mark_when(cross_above(ema30, ema50), "golden")"#,
+        "in a marker rule: the first series went from below the second (or a number) to above",
+    ),
+    (
+        "cross_below",
+        r#"mark_when(cross_below(rsi14, 30), "oversold")"#,
+        "in a marker rule: the first went from above to below",
+    ),
+    (
+        "cross",
+        r#"mark_when(cross(close, ema50), "crossed")"#,
+        "in a marker rule: either way",
+    ),
+    (
+        "is_num",
+        r#"is_num(ema50_prev)"#,
+        "whether a value is there (a series that hasn't begun is ())",
+    ),
     ("clear_marks", "clear_marks()", "remove every marker"),
     ("alert", r#"alert(api > 45ms)"#, "an alert"),
     ("unalert", r#"unalert("api > 45ms")"#, "remove an alert"),
@@ -829,7 +849,18 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "remove_line",
         ],
     ),
-    ("markers", &["mark_when", "mark", "clear_marks"]),
+    (
+        "markers",
+        &[
+            "mark_when",
+            "mark",
+            "clear_marks",
+            "cross_above",
+            "cross_below",
+            "cross",
+            "is_num",
+        ],
+    ),
     ("alerts", &["alert", "unalert", "notify_to", "notify_off"]),
     (
         "panes",
@@ -1000,7 +1031,14 @@ const SERIES_FIRST: &[&str] = &[
     "clear_target",
 ];
 /// Functions where every text argument is a series name (`only("a", "b")`, `mean_of([…])`).
-const SERIES_ANY: &[&str] = &["only", "mean_of", "front"];
+const SERIES_ANY: &[&str] = &[
+    "only",
+    "mean_of",
+    "front",
+    "cross_above",
+    "cross_below",
+    "cross",
+];
 
 /// The choices for a text argument that isn't a series.
 fn arg_choices(func: &str, arg: usize) -> &'static [&'static str] {
@@ -1938,6 +1976,44 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
     engine.register_fn("macd", move |a: Array| -> FnResult<Array> {
         Ok(to_array(crate::lines::macd(&floats(&a))))
     });
+    // In the console: whether it crossed at the newest point (in a marker rule these
+    // are written out, and checked at every point).
+    let crossing = |dir: i32| {
+        let st = state.clone();
+        let last_two = move |st: &State, n: &str| -> FnResult<(f64, f64, f64, f64)> {
+            let p = points(st, n)?.points;
+            match p.as_slice() {
+                [.., a, b] => Ok((a.0, a.1, b.0, b.1)),
+                _ => Err(format!("{n}: needs two points").into()),
+            }
+        };
+        move |a: &str, b: Dynamic| -> FnResult<bool> {
+            let (xa, a0, xb, a1) = last_two(&st, a)?;
+            let (b0, b1) = match dyn_to_f64(&b) {
+                Some(v) => (v, v),
+                None => {
+                    let other = points(&st, &b.to_string())?.points;
+                    let at = |x: f64| crate::render::interpolate(&other, x);
+                    match (at(xa), at(xb)) {
+                        (Some(p), Some(q)) => (p, q),
+                        _ => return Ok(false),
+                    }
+                }
+            };
+            let up = a0 < b0 && a1 >= b1;
+            let down = a0 > b0 && a1 <= b1;
+            Ok(match dir {
+                1 => up,
+                -1 => down,
+                _ => up || down,
+            })
+        }
+    };
+    engine.register_fn("cross_above", crossing(1));
+    engine.register_fn("cross_below", crossing(-1));
+    engine.register_fn("cross", crossing(0));
+    // A value that's there (series without a point yet are `()`).
+    engine.register_fn("is_num", |d: Dynamic| d.is_float() || d.is_int());
     engine.register_fn("sma", move |a: Array, n: i64| -> FnResult<Array> {
         if n < 1 {
             return Err("sma(values, n): n must be at least 1".into());

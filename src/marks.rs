@@ -218,6 +218,51 @@ fn only_series(expr: &str) -> Option<String> {
 /// now and before (and that one's name).
 type Var<'a> = (String, &'a [(f64, f64)], bool, bool, String);
 
+/// `cross_above(a, b)`, `cross_below(a, b)` and `cross(a, b)` written out: `a` went
+/// from below `b` to at or above it between the previous point and this one (`b` can
+/// be a series or a number, e.g. `cross_above(rsi14, 70)`).
+pub fn expand_cross(expr: &str) -> String {
+    static CROSS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"\b(cross_above|cross_below|cross)\s*\(\s*("[^"]*"|[A-Za-z_][A-Za-z0-9_]*)\s*,\s*("[^"]*"|[A-Za-z_][A-Za-z0-9_]*|-?[0-9][0-9_.]*[A-Za-z%]*)\s*\)"#,
+        )
+        .expect("valid")
+    });
+    CROSS
+        .replace_all(expr, |c: &regex::Captures| {
+            let series = |s: &str| crate::script::ident(s.trim_matches('"'));
+            let a = series(&c[2]);
+            let (b, b_prev) = if c[3].starts_with(|ch: char| ch.is_ascii_digit() || ch == '-') {
+                (c[3].to_string(), c[3].to_string())
+            } else {
+                let b = series(&c[3]);
+                (b.clone(), format!("{b}_prev"))
+            };
+            let known =
+                format!("is_num({a}_prev) && is_num({b_prev}) && is_num({a}) && is_num({b})");
+            let above = format!("({a}_prev < {b_prev} && {a} >= {b})");
+            let below = format!("({a}_prev > {b_prev} && {a} <= {b})");
+            match &c[1] {
+                "cross_above" => format!("({known} && {above})"),
+                "cross_below" => format!("({known} && {below})"),
+                _ => format!("({known} && ({above} || {below}))"),
+            }
+        })
+        .into_owned()
+}
+
+/// What a rule uses that belongs to the series it's checked on.
+const PER_SERIES: &[&str] = &[
+    "value",
+    "prev",
+    "delta",
+    "pct",
+    "rate",
+    "i",
+    "name",
+    "prev_time",
+];
+
 fn evaluate_rule(
     host: &ScriptHost,
     n: usize,
@@ -225,7 +270,8 @@ fn evaluate_rule(
     ds: &Dataset,
     out: &mut Vec<Mark>,
 ) -> Result<()> {
-    let ast = host.compile_expr(&rule.expr)?;
+    let expr = expand_cross(&rule.expr);
+    let ast = host.compile_expr(&expr)?;
     // Every series is also a variable: its value at this point (`ema30`) and at the
     // previous one (`ema30_prev`), so rules can compare series — e.g. crossings.
     let named: Vec<(String, &[(f64, f64)])> = ds
@@ -251,8 +297,7 @@ fn evaluate_rule(
     // `x_prev` is x at the previous point — unless a series is itself called `x_prev`.
     let idents: Vec<String> = named.iter().map(|(id, _)| id.clone()).collect();
     // Only the series the rule mentions become variables (each is a lookup per point).
-    let words: std::collections::HashSet<&str> = rule
-        .expr
+    let words: std::collections::HashSet<&str> = expr
         .split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .filter(|w| !w.is_empty())
         .collect();
@@ -271,8 +316,24 @@ fn evaluate_rule(
         })
         .filter(|n| n.2 || n.3)
         .collect();
-    // `name == "ema30" && …` only ever holds for that series: skip the others.
-    let only = only_series(&rule.expr);
+    // `name == "ema30" && …` only ever holds for that series: skip the others. A rule
+    // about other series only (`cross_above(ema30, ema50)`) is checked once per point
+    // of the first one it names, and marks that one.
+    let only = only_series(&rule.expr).or_else(|| {
+        if PER_SERIES.iter().any(|v| words.contains(v)) {
+            return None;
+        }
+        ds.series
+            .iter()
+            .filter_map(|s| {
+                let id = crate::script::ident(&s.name);
+                expr.find(&id)
+                    .filter(|_| words.contains(id.as_str()))
+                    .map(|pos| (pos, s.name.clone()))
+            })
+            .min()
+            .map(|p| p.1)
+    });
     let mut placed = 0;
     for s in ds
         .series
@@ -468,5 +529,27 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         let got: Vec<_> = marks.iter().map(|m| (m.x, m.label.as_str())).collect();
         assert_eq!(got, [(1.0, "up"), (3.0, "down")]);
+        // The same with cross_above/cross_below: checked once per point (of price, the
+        // first series named), not once per series.
+        let rules = [
+            MarkRule::parse("cross_above(price, ema30) => up").unwrap(),
+            MarkRule::parse("cross_below(price, ema30) => down").unwrap(),
+            MarkRule::parse("cross(price, 10.5) => either").unwrap(),
+        ];
+        let (marks, errors) = evaluate(&host, &rules, &crossing);
+        assert!(errors.is_empty(), "{errors:?}");
+        let got: Vec<_> = marks
+            .iter()
+            .map(|m| (m.x, m.label.as_str(), m.series.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (1.0, "up", Some("price")),
+                (1.0, "either", Some("price")),
+                (3.0, "down", Some("price")),
+                (3.0, "either", Some("price"))
+            ]
+        );
     }
 }
