@@ -375,7 +375,8 @@ tell apart from candles or lines in the same colours:
 
 While it runs, press `K` (or tap **markers**) for the list of rules and
 markers: tap a rule to edit it (it opens in the console; Enter saves, Esc
-cancels), tap its symbol or colour to cycle through others, **notify** to be
+cancels), tap the buttons under it to cycle its symbol, colour or effect (plain, badge, bold,
+underline, italic, reverse, dim — for several at once, edit the rule), **notify** to be
 told about new ones, **✕** deletes one, **+ add rule** and **mark now** add more.
 `N` (or **alerts**) lists alerts, which markers notify, and where notifications
 go (bell, desktop, ntfy on your phone, a webhook or a command), with a test

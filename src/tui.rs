@@ -189,6 +189,7 @@ enum Hit {
     ToggleMarkNotify(usize),
     CycleMarkSymbol(usize),
     CycleMarkColor(usize),
+    CycleMarkEffect(usize),
     /// Alerts menu.
     EditAlert(Option<usize>),
     DeleteAlert(usize),
@@ -1951,7 +1952,8 @@ impl App {
         };
         let area = f.area();
         let w = 96.min(area.width);
-        let rows = self.mark_rows().max(1) as u16;
+        // A rule takes two lines (itself, then its buttons); a marker by hand one.
+        let rows = (self.mark_rules.len() * 2 + self.manual_marks.len()).max(1) as u16;
         let h = (rows + 9).min(area.height);
         let rect = Rect {
             x: (area.width - w) / 2,
@@ -1961,7 +1963,7 @@ impl App {
         };
         Clear.render(rect, f.buffer_mut());
         let block = Block::bordered()
-            .title(" markers · tap a rule to edit it · its symbol and colour to change them ")
+            .title(" markers · tap a rule to edit it, its buttons to change its look ")
             .border_style(Style::default().fg(Color::Yellow));
         let inner = block.inner(rect);
         f.render_widget(block, rect);
@@ -2030,7 +2032,7 @@ impl App {
             let r = Rect {
                 y,
                 height: 1,
-                width: inner.width.saturating_sub(27),
+                width: inner.width.saturating_sub(4),
                 ..inner
             };
             if y < inner.bottom() {
@@ -2039,35 +2041,52 @@ impl App {
                     Line::from(vec![
                         Span::styled(" ✎ ", Style::default().fg(Color::Yellow)),
                         Span::styled(shown, style),
-                        Span::styled(format!("  ▼ {count} placed"), dim),
                     ]),
                     r,
                 );
                 self.hits.push(r, Hit::EditRule(i));
-                if inner.width > 30 {
-                    let b = Rect {
-                        x: inner.right() - 26,
-                        y,
-                        width: 22,
-                        height: 1,
-                    };
-                    render_buttons(
-                        &[
-                            Button::new(rule.symbol(), Hit::CycleMarkSymbol(i)),
-                            // Fixed width, so the notify buttons line up row to row.
-                            Button::new(
-                                format!("{:<7}", rule.color.as_deref().unwrap_or("auto")),
-                                Hit::CycleMarkColor(i),
-                            ),
-                            Button::new("notify", Hit::ToggleMarkNotify(i)).active(rule.notify),
-                        ],
-                        b,
-                        f.buffer_mut(),
-                        &self.hits,
+            }
+            delete(f, y, Hit::DeleteRule(i));
+            y += 1;
+            // Its look: symbol, colour, effect (fixed widths so rows line up), notify.
+            if y < inner.bottom() {
+                let effect = match rule.effects.as_slice() {
+                    [] => "plain".to_string(),
+                    [one] => one.clone(),
+                    [one, ..] => format!("{one}+"),
+                };
+                let b = Rect {
+                    x: inner.x + 3,
+                    y,
+                    width: inner.width.saturating_sub(3),
+                    height: 1,
+                };
+                render_buttons(
+                    &[
+                        Button::new(rule.symbol(), Hit::CycleMarkSymbol(i)),
+                        Button::new(
+                            format!("{:<7}", rule.color.as_deref().unwrap_or("auto")),
+                            Hit::CycleMarkColor(i),
+                        ),
+                        Button::new(format!("{effect:<9}"), Hit::CycleMarkEffect(i)),
+                        Button::new("notify", Hit::ToggleMarkNotify(i)).active(rule.notify),
+                    ],
+                    b,
+                    f.buffer_mut(),
+                    &self.hits,
+                );
+                if inner.width > 60 {
+                    f.render_widget(
+                        Span::styled(format!("▼ {count} placed"), dim),
+                        Rect {
+                            x: inner.right().saturating_sub(16),
+                            y,
+                            width: 14,
+                            height: 1,
+                        },
                     );
                 }
             }
-            delete(f, y, Hit::DeleteRule(i));
             y += 1;
         }
         for (j, m) in self.manual_marks.iter().enumerate() {
@@ -6358,6 +6377,23 @@ impl App {
                             self.update_marks();
                             Transition::None
                         }
+                        Hit::CycleMarkEffect(i) => {
+                            if let Some(r) = self.mark_rules.get_mut(i) {
+                                // plain → badge → bold → … → plain (several at once: edit the rule).
+                                let cycle: Vec<Option<&str>> = std::iter::once(None)
+                                    .chain(crate::marks::EFFECT_CYCLE.iter().map(|e| Some(*e)))
+                                    .collect();
+                                let now = match r.effects.as_slice() {
+                                    [] => Some(0),
+                                    [one] => cycle.iter().position(|c| *c == Some(one.as_str())),
+                                    _ => None,
+                                };
+                                let next = now.map_or(0, |p| (p + 1) % cycle.len());
+                                r.effects = cycle[next].map(String::from).into_iter().collect();
+                            }
+                            self.update_marks();
+                            Transition::None
+                        }
                         Hit::ToggleMarkNotify(i) => {
                             if let Some(r) = self.mark_rules.get_mut(i) {
                                 r.notify = !r.notify;
@@ -8627,7 +8663,7 @@ pub(crate) mod tests {
                 .unwrap();
             (s.lines().nth(y).unwrap().to_string(), y as u16)
         };
-        let (line, y) = row_of(&app);
+        let (_, y) = row_of(&app);
         let col = |line: &str, pat: &str| {
             line.chars()
                 .collect::<String>()
@@ -8635,26 +8671,22 @@ pub(crate) mod tests {
                 .map(|b| line[..b].chars().count() as u16)
                 .unwrap()
         };
-        // Tap the symbol (▼ → ▲; the last " ▼ " on the row, the first is the count) and
-        // the colour (auto → green).
-        let last_sym = line
-            .rmatch_indices(" ▼ ")
-            .next()
-            .map(|(b, _)| line[..b].chars().count() as u16)
-            .unwrap();
-        mouse(
-            &mut app,
-            MouseEventKind::Down(MouseButton::Left),
-            last_sym + 1,
-            y,
-        );
-        let (line, y) = row_of(&app);
-        mouse(
-            &mut app,
-            MouseEventKind::Down(MouseButton::Left),
-            col(&line, " auto ") + 1,
-            y,
-        );
+        // Its buttons are on the row below: tap the symbol (▼ → ▲), the colour
+        // (auto → green) and the effect (plain → badge).
+        let buttons =
+            |app: &App, y: u16| screen(app).lines().nth(y as usize + 1).unwrap().to_string();
+        let tap = |app: &mut App, pat: &str| {
+            let line = buttons(app, y);
+            let x = col(&line, pat);
+            mouse(app, MouseEventKind::Down(MouseButton::Left), x + 1, y + 1);
+        };
+        tap(&mut app, " ▼ ");
+        tap(&mut app, " auto ");
+        tap(&mut app, " plain ");
+        assert_eq!(app.mark_rules[0].effects, ["badge"]);
+        assert!(app.opts.marks.iter().all(|m| m.badge));
+        tap(&mut app, " badge ");
+        assert_eq!(app.mark_rules[0].effects, ["bold"]);
         assert_eq!(app.mark_rules[0].symbol(), "▲");
         assert_eq!(app.mark_rules[0].color.as_deref(), Some("green"));
         assert!(
@@ -8663,7 +8695,13 @@ pub(crate) mod tests {
                 .iter()
                 .all(|m| m.symbol == "▲" && m.color == Some(Color::Green))
         );
-        assert_eq!(app.current_cli().mark, ["delta < -1.5GB => fell | ▲ green"]);
+        assert_eq!(
+            app.current_cli().mark,
+            ["delta < -1.5GB => fell | ▲ green bold"]
+        );
+        // It fits a phone: the rule, then its buttons below it.
+        let small = screen_sized(&app, 46, 30);
+        assert!(small.contains("plain") || small.contains("bold"), "{small}");
         key(&mut app, KeyCode::Esc);
         let s = screen(&app);
         assert!(s.contains('▲') && s.contains("fell"), "{s}");

@@ -35,6 +35,9 @@ pub struct MarkRule {
 /// Text effects a marker can have; `badge` puts its label on its colour.
 pub const EFFECTS: [&str; 6] = ["bold", "italic", "underline", "dim", "reverse", "badge"];
 
+/// The order the markers menu's effect button goes through (after plain).
+pub const EFFECT_CYCLE: [&str; 6] = ["badge", "bold", "underline", "italic", "reverse", "dim"];
+
 /// A colour by name — the terminal's (green, lightred…), a few more (orange, purple,
 /// pink, gold, teal, brown, lime, sky, violet, grey), `#ff8800` or 0–255.
 pub fn color(name: &str) -> Option<ratatui::style::Color> {

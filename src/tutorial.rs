@@ -435,7 +435,7 @@ The database spikes now and then: mark it."#,
         keys: &[
             (
                 "K / markers",
-                "the markers menu: your rules and how often each fired",
+                "the markers menu: your rules and how often each fired; under each rule, tap its symbol, colour or effect (plain, badge, bold, underline…) to cycle them",
             ),
             (
                 "e x",
