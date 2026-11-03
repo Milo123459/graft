@@ -232,7 +232,8 @@ with that source's own arguments after `NAME =`. With only `--merge`s, the
 first becomes the main source. In the viewer, the **sources** button (`S`)
 lists them: **edit** opens one in the builder (source, format, live preview) and
 puts it back with **merge into the chart**; **+ add source** makes a new one;
-**✕** removes one. Custom lines can then combine them, e.g. ETH
+**✕** removes one. In a dashboard it also lists each pane's own source
+(`--pane source=memory`), with **change** to pick another. Custom lines can then combine them, e.g. ETH
 from two exchanges, their average, and an EMA30 of it:
 
 ```sh

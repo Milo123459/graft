@@ -530,7 +530,7 @@ The database spikes now and then: mark it."#,
     Step {
         title: "getting data in",
         text: r#"Three kinds of source: a file (read once, or followed as it grows), a command (run every few seconds, like watch) or stdin (a pipe). Any of them can run on another machine with --ssh, and more sources can share one chart: their series are named after them (cb, or cb.price when there are several).
-The sources menu lists them: edit one in the builder (with a live preview), add another, or remove one.
+The sources menu lists them all: the main one, merged ones (edit in the builder with a live preview, add, remove), and in a dashboard each pane's own source (change picks another).
 From here on the steps are a reference: read what's useful, skip the rest with Enter."#,
         keys: &[
             (

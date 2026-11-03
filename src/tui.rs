@@ -205,6 +205,8 @@ enum Hit {
     /// Sources menu: edit one (`None`: the main source), remove a merged one, add one.
     SourceEdit(Option<usize>),
     SourceRemove(usize),
+    /// Pick another source for pane `n`.
+    SourcePane(usize),
     SourceAdd,
     CloseSources,
     /// A console suggestion (by position in the hint row).
@@ -3575,6 +3577,25 @@ impl App {
             .collect()
     }
 
+    /// Panes showing a source of their own: (pane, source name, what it reads).
+    fn pane_sources(&self) -> Vec<(usize, String, String)> {
+        let Some(p) = &self.opts.panes else {
+            return Vec::new();
+        };
+        p.panes
+            .iter()
+            .enumerate()
+            .filter_map(|(id, pane)| {
+                let name = pane.source.clone()?;
+                let what = crate::sources::cli_for(&name, self.cli.ssh.as_deref())
+                    .ok()
+                    .and_then(|c| crate::setup::source_spec(&c, false).ok())
+                    .map_or_else(|| "a profile or recent chart".to_string(), |s| s.describe());
+                Some((id, name, what))
+            })
+            .collect()
+    }
+
     /// Edit a source in the builder: `None` the main one, `Some(i)` merged source `i`,
     /// `Some(usize::MAX)` a new one.
     fn edit_source(&mut self, which: Option<usize>) -> Transition {
@@ -3668,13 +3689,18 @@ impl App {
         }
         let area = f.area();
         let merged = self.merged_sources();
+        let panes = self.pane_sources();
         let w = 72.min(area.width);
         let inner_w = w.saturating_sub(2);
         let actions = vec![
             Button::new("+ add source", Hit::SourceAdd),
             Button::new("done", Hit::CloseSources),
         ];
-        let rows = 2 + 2 * (1 + merged.len()) + 1 + flow_height(&actions, inner_w) as usize + 1;
+        let rows = 2
+            + 2 * (1 + merged.len() + panes.len())
+            + 1
+            + flow_height(&actions, inner_w) as usize
+            + 1;
         let h = (rows as u16 + 2).min(area.height);
         let rect = Rect {
             x: (area.width - w) / 2,
@@ -3761,10 +3787,25 @@ impl App {
         } else {
             "stdin".to_string()
         };
+        // In a dashboard, which panes show it.
+        let shown_in: Vec<String> = self.opts.panes.as_ref().map_or(Vec::new(), |p| {
+            p.panes
+                .iter()
+                .enumerate()
+                .filter(|(_, q)| q.source.is_none())
+                .map(|(i, _)| (i + 1).to_string())
+                .collect()
+        });
+        let main_label = match shown_in.len() {
+            0 if self.opts.panes.is_some() => "main · no pane shows it".to_string(),
+            0 => "main".to_string(),
+            1 => format!("main · pane {}", shown_in[0]),
+            _ => format!("main · panes {}", shown_in.join(", ")),
+        };
         row(
             f,
             y,
-            "main",
+            &main_label,
             &main,
             vec![Button::new("edit", Hit::SourceEdit(None))],
         );
@@ -3779,6 +3820,17 @@ impl App {
                     Button::new("edit", Hit::SourceEdit(Some(i))),
                     Button::new("✕", Hit::SourceRemove(i)),
                 ],
+            );
+            y += 2;
+        }
+        // Panes with a source of their own (a dashboard): change picks another one.
+        for (id, name, what) in &panes {
+            row(
+                f,
+                y,
+                &format!("pane {} · {name}", id + 1),
+                what,
+                vec![Button::new("change", Hit::SourcePane(*id))],
             );
             y += 2;
         }
@@ -5059,6 +5111,15 @@ impl App {
                         }
                         Hit::SourceEdit(i) => self.edit_source(i),
                         Hit::SourceAdd => self.edit_source(Some(usize::MAX)),
+                        Hit::SourcePane(id) => {
+                            // Pick that pane, then choose its source as the pane panel does.
+                            self.sources_menu = false;
+                            if let Some(p) = self.opts.panes.as_mut() {
+                                p.focus = id.min(p.count().saturating_sub(1));
+                            }
+                            self.open_source_menu();
+                            Transition::None
+                        }
                         Hit::SourceRemove(i) => {
                             self.remove_source(i);
                             Transition::None
@@ -8204,5 +8265,22 @@ pub(crate) mod tests {
         shot(&app, "panes", 110, 34);
         key(&mut app, KeyCode::Char('w'));
         shot(&app, "panes-panel", 110, 34);
+    }
+
+    #[test]
+    fn sources_menu_lists_pane_sources() {
+        let mut app = app(&["graft", LOG, "--kv", "--pane", "*", "--pane", "source=load"]);
+        key(&mut app, KeyCode::Char('S'));
+        let s = screen(&app);
+        assert!(s.contains("main · pane 1"), "{s}");
+        assert!(
+            s.contains("pane 2 · load") && s.contains("cat /proc/loadavg"),
+            "{s}"
+        );
+        // change: pick that pane and choose its source.
+        let (x, y) = find(&app, " change ");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert!(app.source_menu.is_some() && !app.sources_menu);
+        assert_eq!(app.opts.panes.as_ref().unwrap().focus, 1);
     }
 }
