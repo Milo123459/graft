@@ -163,8 +163,9 @@ impl Trades {
         }
         let wins = self.closed.iter().filter(|r| **r > 0.0).count();
         format!(
-            "{name} {:+.2}% · {n} trades, {:.0}% won · drawdown {:.1}%",
+            "{name} {:+.2}% · {n} {}, {:.0}% won · drawdown {:.1}%",
             self.total(),
+            if n == 1 { "trade" } else { "trades" },
             wins as f64 / n as f64 * 100.0,
             self.drawdown
         )
