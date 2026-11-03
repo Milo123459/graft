@@ -450,6 +450,12 @@ pub struct App {
     clipboard: Option<String>,
     /// The sources menu is open.
     sources_menu: bool,
+    /// The open popup's area (as last drawn), and which of its buttons the arrow
+    /// keys have picked.
+    popup_rect: std::cell::Cell<Option<Rect>>,
+    popup_focus: std::cell::Cell<usize>,
+    /// Which popup that was (the pick starts over when another opens).
+    popup_kind: std::cell::Cell<u8>,
     /// The source the builder is to edit: `Some(None)` is a new one.
     source_to_edit: Option<Option<String>>,
     /// The console's last output (a result or an error), shown above the status line.
@@ -575,6 +581,9 @@ impl App {
             tutorial,
             console_note: None,
             sources_menu: false,
+            popup_rect: std::cell::Cell::new(None),
+            popup_focus: std::cell::Cell::new(0),
+            popup_kind: std::cell::Cell::new(0),
             source_to_edit: None,
             error_at: None,
             tab_cycle: None,
@@ -1308,6 +1317,7 @@ impl App {
             height: h,
         };
         Clear.render(rect, f.buffer_mut());
+        self.popup_rect.set(Some(rect));
         let block = Block::bordered()
             .title(" alerts & notifications ")
             .border_style(Style::default().fg(Color::Yellow));
@@ -2648,6 +2658,7 @@ impl App {
             height: h,
         };
         Clear.render(rect, f.buffer_mut());
+        self.popup_rect.set(Some(rect));
         let block = Block::bordered()
             .title(" timeframe ")
             .border_style(Style::default().fg(Color::Yellow));
@@ -2774,6 +2785,7 @@ impl App {
             height: h,
         };
         Clear.render(rect, f.buffer_mut());
+        self.popup_rect.set(Some(rect));
         let block = Block::bordered()
             .title(match &self.opts.panes {
                 Some(p) if p.count() > 1 => {
@@ -3561,6 +3573,123 @@ impl App {
         }
     }
 
+    // ───────────── keyboard in popups ─────────────
+
+    /// The popup the arrow keys work in (0: none).
+    fn popup_open(&self) -> u8 {
+        if self.range_menu {
+            1
+        } else if self.lines_menu {
+            2
+        } else if self.sources_menu {
+            3
+        } else if self.alerts_menu {
+            4
+        } else {
+            0
+        }
+    }
+
+    /// The open popup's buttons, as drawn: top to bottom, left to right.
+    fn popup_buttons(&self) -> Vec<(Rect, Hit)> {
+        let Some(area) = self.popup_rect.get() else {
+            return Vec::new();
+        };
+        let mut v: Vec<(Rect, Hit)> = self
+            .hits
+            .all()
+            .into_iter()
+            .filter(|(r, h)| *h != Hit::MenuBackground && area.contains((r.x, r.y).into()))
+            .collect();
+        v.sort_by_key(|(r, _)| (r.y, r.x));
+        v.dedup_by_key(|(r, _)| (r.x, r.y));
+        v
+    }
+
+    /// Arrow keys move the pick to the nearest button that way; Tab to the next.
+    fn popup_move(&mut self, key: KeyCode) {
+        let items = self.popup_buttons();
+        if items.is_empty() {
+            return;
+        }
+        let i = self.popup_focus.get().min(items.len() - 1);
+        let cur = items[i].0;
+        let mid = |r: Rect| r.x as i32 + r.width as i32 / 2;
+        let next = match key {
+            KeyCode::Tab => Some((i + 1) % items.len()),
+            KeyCode::BackTab => Some((i + items.len() - 1) % items.len()),
+            KeyCode::Left => i.checked_sub(1),
+            KeyCode::Right => (i + 1 < items.len()).then_some(i + 1),
+            KeyCode::Up | KeyCode::Down => {
+                // The nearest row that way, then the button closest across.
+                let down = key == KeyCode::Down;
+                let row = items
+                    .iter()
+                    .map(|(r, _)| r.y)
+                    .filter(|&y| if down { y > cur.y } else { y < cur.y })
+                    .reduce(|a, b| if down { a.min(b) } else { a.max(b) });
+                row.and_then(|y| {
+                    items
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (r, _))| r.y == y)
+                        .min_by_key(|(_, (r, _))| (mid(*r) - mid(cur)).abs())
+                        .map(|(k, _)| k)
+                })
+            }
+            _ => None,
+        };
+        if let Some(n) = next {
+            self.popup_focus.set(n);
+        }
+    }
+
+    /// Enter: press the picked button, as a tap would.
+    fn popup_press(&mut self) -> Transition {
+        let items = self.popup_buttons();
+        let Some((r, _)) = items.get(self.popup_focus.get().min(items.len().saturating_sub(1)))
+        else {
+            return Transition::None;
+        };
+        let t = self.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: r.x,
+            row: r.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        self.on_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: r.x,
+            row: r.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        t
+    }
+
+    /// Show which button the arrow keys have picked.
+    fn draw_popup_focus(&self, f: &mut Frame) {
+        let kind = self.popup_open();
+        if kind != self.popup_kind.get() {
+            // Another popup: start from its first button.
+            self.popup_kind.set(kind);
+            self.popup_focus.set(0);
+        }
+        if kind == 0 {
+            return;
+        }
+        let items = self.popup_buttons();
+        let Some((r, _)) = items.get(self.popup_focus.get().min(items.len().saturating_sub(1)))
+        else {
+            return;
+        };
+        let buf = f.buffer_mut();
+        for x in r.x..r.right() {
+            if let Some(cell) = buf.cell_mut((x, r.y)) {
+                cell.set_style(Style::default().fg(Color::Black).bg(Color::Yellow));
+            }
+        }
+    }
+
     // ───────────── sources menu ─────────────
 
     /// The merged sources, as (name, what it reads).
@@ -3709,6 +3838,7 @@ impl App {
             height: h,
         };
         Clear.render(rect, f.buffer_mut());
+        self.popup_rect.set(Some(rect));
         let block = Block::bordered()
             .title(" sources ")
             .border_style(Style::default().fg(Color::Cyan));
@@ -4546,6 +4676,17 @@ impl App {
     // ───────────── events ─────────────
 
     pub fn on_event(&mut self, ev: &TermEvent) -> Transition {
+        let popup = self.popup_open();
+        let t = self.on_event_inner(ev);
+        // A popup opened or closed: the arrow keys start from its first button.
+        if self.popup_open() != popup {
+            self.popup_focus.set(0);
+            self.popup_kind.set(self.popup_open());
+        }
+        t
+    }
+
+    fn on_event_inner(&mut self, ev: &TermEvent) -> Transition {
         // Undo and redo themselves aren't steps.
         if let TermEvent::Key(k) = ev
             && k.kind == KeyEventKind::Press
@@ -4873,6 +5014,22 @@ impl App {
         if self.console.is_some() {
             self.on_console_key(key);
             return Transition::None;
+        }
+        // Arrow keys move through a popup's buttons; Enter presses the picked one.
+        if self.popup_open() != 0 {
+            match key.code {
+                KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Tab
+                | KeyCode::BackTab => {
+                    self.popup_move(key.code);
+                    return Transition::None;
+                }
+                KeyCode::Enter => return self.popup_press(),
+                _ => {}
+            }
         }
         if self.lines_menu {
             self.on_lines_menu_key(key);
@@ -5599,6 +5756,7 @@ impl App {
 
     pub fn draw(&self, f: &mut Frame) {
         self.hits.clear();
+        self.popup_rect.set(None);
         self.plots.borrow_mut().clear();
         let area = f.area();
         // The tutorial sits above everything else.
@@ -5744,6 +5902,7 @@ impl App {
         self.draw_marks_menu(f);
         self.draw_alerts_menu(f);
         self.draw_sources_menu(f);
+        self.draw_popup_focus(f);
         if self.help {
             let mut entries: Vec<(String, String, Color)> = HELP
                 .iter()
@@ -6370,12 +6529,16 @@ pub(crate) mod tests {
         key(&mut app, KeyCode::Char(']'));
         key(&mut app, KeyCode::Char(']'));
         assert!(app.timeframe.is_all());
-        // Keyboard: R opens the dropdown, ↓ moves to narrower ranges, Esc closes.
-        key(&mut app, KeyCode::Char('R'));
+        // Keyboard: r opens the dropdown, ↓ moves the highlight, Enter picks.
+        key(&mut app, KeyCode::Char('r'));
+        screen(&app);
         key(&mut app, KeyCode::Down);
+        screen(&app);
         key(&mut app, KeyCode::Down);
+        screen(&app);
+        assert!(app.timeframe.is_all(), "moving doesn't pick yet");
+        key(&mut app, KeyCode::Enter);
         assert_eq!(app.timeframe.last, Some(Window::Span(21600.0)));
-        key(&mut app, KeyCode::Esc);
         assert!(!app.range_menu);
         assert_eq!(app.current_cli().last, Some(Window::Span(21600.0)));
         key(&mut app, KeyCode::Char(':'));
@@ -8282,5 +8445,51 @@ pub(crate) mod tests {
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
         assert!(app.source_menu.is_some() && !app.sources_menu);
         assert_eq!(app.opts.panes.as_ref().unwrap().focus, 1);
+    }
+
+    #[test]
+    fn popups_work_with_arrow_keys() {
+        let mut app = app(&["graft", LOG]);
+        // The timeframe menu: arrows move the pick (the timeframe stays), Enter presses it.
+        key(&mut app, KeyCode::Char('r'));
+        screen(&app);
+        let n = app.popup_buttons().len();
+        assert!(n > 3, "{n}");
+        for _ in 0..n + 2 {
+            key(&mut app, KeyCode::Down);
+            screen(&app);
+        }
+        assert!(app.timeframe.is_all(), "moving doesn't pick");
+        // The last row is custom…: Enter opens the console with range(".
+        let picked = app.popup_buttons()[app.popup_focus.get()].1;
+        assert_eq!(picked, Hit::CustomRange);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.console.as_ref().map(|c| c.value.as_str()),
+            Some(r#"range(""#)
+        );
+        // The highlight is drawn.
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Char('r'));
+        screen(&app);
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Enter);
+        assert!(
+            !app.timeframe.is_all() && !app.range_menu,
+            "a preset was picked"
+        );
+        // The sources menu too: Tab to done, Enter closes it.
+        key(&mut app, KeyCode::Char('S'));
+        screen(&app);
+        let done = app
+            .popup_buttons()
+            .iter()
+            .position(|b| b.1 == Hit::CloseSources)
+            .unwrap();
+        for _ in 0..done {
+            key(&mut app, KeyCode::Tab);
+        }
+        key(&mut app, KeyCode::Enter);
+        assert!(!app.sources_menu);
     }
 }

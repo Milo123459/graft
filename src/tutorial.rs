@@ -127,6 +127,10 @@ graft works the same with a mouse, a keyboard or a phone over ssh: tap where you
                 "mouse on/off (off lets you select text in your terminal)",
             ),
             ("⋯ / less", "more buttons: chart type, log scale, export…"),
+            (
+                "↑ ↓ ← →  Enter",
+                "in a menu: move to a button and press it (as a tap)",
+            ),
             ("q / quit", "quit (Esc never quits: it clears things)"),
         ],
         examples: &[

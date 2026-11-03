@@ -374,6 +374,23 @@ pub fn fmt_duration_compact(secs: f64) -> String {
     format!("{secs}s")
 }
 
+/// How long ago, rounded to a whole unit: 45s, 2m, 3h, 4d, 2w.
+pub fn fmt_ago(secs: f64) -> String {
+    let s = secs.max(0.0);
+    let (v, unit) = if s < 60.0 {
+        (s, "s")
+    } else if s < 3600.0 {
+        (s / 60.0, "m")
+    } else if s < 86_400.0 {
+        (s / 3600.0, "h")
+    } else if s < 14.0 * 86_400.0 {
+        (s / 86_400.0, "d")
+    } else {
+        (s / 604_800.0, "w")
+    };
+    format!("{}{unit}", v.floor() as i64)
+}
+
 /// A named time unit for expressing slopes, e.g. "per day".
 pub fn per_label(secs: f64) -> String {
     match secs {
@@ -402,6 +419,15 @@ pub fn auto_per(span: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ago_is_rounded() {
+        assert_eq!(fmt_ago(97.0), "1m");
+        assert_eq!(fmt_ago(10959.0), "3h");
+        assert_eq!(fmt_ago(82791.0), "22h");
+        assert_eq!(fmt_ago(3.0 * 86_400.0 + 5.0), "3d");
+        assert_eq!(fmt_ago(40.0 * 86_400.0), "5w");
+    }
 
     #[test]
     fn times_of_day_cross_midnight() {

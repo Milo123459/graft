@@ -533,6 +533,7 @@ mouse capture off, so your terminal's own text selection works.
 | `e` | export the current view to SVG |
 | `m` | mouse capture on/off (off: your terminal can select text; the legend row says how to turn it back on) |
 | `:` | Rhai console |
+| `↑ ↓ ← →` / `Tab`, `Enter` | in a menu (timeframe, lines, sources, alerts): move the highlight between its buttons; Enter presses it, like a tap |
 | `q` | quit |
 
 ### Panes

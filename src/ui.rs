@@ -34,6 +34,11 @@ impl<T: Clone> Hits<T> {
         self.0.borrow().iter().find(|(_, t)| f(t)).map(|(r, _)| *r)
     }
 
+    /// Every region, in the order drawn.
+    pub fn all(&self) -> Vec<(Rect, T)> {
+        self.0.borrow().clone()
+    }
+
     /// The topmost region containing the point (later pushes win).
     pub fn at(&self, col: u16, row: u16) -> Option<(Rect, T)> {
         self.0

@@ -227,7 +227,7 @@ impl Recent {
         let mut parts = vec![if ago < 60.0 {
             "just now".to_string()
         } else {
-            format!("{} ago", crate::time::fmt_duration_compact(ago))
+            format!("{} ago", crate::time::fmt_ago(ago))
         }];
         if let Some(cli) = self.cli() {
             if let Some(dir) = cli.input.as_ref().and_then(|p| p.parent()) {
