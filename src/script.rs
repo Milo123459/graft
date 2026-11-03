@@ -1175,21 +1175,26 @@ const MARK_VARS: &[&str] = &["value", "prev", "delta", "pct", "rate", "time", "n
 
 /// Suggestions for console input `text` with the cursor at char `cursor`.
 pub fn complete(text: &str, cursor: usize, series: &[String]) -> Completions {
-    complete_with(text, cursor, series, &[])
+    complete_with(text, cursor, series, &[], &[])
 }
 
 /// The source settings (`--param`) the console can offer: name and choices.
 pub type ParamChoices = [(String, Vec<String>)];
 
-/// `complete`, also offering the source's settings in `param("name", "value")`.
+/// `complete`, also offering the source's settings in `param("name", "value")` and
+/// the marker rules (their labels) in `backtest(…)` and `strategy(…)`.
 pub fn complete_with(
     text: &str,
     cursor: usize,
     series: &[String],
     params: &ParamChoices,
+    rules: &[String],
 ) -> Completions {
-    complete_in(text, cursor, series, &[], false, params)
+    complete_in(text, cursor, series, &[], false, &(params, rules))
 }
+
+/// What completion can offer beyond series: the source's settings and marker rules.
+type Extra<'a> = (&'a ParamChoices, &'a [String]);
 
 /// `extra`: more variables to offer (inside a marker rule); `in_code`: completing the
 /// text of an expression argument.
@@ -1199,8 +1204,9 @@ fn complete_in(
     series: &[String],
     extra: &[&str],
     in_code: bool,
-    params: &ParamChoices,
+    ctx: &Extra,
 ) -> Completions {
+    let (params, rules) = *ctx;
     let chars: Vec<char> = text.chars().collect();
     let cursor = cursor.min(chars.len());
     // Walk up to the cursor: are we in a string, and in which calls?
@@ -1239,6 +1245,21 @@ fn complete_in(
     // settings (`param("interval", "1h")`: names, then that one's values).
     let choices = |func: &str, arg: usize| -> Vec<String> {
         if SERIES_ANY.contains(&func) || SERIES_FIRST.contains(&func) && arg == 0 {
+            return series.to_vec();
+        }
+        // Marker rules by label: backtest("golden", …), strategy("golden", "death").
+        if (func == "backtest" && arg == 0) || (func == "strategy" && arg <= 1) {
+            return rules.to_vec();
+        }
+        if func == "backtest" && arg == 1 {
+            let mut v = series.to_vec();
+            v.extend(["1h", "4h", "1d"].map(String::from));
+            return v;
+        }
+        if func == "backtest" && arg == 2 {
+            return ["1h", "4h", "1d"].map(String::from).to_vec();
+        }
+        if func == "strategy" && arg == 2 {
             return series.to_vec();
         }
         if func == "param" {
@@ -1303,7 +1324,7 @@ fn complete_in(
                 .map(|&c| if c == '`' { '"' } else { c })
                 .collect();
             let vars: &[&str] = if func == "mark_when" { MARK_VARS } else { &[] };
-            let mut c = complete_in(&inner, inner.chars().count(), series, vars, true, params);
+            let mut c = complete_in(&inner, inner.chars().count(), series, vars, true, ctx);
             c.start += q + 1;
             for item in &mut c.items {
                 item.insert = item.insert.replace('"', "`");

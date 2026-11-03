@@ -658,7 +658,8 @@ timeframe applies to every pane.
 
 Press `:` to open the console. As you type, the row above it suggests commands
 (and, inside quotes, series names or a function's choices such as chart types, or
-for `param(…)` the source's settings and then that setting's values),
+for `param(…)` the source's settings and then that setting's values; for
+`backtest(…)` and `strategy(…)` the marker rules by label),
 and shows how the call you're in is used: **Tab** (or a tap) puts the highlighted
 one in, again for the next. `help` lists every command at once, grouped; tap one to
 use it.

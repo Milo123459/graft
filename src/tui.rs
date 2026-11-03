@@ -5030,7 +5030,21 @@ impl App {
             return Default::default();
         };
         let names: Vec<String> = self.full.series.iter().map(|s| s.name.clone()).collect();
-        crate::script::complete_with(&input.value, input.cursor, &names, &self.param_choices())
+        crate::script::complete_with(
+            &input.value,
+            input.cursor,
+            &names,
+            &self.param_choices(),
+            &self.rule_labels(),
+        )
+    }
+
+    /// The marker rules as backtest() names them: their labels (else conditions).
+    fn rule_labels(&self) -> Vec<String> {
+        self.mark_rules
+            .iter()
+            .map(|r| r.label.clone().unwrap_or_else(|| r.expr.clone()))
+            .collect()
     }
 
     /// Every source setting the console's param() can change, with its choices.
@@ -5073,6 +5087,7 @@ impl App {
                     input.cursor,
                     &names,
                     &self.param_choices(),
+                    &self.rule_labels(),
                 );
                 if comps.items.is_empty() {
                     return;
@@ -9826,6 +9841,24 @@ pub(crate) mod tests {
         run(&mut app, r#"strategy("fell", "rose")"#);
         let (text, error) = note(&app).unwrap();
         assert!(!error && text.starts_with("fell → rose on node1"), "{text}");
+        // The console offers the rules by label.
+        let labels = |app: &App| -> Vec<String> {
+            app.completions()
+                .items
+                .into_iter()
+                .map(|i| i.label)
+                .collect()
+        };
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, "backtest(");
+        assert_eq!(labels(&app), ["fell", "rose"]);
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.console.as_ref().unwrap().value, r#"backtest("fell""#);
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, r#"strategy("fell", "r"#);
+        assert_eq!(labels(&app), ["rose"]);
+        key(&mut app, KeyCode::Esc);
         run(&mut app, r#"backtest("nope")"#);
         let (text, error) = note(&app).unwrap();
         assert!(error && text.contains("1 fell, 2 rose"), "{text}");
