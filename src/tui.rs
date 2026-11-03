@@ -4704,10 +4704,10 @@ impl App {
         self.live = Live::new(spec);
         self.backfill = None;
         self.backfill_done = false;
-        self.view = None;
-        self.selection = None;
+        // Where you were stays: the window (paged back or zoomed), the cursor and a
+        // measured stretch are times, as good for BTC as for ETH. If the new data
+        // doesn't reach back that far, older data is fetched until it does.
         self.anchor = None;
-        self.cursor = None;
         self.started = Instant::now();
         self.rebuild(true);
         Ok(())
@@ -10255,6 +10255,9 @@ pub(crate) mod tests {
             "settings fill units too"
         );
         assert_eq!(app.view_opts().title, "ETH m1", "titles say the setting");
+        // Where you were (a window you'd moved to, the cursor) stays across a change.
+        app.view = Some((100.0, 200.0));
+        app.cursor = Some(150.0);
         // The toolbar has a dropdown; picking a value runs the source again.
         let (x, y) = find(&app, "interval: m1 ▾");
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
@@ -10267,6 +10270,11 @@ pub(crate) mod tests {
         }
         app.rebuild(true);
         assert_eq!(app.ds_names(), ["h1"], "fresh data with the new value");
+        assert_eq!(
+            (app.view, app.cursor),
+            (Some((100.0, 200.0)), Some(150.0)),
+            "still where you were"
+        );
         assert_eq!(
             app.current_cli().line,
             ["per_{interval}:{interval} = m1 * 2"],

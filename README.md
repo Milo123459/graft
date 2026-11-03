@@ -275,7 +275,7 @@ graft -c 'curl -s … "interval":"{interval}" …' --param 'interval = 1m | 5m |
 ```
 
 The viewer shows a dropdown for each (`interval: 1m ▾`); picking another value runs
-the source again with fresh data (`param("interval", "1h")` in the console does the
+the source again with fresh data, staying on the stretch of time you were looking at (`param("interval", "1h")` in the console does the
 same, so it can go on a key). `*` marks the current choice: `1m | *1h`. Merged and
 pane sources can have their own (`--merge 'b = -c "…{coin}…" --param "coin = ETH | BTC"'`).
 

@@ -634,7 +634,7 @@ From here on the steps are a reference: read what's useful, skip the rest with E
             ),
             (
                 "--param 'interval = 1m | 5m | 1h' --title 'ETH {interval}'",
-                "a setting: {interval} fills in the command, titles, series and units (volume:{coin} = v), lines, markers and alerts; a dropdown runs it again",
+                "a setting: {interval} fills in the command, titles, series and units (volume:{coin} = v), lines, markers and alerts; a dropdown runs it again, staying on the time you were looking at",
             ),
             (
                 "graft -c 'curl -s \"https://…?start={from_ms:6h}&end={now_ms}\"' --json",
