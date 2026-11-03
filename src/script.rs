@@ -139,6 +139,7 @@ pub enum Flag {
     Cursor,
     Mouse,
     Measure,
+    Legend,
 }
 
 /// Script names of the on/off buttons. Each takes an optional bool (none = toggle).
@@ -155,6 +156,7 @@ pub const FLAGS: &[(&str, Flag)] = &[
     ("cursor", Flag::Cursor),
     ("mouse", Flag::Mouse),
     ("measure", Flag::Measure),
+    ("legend", Flag::Legend),
 ];
 
 /// State shared between the host and registered functions.
@@ -631,6 +633,7 @@ pub const USAGE: &[(&str, &str, &str)] = &[
     ("cursor", "cursor()", "the cursor on/off"),
     ("mouse", "mouse()", "the mouse on/off"),
     ("measure", "measure()", "start measuring a stretch"),
+    ("legend", "legend()  ·  legend(false)", "the legends on/off"),
     // panes
     ("split_right", "split_right()", "a new pane to the right"),
     ("split_down", "split_down()", "a new pane below"),
@@ -792,6 +795,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "cursor",
             "mouse",
             "measure",
+            "legend",
         ],
     ),
     (

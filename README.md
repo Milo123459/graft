@@ -585,6 +585,8 @@ mouse capture off, so your terminal's own text selection works.
 | `e` | export the current view to SVG |
 | `m` | mouse capture on/off (off: your terminal can select text; the legend row says how to turn it back on) |
 | `:` | Rhai console |
+| right-click / **⚙** | a pane's (or the chart's) settings in one place: its source (edit, change) and that source's settings (`--param`), chart type, lines, series, split or close |
+| `i` | legends on/off (also `legend()`, and under ⋯) |
 | `↑ ↓ ← →` / `Tab`, `Enter` | in a menu (timeframe, lines, sources, alerts): move the highlight between its buttons; Enter presses it, like a tap |
 | `q` | quit |
 

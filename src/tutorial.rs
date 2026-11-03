@@ -135,6 +135,11 @@ graft works the same with a mouse, a keyboard or a phone over ssh: tap where you
                 "mouse on/off (off lets you select text in your terminal)",
             ),
             ("⋯ / less", "more buttons: chart type, log scale, export…"),
+            ("i / legend", "legends on/off (more room for the data)"),
+            (
+                "right-click / ⚙",
+                "a pane's (or the chart's) settings: source, chart type, lines, series",
+            ),
             (
                 "↑ ↓ ← →  Enter",
                 "in a menu: move to a button and press it (as a tap)",
@@ -822,7 +827,7 @@ From here on the steps are a reference: read what's useful, skip the rest with E
         keys: &[
             ("stats() split() log() targets()", "toolbar toggles"),
             (
-                "live() pause() follow() cursor()",
+                "live() pause() follow() cursor() legend()",
                 "more toggles, and measure() mouse() side_by_side()",
             ),
             (

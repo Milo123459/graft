@@ -163,6 +163,7 @@ enum Cmd {
     Markers,
     Alerts,
     Sources,
+    Legend,
     Undo,
 }
 
@@ -205,6 +206,11 @@ enum Hit {
     /// Sources menu: edit one (`None`: the main source), remove a merged one, add one.
     SourceEdit(Option<usize>),
     SourceRemove(usize),
+    /// The settings menu: open it for a pane (`None`: the chart), set the chart
+    /// type, close it.
+    PaneSettings(Option<usize>),
+    SetKind(ChartKind),
+    CloseSettings,
     /// A source parameter's dropdown (whose, which), and a choice in it.
     ParamMenu(ParamTarget, usize),
     ParamPick(ParamTarget, usize, usize),
@@ -466,6 +472,10 @@ pub struct App {
     clipboard: Option<String>,
     /// The sources menu is open.
     sources_menu: bool,
+    /// The pane settings menu is open (for the picked pane, or the chart).
+    settings_menu: bool,
+    /// Legends shown (the boxes in panes, the series in the legend row).
+    show_legend: bool,
     /// A parameter's dropdown is open: whose, which.
     param_menu: Option<(ParamTarget, usize)>,
     /// Fetching older data (scrolled back to the oldest): that run of the command,
@@ -607,6 +617,8 @@ impl App {
             console_note: None,
             sources_menu: false,
             param_menu: None,
+            settings_menu: false,
+            show_legend: true,
             backfill: None,
             backfill_done: false,
             popup_rect: std::cell::Cell::new(None),
@@ -3290,6 +3302,17 @@ impl App {
             Cmd::Undo => return self.step_back(),
             Cmd::Alerts => self.alerts_menu = !self.alerts_menu,
             Cmd::Sources => self.sources_menu = !self.sources_menu,
+            Cmd::Legend => {
+                self.show_legend = !self.show_legend;
+                self.say(
+                    if self.show_legend {
+                        "legends on"
+                    } else {
+                        "legends off (i brings them back)"
+                    },
+                    false,
+                );
+            }
             Cmd::Markers => {
                 self.marks_menu = match self.marks_menu {
                     Some(_) => None,
@@ -3427,8 +3450,8 @@ impl App {
             }
         }
         // With several panes the legend row only covers the picked one: each pane
-        // keeps its own legend box.
-        if self.opts.panes.as_ref().is_none_or(|p| p.count() <= 1) {
+        // keeps its own legend box (unless legends are off).
+        if !self.show_legend || self.opts.panes.as_ref().is_none_or(|p| p.count() <= 1) {
             o.legend = crate::cli::LegendPos::None;
         }
         o
@@ -3590,7 +3613,9 @@ impl App {
                 Some(Hit::Cmd(Cmd::Alerts)),
             ));
         }
-        for (i, name, color, value, shown) in self.legend_items() {
+        for (i, name, color, value, shown) in
+            self.legend_items().into_iter().filter(|_| self.show_legend)
+        {
             let mut parts = vec![(
                 if shown { "● " } else { "○ " }.to_string(),
                 Style::default().fg(color),
@@ -3726,6 +3751,8 @@ impl App {
             4
         } else if self.param_menu.is_some() {
             5
+        } else if self.settings_menu {
+            6
         } else {
             0
         }
@@ -3896,6 +3923,244 @@ impl App {
         };
         self.backfill = Some((Live::new(spec), oldest));
         self.say("loading older data…", false);
+    }
+
+    // ───────────── pane settings menu ─────────────
+
+    /// Open the settings for pane `id` (`None`: the whole chart, or the picked pane).
+    fn open_settings(&mut self, id: Option<usize>) {
+        if let (Some(id), Some(p)) = (id, self.opts.panes.as_mut())
+            && id < p.count()
+        {
+            p.focus = id;
+        }
+        self.settings_menu = true;
+    }
+
+    /// Whose settings the menu shows: the picked pane's source (if it has one of its
+    /// own), else the main source.
+    fn settings_target(&self) -> ParamTarget {
+        match self.focused_pane() {
+            Some(p) if p.source.is_some() => {
+                ParamTarget::Pane(self.opts.panes.as_ref().map_or(0, |p| p.focus))
+            }
+            _ => ParamTarget::Main,
+        }
+    }
+
+    fn current_kind(&self) -> ChartKind {
+        self.focused_pane()
+            .and_then(|p| p.kind)
+            .unwrap_or(self.opts.kind)
+    }
+
+    fn set_kind(&mut self, k: ChartKind) {
+        match self.opts.panes.as_mut() {
+            Some(p) => {
+                let f = p.focus;
+                p.panes[f].kind = Some(k);
+            }
+            None => self.opts.kind = k,
+        }
+    }
+
+    /// One place for everything about a pane (or the chart): its source and the
+    /// source's settings, chart type, lines, series, and splitting or closing it.
+    fn draw_settings_menu(&self, f: &mut Frame) {
+        if !self.settings_menu {
+            return;
+        }
+        let area = f.area();
+        let w = 74.min(area.width);
+        let label_w = 9u16;
+        let inner_w = w.saturating_sub(2);
+        let room = inner_w.saturating_sub(label_w);
+        let t = self.settings_target();
+        let panes = self.opts.panes.as_ref();
+        let pane_id = panes.map(|p| p.focus);
+        // (label, text after it, buttons)
+        let mut rows: Vec<(String, String, Vec<Button<Hit>>)> = Vec::new();
+        // The source.
+        match (pane_id, self.focused_pane().and_then(|p| p.source.clone())) {
+            (Some(id), Some(name)) => rows.push((
+                "source".into(),
+                format!("{name} "),
+                vec![
+                    Button::new("edit", Hit::SourcePaneEdit(id)),
+                    Button::new("change", Hit::SourcePane(id)),
+                ],
+            )),
+            (Some(id), None) => rows.push((
+                "source".into(),
+                "this chart's data ".into(),
+                vec![Button::new("change", Hit::SourcePane(id))],
+            )),
+            (None, _) => rows.push((
+                "source".into(),
+                format!("{} ", self.live.spec.describe()),
+                vec![Button::new("sources…", Hit::Cmd(Cmd::Sources))],
+            )),
+        }
+        // Its settings (--param).
+        for (k, p) in self.params_of(t).iter().enumerate() {
+            rows.push((
+                p.name.clone(),
+                String::new(),
+                p.choices
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        Button::new(c.clone(), Hit::ParamPick(t, k, i)).active(i == p.current)
+                    })
+                    .collect(),
+            ));
+        }
+        let kind = self.current_kind();
+        rows.push((
+            "chart".into(),
+            String::new(),
+            ChartKind::value_variants()
+                .iter()
+                .map(|k| Button::new(k.name(), Hit::SetKind(*k)).active(*k == kind))
+                .collect(),
+        ));
+        let lines = self.cur_lines();
+        let mut line_buttons =
+            vec![Button::new("live", Hit::Layer(None, false)).active(lines.live)];
+        for (style, name) in [
+            (TrendStyle::Avg, "average"),
+            (TrendStyle::Median, "median"),
+            (TrendStyle::P95, "p95"),
+        ] {
+            line_buttons.push(
+                Button::new(name, Hit::Layer(Some(style), false))
+                    .active(lines.trends.contains(&style)),
+            );
+        }
+        rows.push(("lines".into(), String::new(), line_buttons));
+        rows.push((
+            "series".into(),
+            String::new(),
+            self.chips()
+                .into_iter()
+                .map(|b| {
+                    let active = b.active;
+                    let name = b
+                        .label
+                        .split_once(' ')
+                        .map_or(b.label.clone(), |p| p.1.to_string());
+                    Button::new(name, b.action).active(active)
+                })
+                .collect(),
+        ));
+        let mut actions = vec![
+            Button::new("split right", Hit::Pane(PaneOp::Split(PSplit::Across))),
+            Button::new("split down", Hit::Pane(PaneOp::Split(PSplit::Down))),
+        ];
+        if panes.is_some_and(|p| p.count() > 1) {
+            actions.push(Button::new("close pane", Hit::Pane(PaneOp::Close)));
+        }
+        actions.push(Button::new("done", Hit::CloseSettings));
+        let row_h = |r: &(String, String, Vec<Button<Hit>>)| {
+            let text = r.1.chars().count() as u16;
+            if r.2.is_empty() {
+                1
+            } else {
+                flow_height(&r.2, room.saturating_sub(text).max(10)).max(1)
+            }
+        };
+        let body: u16 = rows.iter().map(row_h).sum::<u16>() + flow_height(&actions, inner_w) + 2;
+        let h = (body + 2).min(area.height);
+        let rect = Rect {
+            x: (area.width - w) / 2,
+            y: area.height.saturating_sub(h) / 2,
+            width: w,
+            height: h,
+        };
+        Clear.render(rect, f.buffer_mut());
+        self.popup_rect.set(Some(rect));
+        let title = match pane_id {
+            Some(id) => format!(" pane {} settings ", id + 1),
+            None => " chart settings ".to_string(),
+        };
+        let block = Block::bordered()
+            .title(title)
+            .border_style(Style::default().fg(Color::Yellow));
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        self.hits.push(rect, Hit::MenuBackground);
+        let head = Style::default().fg(Color::Yellow);
+        let mut y = inner.y;
+        for r in &rows {
+            if y >= inner.bottom() {
+                break;
+            }
+            let h = row_h(r);
+            f.buffer_mut().set_string(inner.x, y, &r.0, head);
+            let text_w = r.1.chars().count() as u16;
+            f.buffer_mut()
+                .set_string(inner.x + label_w, y, &r.1, Style::default().fg(Color::Gray));
+            render_buttons(
+                &r.2,
+                Rect {
+                    x: inner.x + label_w + text_w,
+                    y,
+                    width: room
+                        .saturating_sub(text_w)
+                        .max(10)
+                        .min(inner.width.saturating_sub(label_w + text_w)),
+                    height: h.min(inner.bottom() - y),
+                },
+                f.buffer_mut(),
+                &self.hits,
+            );
+            y += h;
+        }
+        y += 1;
+        if y < inner.bottom() {
+            render_buttons(
+                &actions,
+                Rect {
+                    y,
+                    height: inner.bottom() - y,
+                    ..inner
+                },
+                f.buffer_mut(),
+                &self.hits,
+            );
+        }
+        if inner.height > 0 {
+            f.buffer_mut().set_string(
+                inner.x,
+                inner.bottom() - 1,
+                "right-click or ⚙ opens this · arrows + Enter · Esc closes",
+                Style::default().fg(Color::DarkGray),
+            );
+        }
+    }
+
+    /// A ⚙ at the end of each pane's title (or the chart's): tap it for the settings.
+    fn draw_settings_buttons(&self, f: &mut Frame, chart: Rect) {
+        let mut spots: Vec<(Rect, Option<usize>)> = match &self.opts.panes {
+            Some(p) if p.count() > 1 => p
+                .rects(chart)
+                .into_iter()
+                .map(|(id, r)| (r, Some(id)))
+                .collect(),
+            _ => vec![(chart, None)],
+        };
+        spots.retain(|(r, _)| r.width > 8 && r.height > 2);
+        for (r, id) in spots {
+            let at = Rect {
+                x: r.right() - 4,
+                y: r.y,
+                width: 3,
+                height: 1,
+            };
+            f.buffer_mut()
+                .set_string(at.x, at.y, " ⚙ ", Style::default().fg(Color::Gray));
+            self.hits.push(at, Hit::PaneSettings(id));
+        }
     }
 
     // ───────────── source parameters ─────────────
@@ -5343,7 +5608,8 @@ impl App {
             || self.marks_menu.is_some()
             || self.alerts_menu
             || self.sources_menu
-            || self.param_menu.is_some())
+            || self.param_menu.is_some()
+            || self.settings_menu)
     }
 
     fn cli_bits(&self) -> CliBits {
@@ -5498,6 +5764,7 @@ impl App {
             Flag::Follow => self.follow_pointer,
             Flag::Cursor => self.cursor.is_some(),
             Flag::Mouse => self.mouse,
+            Flag::Legend => self.show_legend,
             Flag::Measure => self.measuring || self.anchor.is_some() || self.selection.is_some(),
         }
     }
@@ -5518,6 +5785,7 @@ impl App {
             Flag::Follow => Cmd::Follow,
             Flag::Cursor => Cmd::Cursor,
             Flag::Mouse => Cmd::Mouse,
+            Flag::Legend => Cmd::Legend,
             Flag::Measure => Cmd::Select,
         };
         let t = self.run_cmd(cmd);
@@ -5571,6 +5839,10 @@ impl App {
         }
         if self.param_menu.is_some() {
             self.param_menu = None;
+            return Transition::None;
+        }
+        if self.settings_menu {
+            self.settings_menu = false;
             return Transition::None;
         }
         if self.alerts_menu {
@@ -5734,6 +6006,7 @@ impl App {
             KeyCode::Char('K') => Cmd::Markers,
             KeyCode::Char('N') => Cmd::Alerts,
             KeyCode::Char('S') => Cmd::Sources,
+            KeyCode::Char('i') => Cmd::Legend,
             KeyCode::Char('[') => Cmd::RangeStep(-1),
             KeyCode::Char(']') => Cmd::RangeStep(1),
             KeyCode::Char(' ' | 'p') => Cmd::Pause,
@@ -5768,6 +6041,20 @@ impl App {
                 return Transition::None;
             }
         }
+        // Right-click a pane (or the chart): its settings.
+        if m.kind == MouseEventKind::Down(MouseButton::Right) && !self.help {
+            let chart = self.chart_rect.get();
+            if chart.contains((col, row).into()) {
+                let id = self.opts.panes.as_ref().and_then(|p| {
+                    p.rects(chart)
+                        .into_iter()
+                        .find(|(_, r)| r.contains((col, row).into()))
+                        .map(|(id, _)| id)
+                });
+                self.open_settings(id);
+                return Transition::None;
+            }
+        }
         if self.help {
             match m.kind {
                 MouseEventKind::Down(_) => {
@@ -5791,6 +6078,18 @@ impl App {
                         }
                         Hit::SourceEdit(i) => self.edit_source(i),
                         Hit::SourceAdd => self.edit_source(Some(usize::MAX)),
+                        Hit::PaneSettings(id) => {
+                            self.open_settings(id);
+                            Transition::None
+                        }
+                        Hit::SetKind(k) => {
+                            self.set_kind(k);
+                            Transition::None
+                        }
+                        Hit::CloseSettings => {
+                            self.settings_menu = false;
+                            Transition::None
+                        }
                         Hit::ParamMenu(t, k) => {
                             self.param_menu = match self.param_menu {
                                 Some(open) if open == (t, k) => None,
@@ -6269,6 +6568,7 @@ impl App {
                 b(":", Cmd::Console),
                 b("svg", Cmd::Export),
                 b("mouse", Cmd::Mouse).active(self.mouse),
+                b("legend", Cmd::Legend).active(self.show_legend),
                 b("?", Cmd::Help),
                 b("quit", Cmd::Quit),
             ]);
@@ -6373,6 +6673,9 @@ impl App {
         self.chart_rect.set(chart);
         let opts = self.view_opts();
         f.render_widget(ChartWidget::new(&self.ds, &opts, overlay), chart);
+        if self.mouse {
+            self.draw_settings_buttons(f, chart);
+        }
         if pane_h > 0 {
             self.draw_pane_panel(f, pane_area);
         }
@@ -6447,6 +6750,7 @@ impl App {
         self.draw_marks_menu(f);
         self.draw_alerts_menu(f);
         self.draw_sources_menu(f);
+        self.draw_settings_menu(f);
         self.draw_param_menu(f);
         self.draw_popup_focus(f);
         if self.help {
@@ -9223,5 +9527,83 @@ pub(crate) mod tests {
             m >= n + 9 && m <= n + 11,
             "{n} → {m}: added, no duplicates at the seam"
         );
+    }
+
+    #[test]
+    fn pane_settings_by_right_click_or_gear() {
+        let mut app = app(&["graft", LOG, "--pane", "*", "--pane", "node2"]);
+        screen(&app);
+        let r = app.opts.panes.as_ref().unwrap().rects(app.chart_rect.get())[1].1;
+        app.on_event(&TermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: r.x + r.width / 2,
+            row: r.y + r.height / 2,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(app.settings_menu);
+        assert_eq!(app.opts.panes.as_ref().unwrap().focus, 1);
+        let s = screen(&app);
+        assert!(
+            s.contains("pane 2 settings") && s.contains("source") && s.contains("lines"),
+            "{s}"
+        );
+        // Chart type from the menu applies to that pane.
+        let (x, y) = find(&app, " histogram ");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert_eq!(
+            app.opts.panes.as_ref().unwrap().panes[1].kind,
+            Some(ChartKind::Histogram)
+        );
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.settings_menu);
+        // The ⚙ in pane 1's title opens pane 1.
+        let s = screen(&app);
+        let (row, line) = s
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains('⚙'))
+            .unwrap();
+        let col = line.chars().position(|c| c == '⚙').unwrap() as u16;
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            col,
+            row as u16,
+        );
+        assert!(app.settings_menu && app.opts.panes.as_ref().unwrap().focus == 0);
+        // Fits a phone.
+        let phone = screen_sized(&app, 46, 40);
+        assert!(
+            phone.contains("pane 1 settings") && phone.contains(" done "),
+            "{phone}"
+        );
+        // One chart: right-click anywhere on it.
+        let mut app = app_from(&[LOG.to_string()]);
+        screen(&app);
+        let c = app.chart_rect.get();
+        app.on_event(&TermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: c.x + 10,
+            row: c.y + 5,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(screen(&app).contains("chart settings"));
+        let (x, y) = find(&app, " bar ");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert_eq!(app.opts.kind, ChartKind::Bar);
+    }
+
+    #[test]
+    fn legends_can_be_hidden() {
+        let mut app = app(&["graft", LOG, "--pane", "*", "--pane", "node2"]);
+        assert!(screen_sized(&app, 160, 40).contains("│node1 58.8 GB "));
+        key(&mut app, KeyCode::Char('i'));
+        let s = screen_sized(&app, 160, 40);
+        assert!(
+            !s.contains("│node1 58.8 GB ") && !s.contains("● node1"),
+            "{s}"
+        );
+        run(&mut app, "legend(true)");
+        assert!(app.show_legend);
     }
 }
