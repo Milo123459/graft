@@ -525,6 +525,58 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// This command line with its source settings (`--param`) filled in wherever
+    /// `{name}` appears: series, units, lines, marks, alerts… (the command and file
+    /// name are filled when the source is set up; titles when they're drawn).
+    pub fn with_params(&self) -> Cli {
+        let params = crate::params::parse_all(&self.param);
+        if params.is_empty() {
+            return self.clone();
+        }
+        let fill = |s: &mut String| {
+            if s.contains('{') {
+                *s = crate::params::fill(s, &params);
+            }
+        };
+        let mut c = self.clone();
+        for o in [
+            &mut c.regex,
+            &mut c.columns,
+            &mut c.group_by,
+            &mut c.time_field,
+            &mut c.time_format,
+            &mut c.unit,
+            &mut c.since,
+            &mut c.until,
+            &mut c.ymin,
+            &mut c.ymax,
+            &mut c.x_format,
+            &mut c.per,
+            &mut c.forecast,
+        ] {
+            o.iter_mut().for_each(fill);
+        }
+        for v in [
+            &mut c.grep,
+            &mut c.names,
+            &mut c.select,
+            &mut c.exclude,
+            &mut c.derived,
+            &mut c.colors,
+            &mut c.hline,
+            &mut c.target,
+            &mut c.alert,
+            &mut c.line,
+            &mut c.hide,
+            &mut c.bind,
+            &mut c.mark,
+            &mut c.notify,
+        ] {
+            v.iter_mut().for_each(fill);
+        }
+        c
+    }
+
     /// A default configuration (as if run with no arguments).
     pub fn empty() -> Self {
         Self::parse_from(["graft"])

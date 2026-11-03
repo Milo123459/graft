@@ -508,6 +508,8 @@ pub struct App {
     sub_views: Vec<crate::render::SourceView>,
     /// Marker rules (`--mark`, `mark_when`).
     mark_rules: Vec<crate::marks::MarkRule>,
+    /// The source settings the chart was built with (lines and markers saw these).
+    built_params: Vec<crate::params::Param>,
     /// Markers placed by hand with `mark("…")`.
     manual_marks: Vec<crate::render::Mark>,
     /// The markers menu is open, with this row picked.
@@ -577,7 +579,8 @@ impl App {
             .collect();
         let horizon = opts.forecast.unwrap_or(Horizon::Auto);
         let mut app = Self {
-            alerts: cli.alert.clone(),
+            alerts: cli.with_params().alert,
+            built_params: crate::params::parse_all(&cli.param),
             show_stats: cli.stats,
             mouse: !cli.no_mouse,
             cli,
@@ -694,9 +697,35 @@ impl App {
             .flat_map(|p| p.panes.iter().map(Pane::to_spec))
             .collect();
         c.layout = panes.map(|p| p.layout_expr());
-        c.mark = self.mark_rules.iter().map(|r| r.to_spec()).collect();
-        c.line = self.session.custom.iter().map(|l| l.to_spec()).collect();
-        c.alert = self.alerts.clone();
+        // Lines, markers and alerts run with the source's settings filled in; the
+        // ones written with {name} are saved that way.
+        let params = &self.built_params;
+        let unfill = |now: Vec<String>, raw: &[String], norm: &dyn Fn(&str) -> Option<String>| {
+            now.into_iter()
+                .map(|n| {
+                    raw.iter()
+                        .find(|r| {
+                            r.contains('{')
+                                && norm(&crate::params::fill(r, params)).as_ref() == Some(&n)
+                        })
+                        .cloned()
+                        .unwrap_or(n)
+                })
+                .collect::<Vec<_>>()
+        };
+        c.mark = unfill(
+            self.mark_rules.iter().map(|r| r.to_spec()).collect(),
+            &self.cli.mark,
+            &|s| crate::marks::MarkRule::parse(s).ok().map(|r| r.to_spec()),
+        );
+        c.line = unfill(
+            self.session.custom.iter().map(|l| l.to_spec()).collect(),
+            &self.cli.line,
+            &|s| crate::lines::CustomLine::parse(s).ok().map(|l| l.to_spec()),
+        );
+        c.alert = unfill(self.alerts.clone(), &self.cli.alert, &|s| {
+            Some(s.to_string())
+        });
         let mut hidden: Vec<String> = self.hidden.iter().cloned().collect();
         hidden.sort();
         c.hide = hidden;
@@ -4271,6 +4300,8 @@ impl App {
         let spec = crate::setup::source_spec(&cli, true)?;
         let setup = crate::setup::build(cli, spec.clone(), false)?;
         self.session = setup.session;
+        self.built_params = crate::params::parse_all(&setup.cli.param);
+        self.alerts = setup.cli.with_params().alert;
         self.cli = setup.cli;
         self.live = Live::new(spec);
         self.backfill = None;
@@ -5597,9 +5628,10 @@ impl App {
 
     /// `unit(…)` from the console: values parsed without a unit get this one.
     fn apply_unit(&mut self) {
-        let Some(u) = self.cli.unit.as_deref() else {
+        let Some(u) = self.cli.with_params().unit else {
             return;
         };
+        let u = u.as_str();
         let (dim, mult) = crate::units::lookup_unit(u, self.cli.binary_units)
             .unwrap_or_else(|| (crate::units::Dim::Other(u.to_string()), 1.0));
         for s in &mut self.full.series {
@@ -9471,8 +9503,15 @@ pub(crate) mod tests {
             "interval = m1 | h1",
             "--title",
             "ETH {interval}",
+            "--line",
+            "per_{interval}:{interval} = m1 * 2",
         ]);
-        assert_eq!(app.ds_names(), ["m1"]);
+        assert_eq!(app.ds_names(), ["m1", "per_m1"]);
+        assert_eq!(
+            app.ds.series[1].unit.format(2.0),
+            "2m1",
+            "settings fill units too"
+        );
         assert_eq!(app.view_opts().title, "ETH m1", "titles say the setting");
         // The toolbar has a dropdown; picking a value runs the source again.
         let (x, y) = find(&app, "interval: m1 ▾");
@@ -9486,6 +9525,11 @@ pub(crate) mod tests {
         }
         app.rebuild(true);
         assert_eq!(app.ds_names(), ["h1"], "fresh data with the new value");
+        assert_eq!(
+            app.current_cli().line,
+            ["per_{interval}:{interval} = m1 * 2"],
+            "saved as written"
+        );
         assert_eq!(app.view_opts().title, "ETH h1");
         assert_eq!(
             app.current_cli().title.as_deref(),

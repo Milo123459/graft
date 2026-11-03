@@ -250,6 +250,7 @@ fn run_once(
     color: bool,
     timeframe: transform::Timeframe,
 ) -> Result<ExitCode> {
+    let cli = &cli.with_params();
     for ev in rx {
         match ev {
             Event::Line(line, meta) => {

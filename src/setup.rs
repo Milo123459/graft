@@ -29,6 +29,10 @@ pub struct Setup {
 
 /// Build everything for `cli`, reading from `spec`.
 pub fn build(cli: Cli, spec: SourceSpec, color: bool) -> Result<Setup> {
+    // The chart is built from the command line with its settings filled in; the
+    // one kept (to save, or to change a setting) still says {name}.
+    let raw = cli;
+    let cli = raw.with_params();
     let script = Rc::new(ScriptHost::new(cli.script.as_deref(), cli.binary_units)?);
     if cli.parse_fn && !script.has_fn("parse") {
         bail!("--parse-fn: the script doesn't define `fn parse(line)`");
@@ -50,7 +54,7 @@ pub fn build(cli: Cli, spec: SourceSpec, color: bool) -> Result<Setup> {
     let timeframe = timeframe(&cli)?;
     Ok(Setup {
         timeframe,
-        cli,
+        cli: raw,
         session,
         opts,
         report,

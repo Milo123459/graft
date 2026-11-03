@@ -243,7 +243,7 @@ graft -c 'curl -s --json "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"{coin
   -n 5s --json --time-field t --replace \
   --script examples/indicators.rhai \
   --series 'open:USD = o' --series 'high:USD = h' --series 'low:USD = l' --series 'close:USD = c' \
-  --series 'volume = v' --select open,high,low,close,volume \
+  --series 'volume:{coin} = v' --select open,high,low,close,volume \
   --line 'ema30 = ema(values("close"), 30)' --line 'ema50 = ema(values("close"), 50)' \
   --line 'rsi14:% = rsi(values("close"), 14)' --line 'overbought:% = 70' --line 'oversold:% = 30' \
   --line 'macd = macd(values("close"))' --line 'signal = ema(values("macd"), 9)' \
@@ -263,8 +263,9 @@ back (`--replace` takes care of the overlap), until the source has nothing older
 
 ### Source settings (`--param`)
 
-A source can have settings with a few choices, filled in wherever its command (or
-file name) says `{name}`:
+A source can have settings with a few choices, filled in wherever its command, file
+name, titles, series and units (`--series 'volume:{coin} = v'`), lines, markers or
+alerts say `{name}` (saved charts keep the `{name}`):
 
 ```sh
 graft -c 'curl -s … "interval":"{interval}" …' --param 'interval = 1m | 5m | 15m | 1h | 4h | 1d' …
