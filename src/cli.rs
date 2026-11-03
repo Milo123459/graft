@@ -450,6 +450,16 @@ pub struct Cli {
     )]
     pub hide: Vec<String>,
 
+    /// Series drawn in front of the others, e.g. `--front rsi14` over its 70/30 lines
+    /// (in panes: `--pane 'rsi14,overbought,oversold front=rsi14'`)
+    #[arg(
+        long,
+        value_name = "NAMES",
+        value_delimiter = ',',
+        help_heading = "Chart"
+    )]
+    pub front: Vec<String>,
+
     /// A key that runs Rhai in the viewer, e.g. `--bind 'r = only("eth", "ema30")'`
     /// or `--bind 'a = show_all()'`. Repeatable; bound keys win over built-in ones.
     #[arg(long, value_name = "KEY = CODE", value_parser = parse_bind, help_heading = "Chart")]
@@ -701,6 +711,10 @@ impl Cli {
         opt(
             "--hide",
             (!self.hide.is_empty()).then(|| self.hide.join(",")),
+        );
+        opt(
+            "--front",
+            (!self.front.is_empty()).then(|| self.front.join(",")),
         );
         for b in &self.bind {
             opt("--bind", Some(b.clone()));

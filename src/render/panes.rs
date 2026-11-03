@@ -21,6 +21,8 @@ pub struct Pane {
     pub source: Option<String>,
     /// Its own title (`{name}` fills in a source setting): `title={coin} {interval}`.
     pub title: Option<String>,
+    /// Series drawn in front of the others: `front=rsi14`.
+    pub front: Vec<String>,
 }
 
 impl Pane {
@@ -39,15 +41,21 @@ impl Pane {
             if let Some(v) = word.strip_prefix("kind=") {
                 pane.kind = Some(
                     <ChartKind as clap::ValueEnum>::from_str(v, true)
-                        .map_err(|_| format!("pane: unknown chart type '{v}' (line, scatter, bar, histogram, sparkline)"))?,
+                        .map_err(|_| format!("pane: unknown chart type '{v}' (line, scatter, bar, histogram, sparkline, stat, candles)"))?,
                 );
             } else if let Some(v) = word.strip_prefix("source=") {
                 pane.source = (!v.is_empty()).then(|| v.to_string());
+            } else if let Some(v) = word.strip_prefix("front=") {
+                pane.front = v
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
             } else if let Some(v) = word.strip_prefix("lines=") {
                 pane.lines = Some(Lines::parse(v).map_err(|e| format!("pane: {e}"))?);
             } else if word.contains('=') {
                 return Err(format!(
-                    "pane: unknown setting '{word}' (kind=…, lines=…, source=…, title=…)"
+                    "pane: unknown setting '{word}' (kind=…, lines=…, front=…, source=…, title=…)"
                 ));
             } else if word != "*" {
                 pane.series
@@ -68,6 +76,9 @@ impl Pane {
         }
         if let Some(l) = &self.lines {
             words.push(format!("lines={}", l.to_arg()));
+        }
+        if !self.front.is_empty() {
+            words.push(format!("front={}", self.front.join(",")));
         }
         if let Some(src) = &self.source {
             words.push(format!("source={src}"));
@@ -933,6 +944,9 @@ mod tests {
         assert_eq!(Pane::parse(&p.to_spec()).unwrap(), p);
         assert_eq!(Pane::parse("*").unwrap(), Pane::default());
         // A title takes the rest, spaces and all.
+        let f = Pane::parse("rsi14,overbought,oversold front=rsi14").unwrap();
+        assert_eq!(f.front, ["rsi14"]);
+        assert_eq!(Pane::parse(&f.to_spec()).unwrap(), f);
         let t = Pane::parse("price,ema30 kind=line title={coin} {interval} price").unwrap();
         assert_eq!(t.title.as_deref(), Some("{coin} {interval} price"));
         assert_eq!(t.series, ["price", "ema30"]);

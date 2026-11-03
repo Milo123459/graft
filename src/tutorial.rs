@@ -392,6 +392,10 @@ api is slowly getting slower here. Give it a target and the stats say when it ge
                 "--pane 'db kind=histogram title=db latency spread'",
                 "a pane's own title (title= goes last; {name} fills in a setting)",
             ),
+            (
+                "--pane 'api,db front=api'",
+                "api drawn on top of db where they cross (:front(api) in the console; --front without panes)",
+            ),
         ],
         task: Some(
             "tap panes (or press w), then | to split side by side. Then w to close the panel",
@@ -981,7 +985,7 @@ The next pages are recipes for real use: copy puts one on your clipboard."#,
         title: "recipe: a trading dashboard",
         text: "Hyperliquid candles (500 of them, polled every 5 s; --replace keeps the newest up to date instead of piling up copies) drawn as candlesticks (kind=candles, from the open/high/low/close series), with EMA30/EMA50 over them and crossover markers, RSI, MACD and volume in panes. coin ▾ and interval ▾ switch asset and candle size; press ← (or scroll back to the oldest candle) and older ones load. RSI and MACD are built in (rsi(values, 14), macd(values)).",
         command: Some(
-            r#"graft -c 'curl -s --json "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"{coin}\",\"interval\":\"{interval}\",\"startTime\":{from_ms:500*{interval}},\"endTime\":{now_ms}}}" https://api.hyperliquid.xyz/info' --param 'coin = ETH | BTC | SOL | HYPE' --param 'interval = 1m | 5m | 15m | 1h | 4h | 1d' -n 5s --json --time-field t --replace --series 'open:USD = o' --series 'high:USD = h' --series 'low:USD = l' --series 'close:USD = c' --series 'volume:{coin} = v' --select open,high,low,close,volume --line 'ema30 = ema(values("close"), 30)' --line 'ema50 = ema(values("close"), 50)' --line 'rsi14:% = rsi(values("close"), 14)' --line 'overbought:% = 70' --line 'oversold:% = 30' --line 'macd = macd(values("close"))' --line 'signal = ema(values("macd"), 9)' --mark 'name == "ema30" && prev < ema50_prev && value >= ema50 => golden cross | ▲ cyan badge' --mark 'name == "ema30" && prev > ema50_prev && value <= ema50 => death cross | ▼ magenta badge' --pane 'open,high,low,close,ema30,ema50 kind=candles title={coin} {interval}' --pane 'rsi14,overbought,oversold' --pane 'macd,signal' --pane volume --layout '1 /60% ((2 | 3) / 4)' --title '{coin} {interval}'"#,
+            r#"graft -c 'curl -s --json "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"{coin}\",\"interval\":\"{interval}\",\"startTime\":{from_ms:500*{interval}},\"endTime\":{now_ms}}}" https://api.hyperliquid.xyz/info' --param 'coin = ETH | BTC | SOL | HYPE' --param 'interval = 1m | 5m | 15m | 1h | 4h | 1d' -n 5s --json --time-field t --replace --series 'open:USD = o' --series 'high:USD = h' --series 'low:USD = l' --series 'close:USD = c' --series 'volume:{coin} = v' --select open,high,low,close,volume --line 'ema30 = ema(values("close"), 30)' --line 'ema50 = ema(values("close"), 50)' --line 'rsi14:% = rsi(values("close"), 14)' --line 'overbought:% = 70' --line 'oversold:% = 30' --line 'macd = macd(values("close"))' --line 'signal = ema(values("macd"), 9)' --mark 'name == "ema30" && prev < ema50_prev && value >= ema50 => golden cross | ▲ cyan badge' --mark 'name == "ema30" && prev > ema50_prev && value <= ema50 => death cross | ▼ magenta badge' --pane 'open,high,low,close,ema30,ema50 kind=candles title={coin} {interval}' --pane 'rsi14,overbought,oversold front=rsi14' --pane 'macd,signal front=macd' --pane volume --layout '1 /60% ((2 | 3) / 4)' --title '{coin} {interval}'"#,
         ),
         ..BASE
     },

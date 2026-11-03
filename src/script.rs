@@ -36,6 +36,8 @@ pub enum Action {
     Show(String),
     Hide(String),
     Chart(String),
+    /// Series drawn in front (empty: none).
+    Front(Vec<String>),
     /// Set (`Some`) or remove (`None`) a series' forecast target.
     Target(String, Option<f64>),
     /// Forecast horizon (`"auto"`, `"7d"`), or `None` to turn forecasting off.
@@ -602,7 +604,12 @@ pub const USAGE: &[(&str, &str, &str)] = &[
     (
         "chart",
         r#"chart("bar")"#,
-        "line scatter bar histogram sparkline stat",
+        "line scatter bar histogram sparkline stat candles",
+    ),
+    (
+        "front",
+        r#"front("rsi14")  ·  front()"#,
+        "draw these series on top of the others (none: back to normal)",
     ),
     ("lines", r#"lines("live,avg")"#, "which lines to draw"),
     (
@@ -784,6 +791,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "pan",
             "reset",
             "chart",
+            "front",
             "lines",
             "trend",
             "window",
@@ -992,7 +1000,7 @@ const SERIES_FIRST: &[&str] = &[
     "clear_target",
 ];
 /// Functions where every text argument is a series name (`only("a", "b")`, `mean_of([…])`).
-const SERIES_ANY: &[&str] = &["only", "mean_of"];
+const SERIES_ANY: &[&str] = &["only", "mean_of", "front"];
 
 /// The choices for a text argument that isn't a series.
 fn arg_choices(func: &str, arg: usize) -> &'static [&'static str] {
@@ -2082,6 +2090,21 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
     });
     let st = state.clone();
     engine.register_fn("chart", move |k: &str| push(&st, Action::Chart(k.into())));
+    for n in 0..=4 {
+        let st = state.clone();
+        let f = move |names: Vec<String>| push(&st, Action::Front(names));
+        match n {
+            0 => engine.register_fn("front", move || f(Vec::new())),
+            1 => engine.register_fn("front", move |a: &str| f(vec![a.into()])),
+            2 => engine.register_fn("front", move |a: &str, b: &str| f(vec![a.into(), b.into()])),
+            3 => engine.register_fn("front", move |a: &str, b: &str, c: &str| {
+                f(vec![a.into(), b.into(), c.into()])
+            }),
+            _ => engine.register_fn("front", move |a: &str, b: &str, c: &str, d: &str| {
+                f(vec![a.into(), b.into(), c.into(), d.into()])
+            }),
+        };
+    }
     let st = state.clone();
     engine.register_fn("target", move |n: &str, v: Dynamic| -> FnResult<()> {
         push(

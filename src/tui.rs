@@ -732,6 +732,7 @@ impl App {
         let mut hidden: Vec<String> = self.hidden.iter().cloned().collect();
         hidden.sort();
         c.hide = hidden;
+        c.front = self.opts.front.clone();
         c.side_by_side = self.opts.side_by_side;
         c.no_targets = !self.opts.show_targets;
         c.last = self.timeframe.last;
@@ -5250,7 +5251,14 @@ impl App {
                     }
                     None => self.opts.kind = kind,
                 },
-                Err(_) => self.say(format!("chart: there's no chart type '{k}' — line, scatter, bar, histogram, sparkline or stat"), true),
+                Err(_) => self.say(format!("chart: there's no chart type '{k}' — line, scatter, bar, histogram, sparkline, stat or candles"), true),
+            },
+            Action::Front(names) => match self.opts.panes.as_mut() {
+                Some(p) => {
+                    let f = p.focus;
+                    p.panes[f].front = names;
+                }
+                None => self.opts.front = names,
             },
             Action::Target(name, value) => self.opts.analysis.targets.set(&name, value),
             Action::Forecast(h) => match h.map(|h| Horizon::parse(&h)).transpose() {
@@ -9414,6 +9422,27 @@ pub(crate) mod tests {
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
         assert!(app.source_menu.is_some() && !app.sources_menu);
         assert_eq!(app.opts.panes.as_ref().unwrap().focus, 1);
+    }
+
+    #[test]
+    fn front_draws_a_series_on_top() {
+        let mut app = app(&["graft", LOG, "--pane", "*", "--pane", "node2"]);
+        run(&mut app, "front(node1)");
+        let p = app.opts.panes.as_ref().unwrap();
+        assert_eq!(p.panes[p.focus].front, ["node1"], "the picked pane");
+        assert!(
+            app.current_cli()
+                .pane
+                .iter()
+                .any(|s| s.contains("front=node1"))
+        );
+        run(&mut app, "front()");
+        let p = app.opts.panes.as_ref().unwrap();
+        assert!(p.panes[p.focus].front.is_empty());
+        let mut single = super::tests::app(&["graft", LOG, "--front", "node1"]);
+        assert_eq!(single.opts.front, ["node1"]);
+        run(&mut single, "front(node2)");
+        assert_eq!(single.current_cli().front, ["node2"]);
     }
 
     #[test]

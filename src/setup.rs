@@ -256,5 +256,6 @@ pub fn chart_opts(cli: &Cli, spec: &SourceSpec, analysis: Analysis) -> Result<Ch
             .transpose()
             .context("--forecast")?,
         tidy: false,
+        front: cli.front.clone(),
     })
 }

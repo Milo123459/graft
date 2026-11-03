@@ -105,6 +105,8 @@ pub struct ChartOpts {
 
     /// Short titles: no [log]/[forecast] tags, panes don't repeat the chart's title.
     pub tidy: bool,
+    /// Series drawn on top of the others (the first listed topmost).
+    pub front: Vec<String>,
 }
 
 impl Default for ChartOpts {
@@ -133,6 +135,7 @@ impl Default for ChartOpts {
             marks: Vec::new(),
             show_targets: true,
             tidy: false,
+            front: Vec::new(),
         }
     }
 }
@@ -1355,7 +1358,17 @@ impl<'a> ChartWidget<'a> {
         if raw_shown {
             // Under trend lines the raw data takes a darker shade of the series colour,
             // so each trend is clearly distinct from (but matches) its data.
-            for (i, s, pts) in lines.iter().filter(|l| !is_ohlc(l.1)) {
+            // Series in front are drawn last (the first listed last of all).
+            let rank = |s: &Series| {
+                self.opts
+                    .front
+                    .iter()
+                    .position(|f| *f == s.name)
+                    .map_or(0, |p| self.opts.front.len() - p)
+            };
+            let mut order: Vec<&Prepared> = lines.iter().filter(|l| !is_ohlc(l.1)).collect();
+            order.sort_by_key(|l| rank(l.1));
+            for (i, s, pts) in order {
                 let color = self.opts.color(*i);
                 let style = Style::default().fg(if trends.is_empty() {
                     color
@@ -2365,6 +2378,9 @@ pub fn pane_view(ds: &Dataset, opts: &ChartOpts, pane: &panes::Pane) -> (Dataset
         sub.show_raw = l.live;
         sub.trends = l.trends.clone();
     }
+    if !pane.front.is_empty() {
+        sub.front = pane.front.clone();
+    }
     let picked: Vec<usize> = if pane.series.is_empty() {
         (0..ds.series.len()).collect()
     } else {
@@ -2787,6 +2803,42 @@ mod tests {
         };
         let buf = render_to_buffer(&two, &opts, 40, 16);
         assert!(!buf.content.iter().any(|c| c.symbol() == "█"));
+    }
+
+    #[test]
+    fn series_in_front_are_drawn_on_top() {
+        let line = |name: &str| Series {
+            name: name.into(),
+            unit: Unit::default(),
+            points: (0..20).map(|i| (f64::from(i), 5.0)).collect(),
+        };
+        let ds = Dataset {
+            x_kind: XKind::Index,
+            series: vec![line("rsi"), line("level")],
+        };
+        let colors = |opts: &ChartOpts| -> Vec<Color> {
+            let buf = render_to_buffer(&ds, opts, 40, 12);
+            let mut seen: Vec<Color> = buf
+                .content
+                .iter()
+                .filter(|c| {
+                    c.symbol()
+                        .chars()
+                        .all(|ch| ('\u{2801}'..='\u{28FF}').contains(&ch))
+                })
+                .map(|c| c.fg)
+                .collect();
+            seen.dedup();
+            seen
+        };
+        let opts = ChartOpts::default();
+        // Normally the later series is on top; front= puts rsi there.
+        assert_eq!(colors(&opts), [opts.color(1)]);
+        let front = ChartOpts {
+            front: vec!["rsi".into()],
+            ..ChartOpts::default()
+        };
+        assert_eq!(colors(&front), [opts.color(0)]);
     }
 
     #[test]

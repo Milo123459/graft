@@ -248,7 +248,7 @@ graft -c 'curl -s --json "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"{coin
   --line 'macd = macd(values("close"))' --line 'signal = ema(values("macd"), 9)' \
   --mark 'name == "ema30" && prev < ema50_prev && value >= ema50 => golden cross | ▲ cyan badge' \
   --mark 'name == "ema30" && prev > ema50_prev && value <= ema50 => death cross | ▼ magenta badge' \
-  --pane 'open,high,low,close,ema30,ema50 kind=candles title={coin} {interval}' --pane 'rsi14,overbought,oversold' --pane 'macd,signal' --pane volume \
+  --pane 'open,high,low,close,ema30,ema50 kind=candles title={coin} {interval}' --pane 'rsi14,overbought,oversold front=rsi14' --pane 'macd,signal front=macd' --pane volume \
   --layout '1 /60% ((2 | 3) / 4)' --title '{coin} {interval}'
 ```
 
@@ -414,7 +414,7 @@ time. `{sum}` in `--stats-template` gives the total.
 |---|---|
 | `-k line\|scatter\|bar\|histogram\|sparkline\|stat\|candles` | chart type (bar = latest values; stat = a tile per series with the value in big digits, its change, trend, target ETA and a sparkline — good as a pane above a chart; candles = candlesticks from series named open/high/low/close or o/h/l/c, else the first four, with any other series as lines over them) |
 | `--split` | one panel per series, each with its own y axis |
-| `--pane 'node1 kind=bar lines=live,avg'` | panes: several charts in one view (repeat `--pane`); each picks series (`*` = all), `kind=`, `lines=`, `source=` (another preset, saved profile or recent chart, with its own command and format) and `title=` (last: the rest of the spec; `{name}` fills in a source setting) |
+| `--pane 'node1 kind=bar lines=live,avg'` | panes: several charts in one view (repeat `--pane`); each picks series (`*` = all), `kind=`, `lines=`, `front=` (series drawn on top of the others, e.g. an RSI over its 70/30 lines; `--front` without panes, `front("rsi14")` in the console), `source=` (another preset, saved profile or recent chart, with its own command and format) and `title=` (last: the rest of the spec; `{name}` fills in a source setting) |
 | `--layout '(1 \| 2) / 3'` | how panes are arranged: `\|` side by side, `/` stacked, `\|60%` sizes (default: two side by side, more in a grid) |
 | `-m braille\|dot\|block\|half-block\|bar` | marker |
 | `--log`, `--ymin 0`, `--ymax 500GB` | y axis |
