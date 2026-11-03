@@ -216,27 +216,6 @@ enum Hit {
     MenuBackground,
 }
 
-/// Which layout to draw (a prototype setting: `GRAFT_UI=compact`, `minimal`,
-/// `sidebar`; anything else is the classic one).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UiStyle {
-    Classic,
-    Compact,
-    Minimal,
-    Sidebar,
-}
-
-impl UiStyle {
-    fn from_env() -> Self {
-        match std::env::var("GRAFT_UI").as_deref() {
-            Ok("compact") => Self::Compact,
-            Ok("minimal") => Self::Minimal,
-            Ok("sidebar") => Self::Sidebar,
-            _ => Self::Classic,
-        }
-    }
-}
-
 /// Tab completion in progress.
 #[derive(Debug, Clone)]
 struct TabCycle {
@@ -467,8 +446,6 @@ pub struct App {
     pane_menu: bool,
     /// Text to put on the clipboard (written to the terminal by the event loop).
     clipboard: Option<String>,
-    /// The layout (prototypes).
-    pub ui: UiStyle,
     /// The sources menu is open.
     sources_menu: bool,
     /// The source the builder is to edit: `Some(None)` is a new one.
@@ -596,7 +573,6 @@ impl App {
             tutorial,
             console_note: None,
             sources_menu: false,
-            ui: UiStyle::from_env(),
             source_to_edit: None,
             error_at: None,
             tab_cycle: None,
@@ -3309,22 +3285,20 @@ impl App {
         });
     }
 
-    // ───────────── layout prototypes (GRAFT_UI) ─────────────
+    // ───────────── toolbar and legend row ─────────────
 
-    /// The chart options as this layout draws them.
+    /// The chart options as the viewer draws them: the legend is the row below the
+    /// chart, and titles stay short.
     fn view_opts(&self) -> ChartOpts {
         let mut o = self.opts.clone();
-        if self.ui != UiStyle::Classic {
-            o.tidy = true;
-            o.legend = crate::cli::LegendPos::None;
-        }
-        o.frameless = self.ui == UiStyle::Minimal;
+        o.tidy = true;
+        o.legend = crate::cli::LegendPos::None;
         o
     }
 
     /// The short toolbar: what's used most, zoom controls only while zoomed in,
     /// everything else under ⋯.
-    fn compact_toolbar(&self) -> Vec<Button<Hit>> {
+    fn toolbar(&self) -> Vec<Button<Hit>> {
         let full = self.toolbar_with(true);
         let pick = |c: Cmd| full.iter().find(|b| b.action == Hit::Cmd(c)).cloned();
         let mut v: Vec<Button<Hit>> = Vec::new();
@@ -3411,24 +3385,50 @@ impl App {
             ("■", Style::default().fg(Color::DarkGray))
         };
         let mut head = vec![(format!("{dot} "), style)];
-        let time = match self.cursor {
-            Some(c) => Some((
-                self.ds.fmt_x(crate::render::round_x(&self.ds, c), 1.0),
-                Color::Yellow,
-            )),
-            None => self
-                .ds
-                .x_range()
-                .map(|r| (self.ds.fmt_x(r.1, 1.0), Color::Gray)),
+        // With the date when the data covers more than a day; else to the second.
+        let span = self.ds.x_range().map_or(0.0, |r| r.1 - r.0);
+        let when = |x: f64| {
+            if span > 86_400.0 {
+                self.ds.fmt_x_full(x)
+            } else {
+                self.ds.fmt_x(x, 1.0)
+            }
         };
+        let time = match self.cursor {
+            Some(c) => Some((when(crate::render::round_x(&self.ds, c)), Color::Yellow)),
+            None => self.ds.x_range().map(|r| (when(r.1), Color::Gray)),
+        };
+        if self.cursor.is_some() {
+            // Not the newest data: say so.
+            head.push(("cursor ".into(), Style::default().fg(Color::Yellow)));
+        }
         if let Some((t, c)) = time {
             head.push((t, Style::default().fg(c).add_modifier(Modifier::BOLD)));
         }
         g.push((head, None));
-        if !self.firing.is_empty() {
+        // Lines are arriving but the format matches none of them: say so, rather than
+        // leaving an empty chart.
+        if self.session.matched == 0 && self.session.lines > 0 {
             g.push((
                 vec![(
-                    format!(" ALERT ({}) ", self.firing.len()),
+                    format!(
+                        " {} lines read, none matched the format — press F to fix it ",
+                        self.session.lines
+                    ),
+                    Style::default().fg(Color::Black).bg(Color::Yellow),
+                )],
+                Some(Hit::Cmd(Cmd::Format)),
+            ));
+        }
+        if !self.firing.is_empty() {
+            // One alert: what it is; several: how many (the alerts menu lists them).
+            let text = match self.firing.as_slice() {
+                [one] => format!(" ALERT {one} "),
+                all => format!(" ALERT ({}) ", all.len()),
+            };
+            g.push((
+                vec![(
+                    text,
                     Style::default()
                         .fg(Color::White)
                         .bg(Color::Red)
@@ -3455,6 +3455,32 @@ impl App {
             }
             g.push((parts, Some(Hit::Series(i))));
         }
+        // Target lines, with what they're at.
+        if self.opts.show_targets {
+            for (i, s) in self.ds.series.iter().enumerate() {
+                if self.hidden.contains(&s.name) {
+                    continue;
+                }
+                if let Some(t) = self.opts.analysis.targets.explicit(&s.name) {
+                    g.push((
+                        vec![(
+                            format!("┄ {} target {}", s.name, s.unit.format(t)),
+                            Style::default().fg(self.opts.color(i)),
+                        )],
+                        Some(Hit::Cmd(Cmd::Targets)),
+                    ));
+                }
+            }
+        }
+        if !self.mouse {
+            g.push((
+                vec![(
+                    "mouse off · m turns it back on".into(),
+                    Style::default().fg(Color::DarkGray),
+                )],
+                None,
+            ));
+        }
         if let Some(m) = self
             .message
             .as_ref()
@@ -3471,7 +3497,7 @@ impl App {
     }
 
     /// Where each legend group goes: (row, column) per group, and the rows used.
-    fn legend_layout(&self, width: u16, menu: bool) -> (Vec<Option<(u16, u16)>>, u16) {
+    fn legend_layout(&self, width: u16) -> (Vec<Option<(u16, u16)>>, u16) {
         let gap = 3;
         let mut out = Vec::new();
         let (mut row, mut x) = (0u16, 0u16);
@@ -3480,8 +3506,7 @@ impl App {
                 .iter()
                 .map(|p| unicode_width::UnicodeWidthStr::width(p.0.as_str()) as u16)
                 .sum();
-            // The first row leaves room for ☰.
-            let room = width.saturating_sub(if menu && row == 0 { 4 } else { 0 });
+            let room = width;
             if x > 0 && x + w > room {
                 if row == 2 {
                     out.push(None);
@@ -3497,14 +3522,14 @@ impl App {
         (out, row + 1)
     }
 
-    fn legend_height(&self, width: u16, menu: bool) -> u16 {
-        self.legend_layout(width, menu).1
+    fn legend_height(&self, width: u16) -> u16 {
+        self.legend_layout(width).1
     }
 
     /// Live/paused, the time (newest, or the cursor's), and each series with its
-    /// value: tap one to hide it. `menu`: a ☰ at the end of the first row.
-    fn draw_legend_row(&self, f: &mut Frame, area: Rect, menu: bool) {
-        let (places, _) = self.legend_layout(area.width, menu);
+    /// value: tap one to hide it.
+    fn draw_legend_row(&self, f: &mut Frame, area: Rect) {
+        let (places, _) = self.legend_layout(area.width);
         let buf = f.buffer_mut();
         for ((parts, hit), place) in self.legend_groups().into_iter().zip(places) {
             let Some((row, col)) = place else { continue };
@@ -3530,158 +3555,6 @@ impl App {
                     },
                     h,
                 );
-            }
-        }
-        if menu {
-            let r = Rect {
-                x: area.right().saturating_sub(3),
-                y: area.y,
-                width: 3,
-                height: 1,
-            };
-            let style = if self.toolbar_more {
-                Style::default()
-                    .fg(Color::Indexed(81))
-                    .bg(Color::Indexed(238))
-            } else {
-                Style::default()
-                    .fg(Color::Indexed(250))
-                    .bg(Color::Indexed(236))
-            };
-            buf.set_string(r.x, r.y, " ☰ ", style);
-            self.hits.push(r, Hit::Cmd(Cmd::More));
-        }
-    }
-
-    /// A column on the right: the time, the series with their values, the buttons.
-    fn draw_sidebar(&self, f: &mut Frame, area: Rect) {
-        let buf = f.buffer_mut();
-        let dim = Style::default().fg(Color::Indexed(238));
-        for y in area.y..area.bottom() {
-            buf.set_string(area.x, y, "│", dim);
-        }
-        let inner = Rect {
-            x: area.x + 2,
-            width: area.width.saturating_sub(3),
-            ..area
-        };
-        let mut y = inner.y;
-        let (dot, style, what) = if self.paused {
-            ("⏸ ", Style::default().fg(Color::Yellow), "paused")
-        } else if self.live.spec.is_live() && !self.live.eof {
-            ("● ", Style::default().fg(Color::Green), "live")
-        } else {
-            ("■ ", Style::default().fg(Color::DarkGray), "")
-        };
-        buf.set_string(inner.x, y, format!("{dot}{what}"), style);
-        y += 1;
-        let time = match self.cursor {
-            Some(c) => Some((
-                format!(
-                    "cursor {}",
-                    self.ds.fmt_x(crate::render::round_x(&self.ds, c), 1.0)
-                ),
-                Color::Yellow,
-            )),
-            None => self
-                .ds
-                .x_range()
-                .map(|r| (self.ds.fmt_x(r.1, 1.0), Color::Gray)),
-        };
-        if let Some((t, c)) = time {
-            buf.set_string(
-                inner.x,
-                y,
-                t,
-                Style::default().fg(c).add_modifier(Modifier::BOLD),
-            );
-        }
-        y += 2;
-        for (i, name, color, value, shown) in self.legend_items() {
-            if y + 1 >= inner.bottom() {
-                break;
-            }
-            let marker = if shown { "●" } else { "○" };
-            buf.set_string(inner.x, y, marker, Style::default().fg(color));
-            let name_style = if shown {
-                Style::default().fg(Color::White)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let name: String = name
-                .chars()
-                .take(inner.width.saturating_sub(2) as usize)
-                .collect();
-            buf.set_string(inner.x + 2, y, &name, name_style);
-            if shown && let Some(v) = value {
-                let w = unicode_width::UnicodeWidthStr::width(v.as_str()) as u16;
-                buf.set_string(
-                    inner.right().saturating_sub(w),
-                    y + 1,
-                    &v,
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                );
-            }
-            self.hits.push(
-                Rect {
-                    x: inner.x,
-                    y,
-                    width: inner.width,
-                    height: 2,
-                },
-                Hit::Series(i),
-            );
-            y += 2;
-        }
-        y += 1;
-        // The buttons, one per row.
-        let buttons = self.compact_toolbar();
-        let n = buttons.len() as u16;
-        let msg_rows = 3;
-        let start = y.max(inner.bottom().saturating_sub(n + msg_rows));
-        for (k, b) in buttons.iter().enumerate() {
-            let by = start + k as u16;
-            if by >= inner.bottom().saturating_sub(msg_rows) {
-                break;
-            }
-            let r = Rect {
-                x: inner.x,
-                y: by,
-                width: inner.width,
-                height: 1,
-            };
-            let style = if b.active {
-                Style::default()
-                    .fg(Color::Indexed(81))
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Indexed(250))
-            };
-            buf.set_string(
-                r.x,
-                r.y,
-                format!("{:<w$}", b.label, w = r.width as usize),
-                style,
-            );
-            self.hits.push(r, b.action);
-        }
-        // Messages at the bottom.
-        if let Some(m) = self
-            .message
-            .as_ref()
-            .filter(|m| m.at.elapsed() < Duration::from_secs(8) || m.error)
-        {
-            let style = if m.error {
-                Style::default().fg(Color::LightRed)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            for (k, l) in wrap(&m.text, inner.width as usize)
-                .into_iter()
-                .take(msg_rows as usize)
-                .enumerate()
-            {
-                buf.set_string(inner.x, inner.bottom() - msg_rows + k as u16, l, style);
             }
         }
     }
@@ -5532,10 +5405,6 @@ impl App {
 
     // ───────────── drawing ─────────────
 
-    fn toolbar(&self) -> Vec<Button<Hit>> {
-        self.toolbar_with(self.toolbar_more)
-    }
-
     /// The toolbar, with the buttons under ⋯ (`more`) or without.
     fn toolbar_with(&self, more: bool) -> Vec<Button<Hit>> {
         let b = |l: &str, c: Cmd| Button::new(l, Hit::Cmd(c));
@@ -5678,20 +5547,6 @@ impl App {
         if tut_h > 0 {
             self.draw_tutorial(f, tut_area);
         }
-        // Prototype layouts: a sidebar on wide screens (else compact).
-        let sidebar = self.ui == UiStyle::Sidebar && area.width >= 90;
-        let ui = match self.ui {
-            UiStyle::Sidebar if !sidebar => UiStyle::Compact,
-            u => u,
-        };
-        let area = if sidebar {
-            let [main, side] =
-                Layout::horizontal([Constraint::Min(40), Constraint::Length(28)]).areas(area);
-            self.draw_sidebar(f, side);
-            main
-        } else {
-            area
-        };
         let n_stats = self
             .ds
             .series
@@ -5703,32 +5558,14 @@ impl App {
         } else {
             0
         };
-        let chips = self.chips();
-        let toolbar = match ui {
-            UiStyle::Classic => self.toolbar(),
-            UiStyle::Compact => self.compact_toolbar(),
-            UiStyle::Minimal if self.toolbar_more => self.compact_toolbar(),
-            _ => Vec::new(),
-        };
-        let toolbar: Vec<Button<Hit>> = if sidebar { Vec::new() } else { toolbar };
-        let (chips_h, tool_h) = if self.mouse {
-            (
-                if ui == UiStyle::Classic {
-                    flow_height(&chips, area.width).min(2)
-                } else {
-                    0
-                },
-                flow_height(&toolbar, area.width),
-            )
+        let toolbar = self.toolbar();
+        let tool_h = if self.mouse {
+            flow_height(&toolbar, area.width)
         } else {
-            (0, 0)
+            0
         };
-        let status_h = match ui {
-            _ if sidebar => 0,
-            UiStyle::Classic => 1,
-            UiStyle::Minimal => self.legend_height(area.width, self.mouse),
-            _ => self.legend_height(area.width, false),
-        };
+        // The legend row: live, the time, each series and its value.
+        let status_h = self.legend_height(area.width);
         let (hint_line, hint_buttons) = self.hint_rows(area.width);
         let console_top = std::cell::Cell::new(area.bottom());
         let console_h = u16::from(self.console.is_some())
@@ -5741,7 +5578,6 @@ impl App {
             chart,
             pane_area,
             stats,
-            chips_area,
             tool_area,
             note_area,
             status,
@@ -5750,7 +5586,6 @@ impl App {
             Constraint::Min(6),
             Constraint::Length(pane_h),
             Constraint::Length(stats_h),
-            Constraint::Length(chips_h),
             Constraint::Length(tool_h),
             Constraint::Length(note_h),
             Constraint::Length(status_h),
@@ -5781,22 +5616,12 @@ impl App {
             self.draw_stats(f, stats);
         }
         if self.mouse {
-            if ui == UiStyle::Classic {
-                self.draw_chips(&chips, chips_area, f);
-                render_buttons(&toolbar, tool_area, f.buffer_mut(), &self.hits);
-            } else {
-                crate::ui::render_buttons_quiet(&toolbar, tool_area, f.buffer_mut(), &self.hits);
-            }
+            crate::ui::render_buttons_quiet(&toolbar, tool_area, f.buffer_mut(), &self.hits);
         }
         if note_h > 0 {
             f.render_widget(Paragraph::new(note), note_area);
         }
-        match ui {
-            _ if sidebar => {}
-            UiStyle::Classic => f.render_widget(Paragraph::new(self.status_line()), status),
-            UiStyle::Minimal => self.draw_legend_row(f, status, self.mouse),
-            _ => self.draw_legend_row(f, status, false),
-        }
+        self.draw_legend_row(f, status);
         if let Some(input) = &self.console {
             console_top.set(console.y);
             // Hints above the input line.
@@ -5974,39 +5799,6 @@ impl App {
         }
     }
 
-    fn draw_chips(&self, chips: &[Button<Hit>], area: Rect, f: &mut Frame) {
-        let (rects, _) = crate::ui::flow(chips, area.width);
-        for ((i, chip), r) in chips.iter().enumerate().zip(rects) {
-            if r.y >= area.height {
-                break;
-            }
-            let rect = Rect {
-                x: area.x + r.x,
-                y: area.y + r.y,
-                ..r
-            };
-            // No backgrounds: a coloured marker and the name, dimmed when hidden.
-            let color = self.opts.color(i);
-            let (mark, name) = chip.label.split_once(' ').unwrap_or(("●", &chip.label));
-            let line = if chip.active {
-                Line::from(vec![
-                    Span::styled(format!(" {mark} "), Style::default().fg(color)),
-                    Span::styled(
-                        format!("{name} "),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                ])
-            } else {
-                Line::from(Span::styled(
-                    format!(" {mark} {name} "),
-                    Style::default().fg(Color::DarkGray),
-                ))
-            };
-            f.render_widget(line, rect);
-            self.hits.push(rect, chip.action);
-        }
-    }
-
     /// The console's output, wrapped: an error stays while you fix it, a result for
     /// a while (or until the next command).
     fn note_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -6040,136 +5832,6 @@ impl App {
             .collect();
         lines.truncate(4);
         lines
-    }
-
-    fn status_line(&self) -> Line<'_> {
-        let dim = Style::default().fg(Color::DarkGray);
-        let mut spans = Vec::new();
-        spans.push(if self.paused {
-            Span::styled("⏸ paused ", Style::default().fg(Color::Yellow))
-        } else if self.live.spec.is_live() && !self.live.eof {
-            Span::styled("● live ", Style::default().fg(Color::Green))
-        } else {
-            Span::styled("■ ", dim)
-        });
-        // Lines are arriving but the format matches none of them: say so, rather than
-        // leaving "waiting for data…" on screen.
-        if self.session.matched == 0 && self.session.lines > 0 {
-            spans.push(Span::styled(
-                format!(
-                    " {} lines read, none matched the format — press F to see them and fix it ",
-                    self.session.lines
-                ),
-                Style::default().fg(Color::Black).bg(Color::Yellow),
-            ));
-            spans.push(Span::raw(" "));
-        }
-        for a in &self.firing {
-            spans.push(Span::styled(
-                format!(" ALERT {a} "),
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Red)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::raw(" "));
-        }
-        let message = self
-            .message
-            .as_ref()
-            .filter(|m| m.at.elapsed() < Duration::from_secs(8) || m.error);
-        if let Some(c) = self.cursor {
-            // Not the newest data: say so (console results can be about either).
-            spans.push(Span::styled("cursor ", Style::default().fg(Color::Yellow)));
-            spans.push(Span::styled(
-                self.ds.fmt_x_full(crate::render::round_x(&self.ds, c)),
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
-            for (i, s) in self
-                .ds
-                .series
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| !self.hidden.contains(&s.name))
-            {
-                if let Some((y, projected)) = value_at(s, &self.opts, c) {
-                    spans.push(Span::styled(
-                        format!("  {}=", s.name),
-                        Style::default().fg(self.opts.color(i)),
-                    ));
-                    spans.push(Span::raw(format!(
-                        "{}{}",
-                        if projected { "≈" } else { "" },
-                        s.unit.format(y)
-                    )));
-                }
-            }
-            if let Some(m) = message {
-                spans.push(Span::styled(
-                    format!("   {}", m.text),
-                    if m.error {
-                        Style::default().fg(Color::LightRed)
-                    } else {
-                        dim
-                    },
-                ));
-            }
-        } else if let Some(m) = message {
-            spans.push(Span::styled(
-                m.text.clone(),
-                if m.error {
-                    Style::default().fg(Color::LightRed)
-                } else {
-                    Style::default()
-                },
-            ));
-        } else if let Some(latest) = self
-            .ds
-            .series
-            .iter()
-            .filter(|s| !self.hidden.contains(&s.name))
-            .filter_map(|s| s.points.last().map(|p| p.0))
-            .reduce(f64::max)
-        {
-            // Nothing picked: the newest data, as it comes in.
-            spans.push(Span::styled("latest ", dim));
-            spans.push(Span::styled(
-                self.ds.fmt_x_full(crate::render::round_x(&self.ds, latest)),
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
-            for (i, s) in self
-                .ds
-                .series
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| !self.hidden.contains(&s.name))
-            {
-                if let Some(&(_, y)) = s.points.last() {
-                    spans.push(Span::styled(
-                        format!("  {}=", s.name),
-                        Style::default().fg(self.opts.color(i)),
-                    ));
-                    spans.push(Span::raw(s.unit.format(y)));
-                }
-            }
-            let hint = if self.mouse {
-                "tap to inspect · drag to measure · ? help"
-            } else {
-                "mouse off · m turns it back on · ? help · q quit"
-            };
-            spans.push(Span::styled(format!("   {hint}"), dim));
-        } else {
-            let hint = if self.mouse {
-                "tap to inspect · drag to measure · ? help"
-            } else {
-                "mouse off · m turns it back on · ? help · q quit"
-            };
-            spans.push(Span::styled(hint, dim));
-        }
-        if self.selection.is_some() || self.anchor.is_some() {
-            spans.push(Span::styled("   Esc clears the range", dim));
-        }
-        Line::from(spans)
     }
 
     fn draw_stats(&self, f: &mut Frame, area: Rect) {
@@ -6491,7 +6153,9 @@ pub(crate) mod tests {
         let mut app = app(&["graft", LOG]);
         key(&mut app, KeyCode::Home);
         assert_eq!(app.cursor, app.ds.x_range().map(|r| r.0));
-        assert!(screen(&app).contains("2026-11-01 04:00  node1=59.9 GB  node2=422.6 GB"));
+        assert!(
+            screen(&app).contains("cursor 2026-11-01 04:00   ● node1 59.9 GB   ● node2 422.6 GB")
+        );
         key(&mut app, KeyCode::Char('v'));
         (0..6).for_each(|_| {
             key(&mut app, KeyCode::Char('.'));
@@ -6764,6 +6428,9 @@ pub(crate) mod tests {
             mouse(app, MouseEventKind::Down(MouseButton::Left), col, row);
             mouse(app, MouseEventKind::Up(MouseButton::Left), col, row);
         };
+        // measure is under ⋯.
+        let (x, y) = find(&app, " ⋯ ");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
         let (x, y) = find(&app, " measure ");
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
         assert!(app.measuring);
@@ -6856,7 +6523,7 @@ pub(crate) mod tests {
         assert!(!app.lines_menu);
         let s = screen(&app);
         assert!(
-            s.contains("lines: avg + median") && s.contains("node1 avg"),
+            s.contains("lines: avg + median") && !s.contains("node1 live"),
             "{s}"
         );
         let cli = app.current_cli();
@@ -8363,8 +8030,8 @@ pub(crate) mod tests {
         assert!(t.contains(" · at the cursor ("), "{t}");
         assert!(out(&mut app, r#"at("api")"#).1.contains("at the cursor"));
         assert!(
-            screen(&app).contains("cursor 2"),
-            "the status line says it's the cursor"
+            screen(&app).contains("cursor 09:") || screen(&app).contains("cursor 1"),
+            "the legend row says it's the cursor"
         );
         // `5m` is five minutes.
         // A line from series by name is a real line, not a flat one.
@@ -8438,7 +8105,15 @@ pub(crate) mod tests {
         key(&mut app, KeyCode::Esc);
         key(&mut app, KeyCode::Char(':'));
         type_str(&mut app, r#"max("d"#);
-        let (x, y) = find(&app, " db ");
+        // (The suggestion in the hint row, not db in the legend row.)
+        let s = screen(&app);
+        let (y, line) = s
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains(" Tab ") && l.contains(" db "))
+            .expect("hint row");
+        let x = line[..line.find(" db ").unwrap()].chars().count() as u16;
+        let y = y as u16;
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
         assert_eq!(app.console.as_ref().unwrap().value, r#"max("db""#);
         type_str(&mut app, ")");
@@ -8494,49 +8169,6 @@ pub(crate) mod tests {
         key(&mut app, KeyCode::Char('S'));
         shot(&app, "sources", 46, 30);
         shot(&app, "sources-wide", 110, 34);
-    }
-
-    #[test]
-    #[ignore]
-    fn write_ui_variants() {
-        let dir = std::env::var("GRAFT_SNAPSHOTS").unwrap();
-        let shot = |app: &App, name: &str, w: u16, h: u16| {
-            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-            term.draw(|f| app.draw(f)).unwrap();
-            let ans = crate::render::ansi::to_ansi(term.backend().buffer(), true);
-            std::fs::write(format!("{dir}/{name}.ans"), ans).unwrap();
-        };
-        for ui in [
-            UiStyle::Classic,
-            UiStyle::Compact,
-            UiStyle::Minimal,
-            UiStyle::Sidebar,
-        ] {
-            let tag = format!("{ui:?}").to_lowercase();
-            let mut app = tutorial_app();
-            app.tutorial = None;
-            app.ui = ui;
-            app.message = None;
-            shot(&app, &format!("{tag}-plain"), 110, 34);
-            shot(&app, &format!("{tag}-phone"), 46, 40);
-            key(&mut app, KeyCode::Char('s'));
-            run(&mut app, r#"lines("live,avg"); forecast("10m")"#);
-            app.console_note = None;
-            key(&mut app, KeyCode::Char('c'));
-            shot(&app, &format!("{tag}-busy"), 110, 34);
-            let mut app = tutorial_app();
-            app.tutorial = None;
-            app.ui = ui;
-            run(&mut app, r#"layout("(1 | 2) / (3 | 4)")"#);
-            run(&mut app, r#"focus_pane(1); pane("web,api kind=bar")"#);
-            run(&mut app, r#"focus_pane(2); pane("api lines=live,avg")"#);
-            run(&mut app, r#"focus_pane(3); pane("db kind=histogram")"#);
-            run(&mut app, r#"focus_pane(4); pane("web,api,db kind=stat")"#);
-            run(&mut app, "focus_pane(2)");
-            app.console_note = None;
-            app.message = None;
-            shot(&app, &format!("{tag}-panes"), 110, 34);
-        }
     }
 
     #[test]

@@ -110,7 +110,7 @@ Each step explains a feature, its keys and some examples, then asks you to try i
     },
     Step {
         title: "the screen",
-        text: r#"From the top: the chart, with a legend of each series' latest value; the series chips (● web ● api ● db); the toolbar, where every button also has a key; and the status line: live or paused, the time of the newest data, and messages.
+        text: r#"From the top: the chart; the toolbar (the buttons you use most, the rest under ⋯, and every button has a key); and the legend row: live or paused, the time of the newest data (or the cursor's), then each series with its value. Tap a series there to hide it.
 graft works the same with a mouse, a keyboard or a phone over ssh: tap where you'd click."#,
         keys: &[
             ("? (button too)", "every key on one screen"),
@@ -140,10 +140,10 @@ graft works the same with a mouse, a keyboard or a phone over ssh: tap where you
     },
     Step {
         title: "read a value",
-        text: r#"The cursor is a vertical line: the status line shows its time and every series' value there. It stays where you put it as new data arrives. Past the newest point it reads the forecast (a later step)."#,
+        text: r#"The cursor is a vertical line: the legend row shows "cursor" and its time, and every series' value there. It stays where you put it as new data arrives. Past the newest point it reads the forecast (a later step)."#,
         keys: &[
             (
-                "tap / c / cursor",
+                "tap / c / ⋯ → cursor",
                 "put the cursor down (c again removes it)",
             ),
             ("drag", "scrub through the data"),
@@ -172,7 +172,10 @@ graft works the same with a mouse, a keyboard or a phone over ssh: tap where you
             ("+ − / ↑ ↓", "zoom in / out"),
             ("◀ ▶ / ← → / h l", "move along (when zoomed in)"),
             ("H L", "move half a screen"),
-            ("show all / 0", "everything again"),
+            (
+                "show all / 0",
+                "everything again (show all appears while zoomed in)",
+            ),
         ],
         examples: &[
             (r#":zoom("5m")"#, "just the last 5 minutes"),
@@ -210,7 +213,7 @@ It covers the timeframe, or a measured stretch: the next step."#,
         title: "measure a stretch",
         text: r#"Pick a stretch of time and the stats cover just that: how bad was that spike, what was the average during the deploy? Stat tiles, bar charts and other panes follow it too, and so do console functions like mean()."#,
         keys: &[
-            ("v / measure", "then tap the start and the end"),
+            ("v / ⋯ → measure", "then tap the start and the end"),
             ("drag", "or drag across the chart"),
             ("Shift+click", "from the cursor to here"),
             ("Esc", "clear it"),
@@ -222,15 +225,15 @@ It covers the timeframe, or a measured stretch: the next step."#,
                 "how much it changed across it, in %",
             ),
         ],
-        task: Some("tap measure (or press v), then tap a start and an end — or drag across"),
+        task: Some("press v (or ⋯ → measure), then tap a start and an end — or drag across"),
         check: Check::Selected,
         ..BASE
     },
     Step {
         title: "hide a series",
-        text: r#"Each chip is a series: ● shown, ○ hidden. Hiding one rescales the y axis to what's left, handy when one series dwarfs the rest (db's spikes here). Hidden series are still read, so showing them again loses nothing."#,
+        text: r#"The legend row under the chart lists the series: ● shown, ○ hidden. Hiding one rescales the y axis to what's left, handy when one series dwarfs the rest (db's spikes here). Hidden series are still read, so showing them again loses nothing."#,
         keys: &[
-            ("tap a chip / 1–9", "show or hide that series"),
+            ("tap one / 1–9", "show or hide that series"),
             ("a", "show them all"),
         ],
         examples: &[
@@ -242,7 +245,7 @@ It covers the timeframe, or a measured stretch: the next step."#,
             ),
             (r#"--bind 'x = toggle("db")'"#, "your own key for it"),
         ],
-        task: Some("tap a chip like ● db (or press 1, 2, 3). a shows them all again"),
+        task: Some("tap db in the legend row (or press 1, 2, 3). a shows them all again"),
         check: Check::Hidden,
         ..BASE
     },
@@ -307,7 +310,7 @@ Each uses the last N points, the window (10% of the data, at least 10). With any
         text: r#"A forecast continues each trend past the newest point, dashed. Move the cursor into it to read future values. The trend is a straight line (same change per hour); --fit exp makes it the same % per hour, for things that grow.
 api is slowly getting slower here. Give it a target and the stats say when it gets there."#,
         keys: &[
-            ("f / forecast", "forecast on/off"),
+            ("f / ⋯ → forecast", "forecast on/off"),
             ("G / targets", "target lines on/off"),
         ],
         examples: &[
@@ -319,7 +322,7 @@ api is slowly getting slower here. Give it a target and the stats say when it ge
             (r#":eta("api", 60ms)"#, "seconds until then, in the console"),
             ("--fit-window 10m", "fit only the last 10 minutes"),
         ],
-        task: Some("tap forecast (or press f)"),
+        task: Some("press f (or ⋯ → forecast)"),
         check: Check::Forecast,
         ..BASE
     },
@@ -333,7 +336,10 @@ api is slowly getting slower here. Give it a target and the stats say when it ge
             ),
             ("b", "point style: braille, dots, blocks, bars"),
             ("y / log", "log scale, for values spanning 10× or more"),
-            ("x / split", "a panel per series, each with its own y axis"),
+            (
+                "x / ⋯ → split",
+                "a panel per series, each with its own y axis",
+            ),
         ],
         examples: &[
             ("--kind histogram", "start as a histogram"),

@@ -480,7 +480,8 @@ including over SSH from a phone.
 | drag the cursor line | scrub through the data, and past it into the forecast |
 | **measure**, then tap start and end (or drag across, or click then **shift+click**) | stats for just that stretch, including how much each series *changed*; tap again to clear |
 | scroll | zoom around the pointer (sideways or shift + scroll moves); never past your data |
-| toolbar / series chips | ◀ ▶ (move; ▶ at the newest data shows everything) + − **show all** cursor measure stats **lines** (menu) **side by side** forecast split **all time ▾** (menu); `⋯` shows more: targets, chart type, log, follow, pause, format, console, export, mouse, help, quit |
+| toolbar | **lines ▾** **all time ▾** **stats** **panes** **sources**, plus ↶ undo, **markers** and **alerts** once there are some, and ◀ ▶ **show all** while zoomed in; `⋯` shows the rest: + − cursor measure side by side forecast split targets, chart type, log, follow, pause, format, save, copy, console, export, mouse, help, quit |
+| legend row | under the chart: live or paused, the time of the newest data (or **cursor** and its time), each series with its value (at the cursor, if there is one), target lines and a firing alert. Tap a series to hide or show it |
 
 **Timeframe** (anything on a time axis — log timestamps, or arrival times for
 live commands like `ping`): tap **all time ▾** (or press `r`) for a dropdown
@@ -493,7 +494,7 @@ all use the chosen timeframe.
 **Lines:** tap **lines: live** (or press `T`) for a menu where you tick any mix
 of **live**, **average**, **median** and **p95**, and make the rolling window
 bigger or smaller (`+` / `−`, shown in points and time). Each line's value is in
-the legend and the cursor readout. Ping-style data (mostly low with spikes)
+the cursor readout. Ping-style data (mostly low with spikes)
 shows why you might want several: the average is pulled up by the spikes, the
 median shows the typical value, p95 the bad-but-common case. Forecast (`f`) and
 target lines (`G`) are separate toggles. In side by side the menu has a **left** and a **right**
@@ -529,7 +530,7 @@ mouse capture off, so your terminal's own text selection works.
 | `s` | stats panel |
 | `space` | pause the chart: the source keeps running and its data is kept, so resuming jumps to the latest |
 | `e` | export the current view to SVG |
-| `m` | mouse capture on/off (off: your terminal can select text; the status line says how to turn it back on) |
+| `m` | mouse capture on/off (off: your terminal can select text; the legend row says how to turn it back on) |
 | `:` | Rhai console |
 | `q` | quit |
 
@@ -540,7 +541,7 @@ the panel opens under the chart:
 
 - **split right** / **split down** splits the picked pane (outlined in yellow);
   the new pane starts as a copy, so change what it shows: its **chart** type,
-  its **lines** and its **series** chips
+  its **lines** and its **series** (the legend row lists the picked pane's)
 - tap a pane to pick it, or use the **focus** arrows; **move** swaps it with
   its neighbour; **size** moves its edge, or just drag the border between two
   panes (with a finger too)
