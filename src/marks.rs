@@ -14,8 +14,11 @@ use crate::data::Dataset;
 use crate::render::Mark;
 use crate::script::ScriptHost;
 
-/// Most markers one rule may place (a rule that matches everything isn't useful).
+/// A rule that matches more than this many points *and* over half of the points it's
+/// checked on matches nearly everything: not useful, so it's refused.
 const MAX_PER_RULE: usize = 300;
+/// Most markers any rule may place.
+const HARD_MAX: usize = 50_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MarkRule {
@@ -335,6 +338,7 @@ fn evaluate_rule(
             .map(|p| p.1)
     });
     let mut placed = 0;
+    let mut checked = 0usize;
     for s in ds
         .series
         .iter()
@@ -372,6 +376,7 @@ fn evaluate_rule(
                     scope.set_or_push(prev_id.as_str(), at(px));
                 }
             }
+            checked += 1;
             let hit: Dynamic = host
                 .eval_ast_with_scope(&mut scope, &ast)
                 .with_context(|| format!("at {} point {i}", s.name))?;
@@ -382,9 +387,9 @@ fn evaluate_rule(
                 continue;
             }
             placed += 1;
-            if placed > MAX_PER_RULE {
+            if placed > HARD_MAX {
                 return Err(anyhow::anyhow!(
-                    "matched more than {MAX_PER_RULE} points; make the condition stricter"
+                    "matched more than {HARD_MAX} points; make the condition stricter"
                 ));
             }
             let fill = |t: &str| {
@@ -409,6 +414,11 @@ fn evaluate_rule(
             });
         }
     }
+    if placed > MAX_PER_RULE && placed * 2 > checked {
+        return Err(anyhow::anyhow!(
+            "matched {placed} of {checked} points; make the condition stricter"
+        ));
+    }
     Ok(())
 }
 
@@ -425,6 +435,29 @@ mod tests {
     use super::*;
     use crate::data::{Series, XKind};
     use crate::units::{Dim, Unit};
+
+    #[test]
+    fn frequent_rules_are_fine_but_not_ones_matching_everything() {
+        let host = ScriptHost::new(None, false).unwrap();
+        let ds = Dataset {
+            x_kind: XKind::Time,
+            series: vec![Series {
+                name: "k".into(),
+                unit: Unit::default(),
+                points: (0..1000)
+                    .map(|i| (f64::from(i), if i % 3 == 0 { 1.0 } else { 0.0 }))
+                    .collect(),
+            }],
+        };
+        // A third of 1000 points: an exit rule on a long history, say.
+        let (marks, errors) = evaluate(&host, &[MarkRule::parse("value > 0.5").unwrap()], &ds);
+        assert!(errors.is_empty() && marks.len() == 334, "{errors:?}");
+        let (_, errors) = evaluate(&host, &[MarkRule::parse("value >= 0").unwrap()], &ds);
+        assert!(
+            errors[0].contains("matched 1000 of 1000 points"),
+            "{errors:?}"
+        );
+    }
 
     #[test]
     fn rules_place_labelled_marks() {
