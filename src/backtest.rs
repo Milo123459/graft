@@ -285,6 +285,14 @@ pub fn series_for<'a>(ds: &'a Dataset, name: Option<&str>, marks: &[&Mark]) -> O
     if let Some(n) = name {
         return ds.get(n);
     }
+    // A series called close (e.g. close:USD = c) before a raw `c` field.
+    if let Some(s) = ds
+        .series
+        .iter()
+        .find(|s| s.name.eq_ignore_ascii_case("close"))
+    {
+        return Some(s);
+    }
     let names: Vec<&str> = ds.series.iter().map(|s| s.name.as_str()).collect();
     if let Some(k) = crate::render::candle_roles_named(&names)[3] {
         return ds.series.get(k);
@@ -346,6 +354,19 @@ mod tests {
             text.contains("2 times") && text.contains("up 100%"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn close_before_a_raw_c() {
+        let mut c = price();
+        c.name = "c".into();
+        let mut close = price();
+        close.name = "close".into();
+        let ds = Dataset {
+            x_kind: crate::data::XKind::Time,
+            series: vec![c, close],
+        };
+        assert_eq!(series_for(&ds, None, &[]).unwrap().name, "close");
     }
 
     #[test]
