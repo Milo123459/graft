@@ -272,6 +272,11 @@ pub struct Mark {
     pub symbol: String,
     /// `None`: the series' colour (or yellow for a marker placed by hand).
     pub color: Option<Color>,
+    /// Text effects for its symbol and label.
+    pub effects: Modifier,
+    /// The label on the marker's colour, like a tag.
+    pub badge: bool,
+    pub bg: Option<Color>,
 }
 
 /// What a pane's own source has produced so far.
@@ -1569,10 +1574,13 @@ impl<'a> ChartWidget<'a> {
             if !free_cell(&buf[(col, row)]) || beside_text {
                 continue;
             }
-            buf[(col, row)]
-                .set_symbol(&m.symbol)
-                .set_fg(color)
-                .set_style(Style::default().add_modifier(Modifier::BOLD));
+            let mut style = Style::default()
+                .fg(color)
+                .add_modifier(Modifier::BOLD | m.effects);
+            if let Some(bg) = m.bg {
+                style = style.bg(bg);
+            }
+            buf[(col, row)].set_symbol(&m.symbol).set_style(style);
             placed.push((col, row, color, m));
         }
         let mut taken: Vec<(u16, u16, u16)> = placed.iter().map(|p| (p.1, p.0, p.0)).collect();
@@ -1582,7 +1590,13 @@ impl<'a> ChartWidget<'a> {
         let mut newest: Vec<&(u16, u16, Color, &Mark)> = placed.iter().collect();
         newest.sort_by(|a, b| b.3.x.total_cmp(&a.3.x));
         for &&(col, row, color, m) in newest.iter().take(budget) {
-            let w = unicode_width::UnicodeWidthStr::width(m.label.as_str()) as u16;
+            // A badge: the label on the marker's colour, with a space either side.
+            let text = if m.badge {
+                format!(" {} ", m.label)
+            } else {
+                m.label.clone()
+            };
+            let w = unicode_width::UnicodeWidthStr::width(text.as_str()) as u16;
             // Labels only on empty space: never over the plotted lines.
             let fits = |x: u16| {
                 !taken
@@ -1597,7 +1611,19 @@ impl<'a> ChartWidget<'a> {
             let Some(x) = right.or(left) else {
                 continue;
             };
-            buf.set_stringn(x, row, &m.label, w as usize, Style::default().fg(color));
+            let mut style = Style::default().add_modifier(m.effects);
+            style = if m.badge {
+                style
+                    .fg(Color::Black)
+                    .bg(m.bg.unwrap_or(color))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                match m.bg {
+                    Some(bg) => style.fg(color).bg(bg),
+                    None => style.fg(color),
+                }
+            };
+            buf.set_stringn(x, row, &text, w as usize, style);
             taken.push((row, x, x + w));
         }
     }
@@ -2761,6 +2787,49 @@ mod tests {
         };
         let buf = render_to_buffer(&two, &opts, 40, 16);
         assert!(!buf.content.iter().any(|c| c.symbol() == "█"));
+    }
+
+    #[test]
+    fn marker_badges_sit_on_their_colour() {
+        let ds = Dataset {
+            x_kind: XKind::Time,
+            series: vec![Series {
+                name: "eth".into(),
+                unit: Unit::default(),
+                points: (0..20)
+                    .map(|i| (f64::from(i) * 60.0, f64::from(i % 5)))
+                    .collect(),
+            }],
+        };
+        let mark = Mark {
+            series: Some("eth".into()),
+            x: 300.0,
+            y: Some(0.0),
+            label: "cross".into(),
+            rule: Some(0),
+            symbol: "▲".into(),
+            color: Some(Color::Indexed(208)),
+            effects: Modifier::ITALIC,
+            badge: true,
+            bg: None,
+        };
+        let opts = ChartOpts {
+            marks: vec![mark],
+            ..ChartOpts::default()
+        };
+        let buf = render_to_buffer(&ds, &opts, 60, 16);
+        let label: Vec<&ratatui::buffer::Cell> = buf
+            .content
+            .iter()
+            .filter(|c| c.bg == Color::Indexed(208))
+            .collect();
+        let text: String = label.iter().map(|c| c.symbol()).collect();
+        assert_eq!(text, " cross ", "the label on the marker's colour");
+        assert!(
+            label
+                .iter()
+                .all(|c| c.modifier.contains(Modifier::ITALIC | Modifier::BOLD))
+        );
     }
 
     #[test]

@@ -5467,6 +5467,9 @@ impl App {
                             rule: None,
                             symbol: "▼".into(),
                             color: None,
+                            effects: ratatui::style::Modifier::empty(),
+                            badge: false,
+                            bg: None,
                         });
                         self.update_marks();
                     }

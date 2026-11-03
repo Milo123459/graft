@@ -26,18 +26,64 @@ pub struct MarkRule {
     /// The marker's symbol (default ▼) and colour (default: the series' colour).
     pub symbol: Option<String>,
     pub color: Option<String>,
+    /// Text effects (`bold`, `italic`, `underline`, `dim`, `reverse`, `badge`).
+    pub effects: Vec<String>,
+    /// A background colour (`on:yellow`).
+    pub bg: Option<String>,
+}
+
+/// Text effects a marker can have; `badge` puts its label on its colour.
+pub const EFFECTS: [&str; 6] = ["bold", "italic", "underline", "dim", "reverse", "badge"];
+
+/// A colour by name — the terminal's (green, lightred…), a few more (orange, purple,
+/// pink, gold, teal, brown, lime, sky, violet, grey), `#ff8800` or 0–255.
+pub fn color(name: &str) -> Option<ratatui::style::Color> {
+    use ratatui::style::Color;
+    let extra = match name.to_lowercase().as_str() {
+        "orange" => Some(208),
+        "purple" => Some(129),
+        "pink" => Some(213),
+        "gold" => Some(220),
+        "teal" => Some(30),
+        "brown" => Some(130),
+        "lime" => Some(118),
+        "sky" => Some(117),
+        "violet" => Some(177),
+        "grey" => return Some(Color::Gray),
+        _ => None,
+    };
+    extra.map(Color::Indexed).or_else(|| name.parse().ok())
+}
+
+/// The text style for a marker's effects (`badge` aside, which is how the label is laid out).
+pub fn modifiers(effects: &[String]) -> ratatui::style::Modifier {
+    use ratatui::style::Modifier;
+    effects.iter().fold(Modifier::empty(), |m, e| {
+        m | match e.as_str() {
+            "bold" => Modifier::BOLD,
+            "italic" => Modifier::ITALIC,
+            "underline" => Modifier::UNDERLINED,
+            "dim" => Modifier::DIM,
+            "reverse" => Modifier::REVERSED,
+            _ => Modifier::empty(),
+        }
+    })
 }
 
 /// Symbols the markers menu cycles through.
 pub const SYMBOLS: [&str; 8] = ["▼", "▲", "●", "◆", "★", "✕", "↑", "↓"];
 /// Colours it cycles through (`None` = the series' own).
-pub const COLORS: [Option<&str>; 7] = [
+pub const COLORS: [Option<&str>; 11] = [
     None,
     Some("green"),
     Some("red"),
     Some("yellow"),
     Some("cyan"),
     Some("magenta"),
+    Some("orange"),
+    Some("purple"),
+    Some("pink"),
+    Some("blue"),
     Some("white"),
 ];
 
@@ -69,15 +115,26 @@ impl MarkRule {
             },
             None => (s, None),
         };
-        let (mut symbol, mut color) = (None, None);
+        let (mut symbol, mut color, mut effects, mut bg) = (None, None, Vec::new(), None);
         for tok in style.unwrap_or("").split_whitespace() {
-            if tok.parse::<ratatui::style::Color>().is_ok() {
+            let lower = tok.to_lowercase();
+            if let Some(c) = lower.strip_prefix("on:").or(lower.strip_prefix("bg:")) {
+                if color_ok(c) {
+                    bg = Some(c.to_string());
+                } else {
+                    return Err(format!("'{tok}': on: takes a colour, e.g. on:yellow"));
+                }
+            } else if EFFECTS.contains(&lower.as_str()) {
+                if !effects.contains(&lower) {
+                    effects.push(lower);
+                }
+            } else if color_ok(&lower) {
                 color = Some(tok.to_string());
             } else if unicode_width::UnicodeWidthStr::width(tok) <= 2 {
                 symbol = Some(tok.to_string());
             } else {
                 return Err(format!(
-                    "'{tok}': a marker style is a symbol (▲ ● ★…) and/or a colour (green, #ff8800, 208)"
+                    "'{tok}': a marker style is a symbol (▲ ● ★…), a colour (orange, #ff8800, 208), effects (bold italic underline dim reverse badge) and on:COLOUR for a background"
                 ));
             }
         }
@@ -97,6 +154,8 @@ impl MarkRule {
             notify,
             symbol,
             color,
+            effects,
+            bg,
         })
     }
 
@@ -105,9 +164,12 @@ impl MarkRule {
             Some(l) => format!("{} => {l}", self.expr),
             None => self.expr.clone(),
         };
+        let bg = self.bg.as_ref().map(|b| format!("on:{b}"));
         let style: Vec<&str> = [self.symbol.as_deref(), self.color.as_deref()]
             .into_iter()
             .flatten()
+            .chain(self.effects.iter().map(String::as_str))
+            .chain(bg.as_deref())
             .collect();
         if !style.is_empty() {
             if self.label.is_none() {
@@ -122,6 +184,10 @@ impl MarkRule {
             rule
         }
     }
+}
+
+fn color_ok(name: &str) -> bool {
+    color(name).is_some()
 }
 
 /// Place markers for every rule. An error stops that rule (reported, the rest go on).
@@ -272,7 +338,10 @@ fn evaluate_rule(
                 label: fill(rule.label.as_deref().unwrap_or("{name} {delta}")),
                 rule: Some(n),
                 symbol: rule.symbol().to_string(),
-                color: rule.color.as_deref().and_then(|c| c.parse().ok()),
+                color: rule.color.as_deref().and_then(color),
+                effects: modifiers(&rule.effects),
+                badge: rule.effects.iter().any(|e| e == "badge"),
+                bg: rule.bg.as_deref().and_then(color),
             });
         }
     }
@@ -349,6 +418,25 @@ mod tests {
         );
         assert_eq!(MarkRule::parse(&styled.to_spec()).unwrap(), styled);
         assert!(MarkRule::parse("value > 1 => x | notacolour").is_err());
+        // Effects, more colour names and a background.
+        let fancy = MarkRule::parse("value > 1 => hot | ★ orange bold badge on:purple").unwrap();
+        assert_eq!(
+            (
+                fancy.symbol(),
+                fancy.color.as_deref(),
+                fancy.effects.clone(),
+                fancy.bg.as_deref()
+            ),
+            (
+                "★",
+                Some("orange"),
+                vec!["bold".into(), "badge".into()],
+                Some("purple")
+            )
+        );
+        assert_eq!(MarkRule::parse(&fancy.to_spec()).unwrap(), fancy);
+        assert_eq!(color("orange"), Some(ratatui::style::Color::Indexed(208)));
+        assert!(MarkRule::parse("value > 1 => x | on:nope").is_err());
         let n = MarkRule::parse("notify value > 5 => hot").unwrap();
         assert!(n.notify && n.expr == "value > 5");
         assert_eq!(MarkRule::parse(&n.to_spec()).unwrap(), n);
