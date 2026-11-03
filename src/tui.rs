@@ -8037,4 +8037,39 @@ pub(crate) mod tests {
         shot(&app, "sources", 46, 30);
         shot(&app, "sources-wide", 110, 34);
     }
+
+    #[test]
+    #[ignore]
+    fn write_ui_screens() {
+        let dir = std::env::var("GRAFT_SNAPSHOTS").unwrap();
+        let shot = |app: &App, name: &str, w: u16, h: u16| {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| app.draw(f)).unwrap();
+            let ans = crate::render::ansi::to_ansi(term.backend().buffer(), true);
+            std::fs::write(format!("{dir}/ui-{name}.ans"), ans).unwrap();
+        };
+        let mut app = tutorial_app();
+        app.tutorial = None;
+        app.message = None;
+        shot(&app, "plain", 110, 34);
+        shot(&app, "plain-phone", 46, 40);
+        key(&mut app, KeyCode::Char('s'));
+        run(&mut app, r#"lines("live,avg"); forecast("10m")"#);
+        app.console_note = None;
+        key(&mut app, KeyCode::Char('c'));
+        shot(&app, "busy", 110, 34);
+        shot(&app, "busy-phone", 46, 40);
+        let mut app = tutorial_app();
+        app.tutorial = None;
+        run(&mut app, r#"layout("(1 | 2) / (3 | 4)")"#);
+        run(&mut app, r#"focus_pane(1); pane("web,api kind=bar")"#);
+        run(&mut app, r#"focus_pane(2); pane("api lines=live,avg")"#);
+        run(&mut app, r#"focus_pane(3); pane("db kind=histogram")"#);
+        run(&mut app, r#"focus_pane(4); pane("web,api,db kind=stat")"#);
+        app.console_note = None;
+        app.message = None;
+        shot(&app, "panes", 110, 34);
+        key(&mut app, KeyCode::Char('w'));
+        shot(&app, "panes-panel", 110, 34);
+    }
 }
