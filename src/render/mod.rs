@@ -981,8 +981,21 @@ fn draw_candles(
                 _ if wick_top <= b && a < wick_bottom => "│",
                 _ => continue,
             };
-            buf[(col, r.y + row)]
-                .set_symbol(symbol)
+            // A line through here (an EMA, the cursor) stays visible: over a full
+            // body its dots go on the candle's colour, elsewhere the line wins.
+            let cell = &mut buf[(col, r.y + row)];
+            let line_here = cell
+                .symbol()
+                .chars()
+                .next()
+                .is_some_and(|ch| ('\u{2801}'..='\u{28FF}').contains(&ch));
+            if line_here {
+                if symbol == "█" {
+                    cell.set_bg(color);
+                }
+                continue;
+            }
+            cell.set_symbol(symbol)
                 .set_style(Style::default().fg(color));
         }
     }
@@ -2723,6 +2736,18 @@ mod tests {
         };
         assert!(cells("█", Color::Green) > 0 && cells("█", Color::Red) > 0);
         assert!(cells("│", Color::Green) > 0 && cells("│", Color::Red) > 0);
+        // The EMA crosses the bodies: its dots stay, on the candle's colour.
+        let braille = |c: &ratatui::buffer::Cell| {
+            c.symbol()
+                .chars()
+                .next()
+                .is_some_and(|ch| ('\u{2801}'..='\u{28FF}').contains(&ch))
+        };
+        assert!(
+            buf.content
+                .iter()
+                .any(|c| braille(c) && matches!(c.bg, Color::Green | Color::Red))
+        );
         // Only the EMA is a line: no braille in the candles' colours.
         let text = crate::render::ansi::to_ansi(&buf, false);
         assert!(
