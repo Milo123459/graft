@@ -49,6 +49,21 @@ impl Series {
         }
     }
 
+    /// Add a point; with `replace`, one at an x already there replaces it (an API that
+    /// returns the same candles each poll, the newest still changing).
+    fn push_or_replace(&mut self, x: f64, y: f64, replace: bool) {
+        if replace {
+            let i = self.points.partition_point(|p| p.0 < x);
+            if let Some(p) = self.points.get_mut(i)
+                && p.0 == x
+            {
+                p.1 = y;
+                return;
+            }
+        }
+        self.push(x, y);
+    }
+
     fn push(&mut self, x: f64, y: f64) {
         match self.points.last() {
             Some(&(lx, _)) if x < lx => {
@@ -127,6 +142,8 @@ pub struct Store {
     next_index: u64,
     /// Bumped whenever data changes, so views know when to rebuild.
     pub revision: u64,
+    /// `--replace`: a point at an x already seen replaces it.
+    pub replace: bool,
 }
 
 impl Store {
@@ -139,11 +156,22 @@ impl Store {
             window,
             next_index: 0,
             revision: 0,
+            replace: false,
         }
     }
 
     /// Add a parsed line, returning the x value it was placed at.
-    pub fn ingest(&mut self, parsed: Parsed, meta: &LineMeta) -> Result<f64, Skip> {
+    pub fn ingest(&mut self, mut parsed: Parsed, meta: &LineMeta) -> Result<f64, Skip> {
+        // Several records on one line: each in turn.
+        let more = std::mem::take(&mut parsed.more);
+        let mut x = self.ingest_one(parsed, meta)?;
+        for m in more {
+            x = self.ingest_one(m, meta)?;
+        }
+        Ok(x)
+    }
+
+    fn ingest_one(&mut self, parsed: Parsed, meta: &LineMeta) -> Result<f64, Skip> {
         let sample_time = meta.sample.map(|s| (XKind::Time, s.time));
         let (kind, x) = match self.mode {
             XMode::Auto => match parsed.x {
@@ -189,7 +217,7 @@ impl Store {
                 _ => (p.value, p.unit),
             };
             match self.series.get_mut(&p.series) {
-                Some(series) => series.push(x, value),
+                Some(series) => series.push_or_replace(x, value, self.replace),
                 None => {
                     let mut series = Series::new(p.series.clone(), unit);
                     series.push(x, value);
@@ -253,11 +281,33 @@ fn kind_name(k: XKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn replace_updates_a_point_at_the_same_time() {
+        let meta = LineMeta {
+            arrival: 0.0,
+            sample: None,
+        };
+        let mut s = Store::new(XMode::Auto, None, None);
+        s.replace = true;
+        s.ingest(line(Some(XVal::Num(1.0)), &[("c", 10.0)]), &meta)
+            .unwrap();
+        s.ingest(line(Some(XVal::Num(2.0)), &[("c", 11.0)]), &meta)
+            .unwrap();
+        // The same candles again, the newest one changed.
+        s.ingest(line(Some(XVal::Num(1.0)), &[("c", 10.0)]), &meta)
+            .unwrap();
+        s.ingest(line(Some(XVal::Num(2.0)), &[("c", 12.0)]), &meta)
+            .unwrap();
+        assert_eq!(s.series["c"].points, [(1.0, 10.0), (2.0, 12.0)]);
+    }
+
     use super::*;
     use crate::parse::Point;
 
     fn line(x: Option<XVal>, vals: &[(&str, f64)]) -> Parsed {
         Parsed {
+            more: Vec::new(),
             x,
             points: vals
                 .iter()

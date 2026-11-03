@@ -33,6 +33,8 @@ pub struct Point {
 pub struct Parsed {
     pub x: Option<XVal>,
     pub points: Vec<Point>,
+    /// More records from the same line, each at its own x (a JSON array of objects).
+    pub more: Vec<Parsed>,
 }
 
 /// Why a line produced no data. Shown by `--explain`.
@@ -192,6 +194,7 @@ impl LineParser for CountParser {
         Ok(Parsed {
             x: t.map(XVal::Time),
             points,
+            more: Vec::new(),
         })
     }
 }
@@ -226,7 +229,11 @@ fn finish(x: Option<XVal>, points: Vec<Point>) -> Result<Parsed, Skip> {
     if points.is_empty() {
         Err(Skip::NoValues)
     } else {
-        Ok(Parsed { x, points })
+        Ok(Parsed {
+            x,
+            points,
+            more: Vec::new(),
+        })
     }
 }
 
@@ -787,6 +794,22 @@ impl LineParser for JsonParser {
             }
         };
         self.buf.clear();
+        // An array of objects (an API's list of candles): one record per object.
+        if let Value::Array(items) = &v
+            && !items.is_empty()
+            && items.iter().all(Value::is_object)
+        {
+            let mut records = items.iter().filter_map(|item| {
+                let mut fields = Vec::new();
+                flatten(item, "", &mut fields);
+                fields_to_parsed(fields, self.time_field.as_deref(), &self.time, self.binary).ok()
+            });
+            let Some(mut first) = records.next() else {
+                return Err(Skip::NoValues);
+            };
+            first.more = records.collect();
+            return Ok(first);
+        }
         let mut fields = Vec::new();
         flatten(&v, "", &mut fields);
         fields_to_parsed(fields, self.time_field.as_deref(), &self.time, self.binary)
@@ -923,6 +946,25 @@ mod tests {
         let r = p.parse("2026-11-01 04:00:01 GET / took 12ms").unwrap();
         assert_eq!(r.points[0].series, "latency");
         assert!((r.points[0].value - 0.012).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_json_array_is_one_record_per_object() {
+        let mut p = JsonParser {
+            buf: String::new(),
+            time_field: Some("t".into()),
+            time: TimeParser::new(None),
+            binary: false,
+        };
+        let parsed = p
+            .parse(r#"[{"t":1793711520000,"c":"2280.2"},{"t":1793711580000,"c":"2281.5"}]"#)
+            .unwrap();
+        assert_eq!(parsed.points[0].series, "c");
+        assert_eq!(parsed.more.len(), 1);
+        assert_eq!(parsed.more[0].points[0].value, 2281.5);
+        assert!(
+            matches!((parsed.x, parsed.more[0].x), (Some(XVal::Time(a)), Some(XVal::Time(b))) if b - a == 60.0)
+        );
     }
 
     #[test]

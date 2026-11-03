@@ -33,7 +33,11 @@ impl Session {
             lookup_unit(u, cli.binary_units).unwrap_or_else(|| (Dim::Other(u.to_string()), 1.0))
         });
         Ok(Self {
-            store: Store::new(cli.x, default_unit, cli.window),
+            store: {
+                let mut s = Store::new(cli.x, default_unit, cli.window);
+                s.replace = cli.replace;
+                s
+            },
             parser: parse::build(cli, script.clone())?,
             pipeline: Pipeline::from_cli(cli, &script)?,
             script,

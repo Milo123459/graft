@@ -620,7 +620,11 @@ From here on the steps are a reference: read what's useful, skip the rest with E
             ),
             (
                 "--json --time-field ts",
-                "JSON lines; nested keys become a.b.c",
+                "JSON lines; nested keys become a.b.c (an array: one record per object)",
+            ),
+            (
+                "--json --time-field t --replace",
+                "an API that returns the same candles every poll: the newest replaces the old",
             ),
             (
                 "--columns 2,3 --names rx,tx",
@@ -943,6 +947,14 @@ The next pages are recipes for real use: copy puts one on your clipboard."#,
         title: "recipe: pipe anything",
         text: "Pipe output in and graft suggests formats that fit: pick one and it remembers. Or say it yourself with --format, where {name} captures a number.",
         command: Some("ping 1.1.1.1 | graft --format 'time={latency}'"),
+        ..BASE
+    },
+    Step {
+        title: "recipe: a trading dashboard",
+        text: "Hyperliquid's 1-minute ETH candles (6 hours, polled every 5 s; --replace keeps the newest candle up to date instead of piling up copies), with EMA30/EMA50 and crossover markers, RSI, MACD and volume in panes. RSI and MACD come from examples/indicators.rhai.",
+        command: Some(
+            r#"graft -c 'now=$(date +%s)000; curl -s --json "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"ETH\",\"interval\":\"1m\",\"startTime\":$((now - 6*3600000)),\"endTime\":$now}}" https://api.hyperliquid.xyz/info' -n 5s --json --time-field t --replace --script examples/indicators.rhai --series 'eth:USD = c' --series 'volume:ETH = v' --select eth,volume --line 'ema30 = ema(values("eth"), 30)' --line 'ema50 = ema(values("eth"), 50)' --line 'rsi14:% = rsi(values("eth"), 14)' --line 'overbought:% = 70' --line 'oversold:% = 30' --line 'macd = macd(values("eth"))' --line 'signal = ema(values("macd"), 9)' --mark 'name == "ema30" && prev < ema50_prev && value >= ema50 => golden cross | ▲ green' --mark 'name == "ema30" && prev > ema50_prev && value <= ema50 => death cross | ▼ red' --pane 'eth,ema30,ema50' --pane 'rsi14,overbought,oversold' --pane 'macd,signal' --pane volume --layout '1 /60% ((2 | 3) / 4)' --title 'ETH 1m'"#,
+        ),
         ..BASE
     },
     Step {

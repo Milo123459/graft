@@ -58,6 +58,12 @@ pub struct Cli {
     #[arg(long, value_name = "NAME[ = ARGS]", help_heading = "Input")]
     pub merge: Vec<String>,
 
+    /// A point at the same time (x) as one already read replaces it, instead of adding
+    /// another: for APIs that return the same history every poll, like price candles
+    /// (the newest one still changing).
+    #[arg(long, help_heading = "Input")]
+    pub replace: bool,
+
     /// A named source for panes, with its own arguments: `--source 'mem = -c "free -b"
     /// --kv'`, shown by `--pane 'source=mem'` (repeatable). It takes the place of a
     /// preset or profile with the same name, for this chart only.
@@ -663,6 +669,7 @@ impl Cli {
         );
         let flags = [
             (self.follow, "--follow"),
+            (self.replace, "--replace"),
             (self.kv, "--kv"),
             (self.auto, "--auto"),
             (self.csv, "--csv"),

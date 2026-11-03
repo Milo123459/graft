@@ -224,6 +224,28 @@ alerts). In the viewer, the lines menu (`T`) lists them: tap one to edit it,
 `remove_line("name")` in the console. Money: `-u USD` (or `$`, `EUR`, `GBP`)
 shows `$3,456.78`; `:unit("USD")` and `:title("ETH")` change it while running.
 
+### A trading dashboard (candles, EMAs, RSI, MACD)
+
+Hyperliquid's 1-minute candles, polled every 5 s: the API returns a JSON array
+(one record per candle, `--json --time-field t`) and the same candles each time,
+so `--replace` updates the newest one instead of adding copies. RSI and MACD come
+from [examples/indicators.rhai](examples/indicators.rhai); `hist = macd - signal`
+would add the histogram (series by name are worked out at each point).
+
+```sh
+graft -c 'now=$(date +%s)000; curl -s --json "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"ETH\",\"interval\":\"1m\",\"startTime\":$((now - 6*3600000)),\"endTime\":$now}}" https://api.hyperliquid.xyz/info' \
+  -n 5s --json --time-field t --replace \
+  --script examples/indicators.rhai \
+  --series 'eth:USD = c' --series 'volume:ETH = v' --select eth,volume \
+  --line 'ema30 = ema(values("eth"), 30)' --line 'ema50 = ema(values("eth"), 50)' \
+  --line 'rsi14:% = rsi(values("eth"), 14)' --line 'overbought:% = 70' --line 'oversold:% = 30' \
+  --line 'macd = macd(values("eth"))' --line 'signal = ema(values("macd"), 9)' \
+  --mark 'name == "ema30" && prev < ema50_prev && value >= ema50 => golden cross | ▲ green' \
+  --mark 'name == "ema30" && prev > ema50_prev && value <= ema50 => death cross | ▼ red' \
+  --pane 'eth,ema30,ema50' --pane 'rsi14,overbought,oversold' --pane 'macd,signal' --pane volume \
+  --layout '1 /60% ((2 | 3) / 4)' --title 'ETH 1m'
+```
+
 ### Combining sources (`--merge`)
 
 Several sources can share one chart: each `--merge` adds another source's

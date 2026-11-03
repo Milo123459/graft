@@ -7674,7 +7674,7 @@ pub(crate) mod tests {
         type_str(&mut app, r#"load("examples/indicators.rhai")"#);
         key(&mut app, KeyCode::Enter);
         assert!(
-            app.message.as_ref().unwrap().text.contains("3 functions"),
+            app.message.as_ref().unwrap().text.contains("5 functions"),
             "{:?}",
             app.message.as_ref().map(|m| &m.text)
         );
