@@ -592,6 +592,11 @@ Answers come in the series' unit and say which point they're from:
 placed, the value there too (`at("api")` is the value at the cursor). Trends read
 as words: `slope("api", "1h")` → `api is rising 2.1 ms per hour`.
 
+Where a function wants a series' name, a series written plainly is its name:
+`last(busy)`, `slope(user, 1h)`, `only(web, api)`, `mean_of([web, api])` (a
+script's own variables are left alone). Examples in hints and errors use the
+chart's own series.
+
 Expressions that are kept to run later can be written as code, no quotes needed:
 `add_line("total", user + sys)`, `alert(api > 45ms)`,
 `mark_when(value > 60ms, "spike")`, `bind("r", only("api"))`; Tab completes series,

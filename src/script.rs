@@ -527,7 +527,7 @@ pub const USAGE: &[(&str, &str, &str)] = &[
     // trends
     (
         "slope",
-        r#"slope("api", "1h")"#,
+        r#"slope("api")  ·  slope("api", "1h")"#,
         "the trend: change per hour (or per second)",
     ),
     (
@@ -823,6 +823,114 @@ pub const GROUPS: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// `last(busy)` → `last("busy")`: where a function takes a series' name, a series
+/// written plainly is its name (not its newest value). Only words that are one of
+/// `series` (so a script's own variables are left alone).
+pub fn quote_series_names(src: &str, series: &[String]) -> String {
+    if series.is_empty() {
+        return src.to_string();
+    }
+    let by_ident: Vec<(String, &String)> = series.iter().map(|s| (ident(s), s)).collect();
+    let name_of = |w: &str| by_ident.iter().find(|(id, _)| id == w).map(|(_, n)| *n);
+    let b = src.as_bytes();
+    // (start, end, replacement) for each argument to quote.
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let bare = |start: usize, end: usize, edits: &mut Vec<(usize, usize, String)>| {
+        let raw = &src[start..end];
+        let t = raw.trim();
+        if let Some(name) = name_of(t) {
+            let lead = raw.len() - raw.trim_start().len();
+            edits.push((start + lead, start + lead + t.len(), format!("{name:?}")));
+        }
+    };
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            q @ (b'"' | b'`' | b'\'') => {
+                i = skip_string(b, i, q);
+                continue;
+            }
+            c if is_ident(c) && (i == 0 || !is_ident(b[i - 1])) => {
+                let end = (i..b.len()).find(|&k| !is_ident(b[k])).unwrap_or(b.len());
+                let word = &src[i..end];
+                let first = SERIES_FIRST.contains(&word);
+                let any = SERIES_ANY.contains(&word);
+                let rest = &src[end..];
+                if (first || any) && rest.trim_start().starts_with('(') {
+                    let open = end + (rest.len() - rest.trim_start().len());
+                    let mut start = open + 1;
+                    loop {
+                        let comma = scan_to(b, start, b',');
+                        let stop = comma.or_else(|| scan_to(b, start, b')'));
+                        let Some(stop) = stop else { break };
+                        let arg = src[start..stop].trim();
+                        if arg.starts_with('[') && arg.ends_with(']') {
+                            // mean_of([web, api]): each item.
+                            let lb = start + src[start..stop].find('[').expect("starts with [");
+                            let mut s = lb + 1;
+                            while let Some(e) = scan_to(b, s, b',').or_else(|| scan_to(b, s, b']'))
+                            {
+                                if e > stop {
+                                    break;
+                                }
+                                bare(s, e, &mut edits);
+                                if b[e] == b']' {
+                                    break;
+                                }
+                                s = e + 1;
+                            }
+                        } else {
+                            bare(start, stop, &mut edits);
+                        }
+                        if first || comma.is_none() {
+                            break;
+                        }
+                        start = stop + 1;
+                    }
+                }
+                i = end;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let mut out = src.to_string();
+    for (s, e, r) in edits.into_iter().rev() {
+        out.replace_range(s..e, &r);
+    }
+    out
+}
+
+/// A usage example with the chart's own series in place of the made-up ones (api,
+/// web, db), so `e.g. last("api")` reads `e.g. last("busy")` on a CPU chart.
+pub fn example_for(example: &str, series: &[String]) -> String {
+    if series.is_empty() || series.iter().any(|s| s == "api") {
+        return example.to_string();
+    }
+    static DEMO: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b(api|web|db)\b").expect("valid"));
+    let pick = |w: &str| {
+        let k = match w {
+            "api" => 0,
+            "web" => 1,
+            _ => 2,
+        };
+        &series[k % series.len()]
+    };
+    let mut out = String::new();
+    let mut last = 0;
+    for m in DEMO.find_iter(example) {
+        out.push_str(&example[last..m.start()]);
+        let quoted = example[..m.start()].ends_with(['"', '`']);
+        let s = pick(m.as_str());
+        out.push_str(&if quoted { s.clone() } else { ident(s) });
+        last = m.end();
+    }
+    out.push_str(&example[last..]);
+    out
+}
+
 /// How `name` is called, if it's a console function.
 pub fn usage(name: &str) -> Option<&'static (&'static str, &'static str, &'static str)> {
     USAGE.iter().find(|u| u.0 == name)
@@ -901,6 +1009,28 @@ pub struct Completions {
     pub items: Vec<Suggestion>,
     /// The call the cursor is in: how it's used, and what it does.
     pub signature: Option<(&'static str, &'static str)>,
+}
+
+/// How many arguments `func` takes at least (its shortest usage form), if known.
+fn min_args(func: &str) -> Option<usize> {
+    let u = usage(func)?;
+    u.1.split("  ·  ")
+        .filter_map(|form| {
+            let inner = form.trim().strip_prefix(func)?.strip_prefix('(')?;
+            let inner = inner.strip_suffix(')')?;
+            if inner.trim().is_empty() {
+                return Some(0);
+            }
+            let b = inner.as_bytes();
+            let mut n = 1;
+            let mut i = 0;
+            while let Some(c) = scan_to(b, i, b',') {
+                n += 1;
+                i = c + 1;
+            }
+            Some(n)
+        })
+        .min()
 }
 
 /// What a marker rule can use besides series and functions.
@@ -1013,12 +1143,20 @@ fn complete_in(
                 .collect()
         };
         out.start = q + 1;
+        // The last argument (of the shortest form): close the call too.
+        let last =
+            min_args(&func).is_some_and(|n| arg + 1 >= n) && !SERIES_ANY.contains(&func.as_str());
+        let paren = if last && !chars[cursor..].iter().any(|c| *c == ')') {
+            ")"
+        } else {
+            ""
+        };
         out.items = ranked(options, &word)
             .into_iter()
             .filter(|o| *o != word || close(cursor))
             .map(|o| Suggestion {
                 insert: if close(cursor) && !o.ends_with(':') {
-                    format!("{o}\"")
+                    format!("{o}\"{paren}")
                 } else {
                     o.clone()
                 },
@@ -1052,11 +1190,20 @@ fn complete_in(
                     .map(|s| s.to_string())
                     .collect()
             };
+            let last = min_args(func).is_some_and(|n| *arg + 1 >= n)
+                && !SERIES_ANY.contains(&func.as_str());
+            let paren = if last && !chars[cursor..].iter().any(|c| *c == ')') {
+                ")"
+            } else {
+                ""
+            };
             out.items = options
                 .into_iter()
                 .map(|o| Suggestion {
                     insert: if o.ends_with(':') {
                         format!("\"{o}")
+                    } else if !paren.is_empty() {
+                        format!("\"{o}\"{paren}")
                     } else {
                         format!("\"{o}\"")
                     },
@@ -1179,7 +1326,11 @@ pub fn explain_error(raw: &str, code: &str, series: &[String]) -> (String, Optio
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let how = |name: &str| usage(name).map_or(String::new(), |u| format!(" — e.g. {}", u.1));
+    let how = |name: &str| {
+        usage(name).map_or(String::new(), |u| {
+            format!(" — e.g. {}", example_for(u.1, series))
+        })
+    };
     // Function not found: name (types)
     if let Some(rest) = msg.strip_prefix("Function not found: ") {
         let (name, args) = rest.split_once(' ').unwrap_or((rest, ""));
@@ -1187,13 +1338,18 @@ pub fn explain_error(raw: &str, code: &str, series: &[String]) -> (String, Optio
         if usage(name).is_none() {
             let names = USAGE.iter().map(|u| u.0);
             return match did_you_mean(name, names) {
-                Some(m) => (
-                    format!(
-                        "there's no {name}() — did you mean {}?",
-                        usage(m).map_or(format!("{m}()"), |u| u.1.to_string())
-                    ),
-                    at,
-                ),
+                Some(m) => {
+                    // Their own call with the name fixed: lst(busy) → last(busy).
+                    let theirs = code.find(&format!("{name}(")).and_then(|p| {
+                        let open = p + name.len();
+                        let close = scan_to(code.as_bytes(), open + 1, b')')?;
+                        Some(format!("{m}{}", &code[open..=close]))
+                    });
+                    let fix = theirs.unwrap_or_else(|| {
+                        usage(m).map_or(format!("{m}()"), |u| example_for(u.1, series))
+                    });
+                    (format!("there's no {name}() — did you mean {fix}?"), at)
+                }
                 None => (
                     format!("there's no {name}() — type help to see every command"),
                     at,
@@ -1449,9 +1605,18 @@ impl ScriptHost {
 
     /// Compile an expression (unit literals allowed) that may call script functions.
     pub fn compile_expr(&self, src: &str) -> Result<AST> {
+        let names: Vec<String> = self
+            .state
+            .borrow()
+            .data
+            .series
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        let src = quote_series_names(src, &names);
         let ast = self
             .engine
-            .compile(preprocess(src, self.binary))
+            .compile(preprocess(&src, self.binary))
             .map_err(|e| anyhow!("{e}"))?;
         Ok(self.ast.borrow().clone_functions_only().merge(&ast))
     }
@@ -2171,9 +2336,11 @@ mod tests {
         assert_eq!(items("perc")[0], "percentile(\"");
         assert_eq!(items("zoom_"), ["zoom_in()", "zoom_out()"]);
         assert_eq!(items("ap"), ["api"]);
-        assert_eq!(items("last(\"")[..3], ["web\"", "api\"", "db\""]);
+        // The last argument closes the call; one with more to come doesn't.
+        assert_eq!(items("last(\"")[..3], ["web\")", "api\")", "db\")"]);
+        assert_eq!(items("percentile(\"d"), ["db\""]);
         assert_eq!(items("only(\"web\", \"a"), ["api\""]);
-        assert_eq!(items("last("), ["\"web\"", "\"api\"", "\"db\""]);
+        assert_eq!(items("last("), ["\"web\")", "\"api\")", "\"db\")"]);
         assert_eq!(items("notify_to(\"n"), ["ntfy:"]);
         assert!(
             items("title(\"").is_empty(),
@@ -2195,12 +2362,15 @@ mod tests {
         assert_eq!(items2(r#"add_line("total", "us"#)[0], "user");
         assert_eq!(items2(r#"add_line("total", us"#)[0], "user");
         assert_eq!(items2(r#"add_line("total", "user + s"#)[0], "sys");
-        assert_eq!(items2(r#"add_line("t", "ema(values(`b"#), ["busy`"]);
+        assert_eq!(items2(r#"add_line("t", "ema(values(`b"#), ["busy`)"]);
         assert!(items2(r#"add_line("t", "va"#).contains(&"values(`".to_string()));
         assert_eq!(items2(r#"mark_when("del"#), ["delta"]);
         assert_eq!(items2(r#"alert("sy"#)[0], "sys");
         let c = complete("slope(\"api\", ", 13, &s);
-        assert_eq!(c.signature.map(|s| s.0), Some(r#"slope("api", "1h")"#));
+        assert_eq!(
+            c.signature.map(|s| s.0),
+            Some(r#"slope("api")  ·  slope("api", "1h")"#)
+        );
     }
 
     use super::*;

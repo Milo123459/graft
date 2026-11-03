@@ -4236,7 +4236,10 @@ impl App {
             let name = s.label.strip_suffix("()")?;
             crate::script::usage(name).map(|u| (u.1, u.2))
         });
+        let names: Vec<String> = self.full.series.iter().map(|s| s.name.clone()).collect();
         let line = shown.map(|(how, what)| {
+            // The example in this chart's own series.
+            let how = crate::script::example_for(how, &names);
             let mut text = format!("{how} — {what}");
             let w = width.saturating_sub(1) as usize;
             if text.chars().count() > w {
@@ -4276,7 +4279,10 @@ impl App {
             .as_float()
             .ok()
             .or_else(|| v.as_int().ok().map(|i| i as f64));
-        let code = code.trim();
+        // `last(api)` reads as `last("api")`.
+        let names: Vec<String> = self.full.series.iter().map(|s| s.name.clone()).collect();
+        let quoted = crate::script::quote_series_names(code, &names);
+        let code = quoted.trim();
         // `api` on its own is its newest value.
         let (func, name, arg) = match CALL.captures(code) {
             Some(c) => (
@@ -8447,6 +8453,13 @@ pub(crate) mod tests {
             "the legend row says it's the cursor"
         );
         // `5m` is five minutes.
+        // A series written plainly is its name where one is wanted: last(api).
+        assert_eq!(
+            out(&mut app, "last(api)").1,
+            out(&mut app, r#"last("api")"#).1
+        );
+        assert!(out(&mut app, "slope(api, 1h)").1.contains(" per hour"));
+        assert!(!out(&mut app, "mean_of([web, api])").0);
         // A line from series by name is a real line, not a flat one.
         run(&mut app, r#"add_line("total", "web + api")"#);
         let total = app
@@ -8464,10 +8477,7 @@ pub(crate) mod tests {
         assert!(app.view.is_some_and(|(a, b)| (b - a - 300.0).abs() < 1.0));
         // Mistakes: plain words, a fix, and the console stays open on the command.
         for (code, says) in [
-            (
-                "last(api)",
-                r#"last() needs the series' name in quotes: last("api")"#,
-            ),
+            ("lst(api)", "did you mean last(api)?"),
             (r#"lst("api")"#, r#"did you mean last("api")?"#),
             (r#"last("apu")"#, r#"did you mean "api"?"#),
             ("zoom(5x)", "5x isn't a number graft understands"),
@@ -8502,18 +8512,18 @@ pub(crate) mod tests {
         // The hint row: how it's used, and what Tab would put in.
         let s = screen_sized(&app, 46, 30);
         assert!(
-            s.contains(r#"slope("api", "1h") — the trend"#) && s.contains(" slope() "),
+            s.contains(r#"slope("api")  ·  slope("#) && s.contains(" slope() "),
             "{s}"
         );
         key(&mut app, KeyCode::Tab);
         assert_eq!(app.console.as_ref().unwrap().value, r#"slope(""#);
         // Inside the quotes: the series. Tab cycles through them.
         key(&mut app, KeyCode::Tab);
-        assert_eq!(app.console.as_ref().unwrap().value, r#"slope("web""#);
+        assert_eq!(app.console.as_ref().unwrap().value, r#"slope("web")"#);
         key(&mut app, KeyCode::Tab);
-        assert_eq!(app.console.as_ref().unwrap().value, r#"slope("api""#);
+        assert_eq!(app.console.as_ref().unwrap().value, r#"slope("api")"#);
         key(&mut app, KeyCode::BackTab);
-        assert_eq!(app.console.as_ref().unwrap().value, r#"slope("web""#);
+        assert_eq!(app.console.as_ref().unwrap().value, r#"slope("web")"#);
         // A letter narrows it; a tap works like Tab.
         key(&mut app, KeyCode::Esc);
         key(&mut app, KeyCode::Char(':'));
@@ -8528,8 +8538,7 @@ pub(crate) mod tests {
         let x = line[..line.find(" db ").unwrap()].chars().count() as u16;
         let y = y as u16;
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
-        assert_eq!(app.console.as_ref().unwrap().value, r#"max("db""#);
-        type_str(&mut app, ")");
+        assert_eq!(app.console.as_ref().unwrap().value, r#"max("db")"#);
         key(&mut app, KeyCode::Enter);
         assert!(
             app.console_note
@@ -8540,12 +8549,12 @@ pub(crate) mod tests {
         key(&mut app, KeyCode::Char(':'));
         type_str(&mut app, r#"chart("hi"#);
         key(&mut app, KeyCode::Tab);
-        assert_eq!(app.console.as_ref().unwrap().value, r#"chart("histogram""#);
+        assert_eq!(app.console.as_ref().unwrap().value, r#"chart("histogram")"#);
         key(&mut app, KeyCode::Esc);
         key(&mut app, KeyCode::Char(':'));
         type_str(&mut app, r#"slope("api", "#);
         key(&mut app, KeyCode::Tab);
-        assert_eq!(app.console.as_ref().unwrap().value, r#"slope("api", "1m""#);
+        assert_eq!(app.console.as_ref().unwrap().value, r#"slope("api", "1m")"#);
     }
 
     #[test]

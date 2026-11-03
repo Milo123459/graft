@@ -472,7 +472,7 @@ The database spikes now and then: mark it."#,
     Step {
         title: "your own lines",
         text: r#"A custom line is worked out with Rhai over all the data and drawn like any series: hide it, mark it, alert on it. Return an array (one value per point), [x, y] pairs, or a number for a flat line. Built in: ema, sma, values, xs, values_at, mean_of.
-The expression can go in quotes or be written as code: add_line("total", user + sys). The same goes for alert(api > 45ms) and mark_when(value > 60ms, "spike"). Tab completes series and functions inside it."#,
+The expression can go in quotes or be written as code: add_line("total", user + sys). Where a function wants a series' name, the name works plainly too: last(api), slope(api, 1h). The same goes for alert(api > 45ms) and mark_when(value > 60ms, "spike"). Tab completes series and functions inside it."#,
         keys: &[(
             "T → + custom line",
             "add, edit or delete lines in the lines menu",
