@@ -323,9 +323,19 @@ pub fn preprocess(src: &str, binary: bool) -> String {
     out
 }
 
-/// `bind("r", only("eth"))` → `bind("r", "only(\"eth\")")`: the code a key runs is
-/// written as code, and kept as text to run when the key is pressed. (A string, a
-/// `|| …` closure or a `{ … }` block work too.)
+/// Arguments that are code, kept as text to run later: (function, argument number).
+/// Written as code, they're quoted here: `bind("r", only("eth"))` →
+/// `bind("r", "only(\"eth\")")`, `add_line("total", user + sys)` →
+/// `add_line("total", "user + sys")`, `alert(api > 45ms)`. (A string, a `|| …`
+/// closure or a `{ … }` block work too.)
+const CODE_ARGS: &[(&str, usize)] = &[
+    ("bind", 1),
+    ("add_line", 1),
+    ("alert", 0),
+    ("unalert", 0),
+    ("mark_when", 0),
+];
+
 fn quote_bind_code(src: &str) -> String {
     let b = src.as_bytes();
     let mut out = String::with_capacity(src.len());
@@ -343,27 +353,48 @@ fn quote_bind_code(src: &str) -> String {
             b'/' if b.get(i + 1) == Some(&b'*') => {
                 i = src[i..].find("*/").map_or(b.len(), |e| i + e + 2);
             }
-            b'b' if src[i..].starts_with("bind")
-                && (i == 0 || !is_ident(b[i - 1]))
-                && src[i + 4..].trim_start().starts_with('(') =>
-            {
-                let open = i + 4 + (src[i + 4..].len() - src[i + 4..].trim_start().len());
-                // The first argument ends at a top-level comma; the second at the
-                // matching close paren.
-                let Some(comma) = scan_to(b, open + 1, b',') else {
-                    i += 4;
+            c if is_ident(c) && (i == 0 || !is_ident(b[i - 1])) => {
+                let word_end = (i..b.len()).find(|&k| !is_ident(b[k])).unwrap_or(b.len());
+                let word = &src[i..word_end];
+                let rest = &src[word_end..];
+                let Some(&(_, n)) = CODE_ARGS.iter().find(|(f, _)| *f == word) else {
+                    i = word_end;
                     continue;
                 };
-                let Some(close) = scan_to(b, comma + 1, b')') else {
-                    i += 4;
+                if !rest.trim_start().starts_with('(') {
+                    i = word_end;
+                    continue;
+                }
+                let open = word_end + (rest.len() - rest.trim_start().len());
+                // Argument n: after n top-level commas; it ends at the next one or at
+                // the closing paren.
+                let mut start = open + 1;
+                let mut found = true;
+                for _ in 0..n {
+                    match scan_to(b, start, b',') {
+                        Some(c) => start = c + 1,
+                        None => {
+                            found = false;
+                            break;
+                        }
+                    }
+                }
+                let end = found
+                    .then(|| scan_to(b, start, b',').or_else(|| scan_to(b, start, b')')))
+                    .flatten();
+                let Some(end) = end else {
+                    i = word_end;
                     continue;
                 };
-                let arg = src[comma + 1..close].trim();
+                let arg = src[start..end].trim();
                 let quoted = arg.starts_with('"') || arg.starts_with('`');
                 if !quoted && !arg.is_empty() {
                     let code = arg.strip_prefix("||").unwrap_or(arg).trim();
-                    out.push_str(&src[copied..=comma]);
-                    out.push_str(" \"");
+                    out.push_str(&src[copied..start]);
+                    if n > 0 {
+                        out.push(' ');
+                    }
+                    out.push('"');
                     out.push_str(
                         &code
                             .replace('\\', "\\\\")
@@ -373,9 +404,9 @@ fn quote_bind_code(src: &str) -> String {
                             .replace('\t', "\\t"),
                     );
                     out.push('"');
-                    copied = close;
+                    copied = end;
                 }
-                i = close;
+                i = end;
             }
             _ => i += 1,
         }
@@ -629,12 +660,12 @@ pub const USAGE: &[(&str, &str, &str)] = &[
     // markers, alerts, lines, sources
     (
         "mark_when",
-        r#"mark_when("value > 60ms", "spike")"#,
+        r#"mark_when(value > 60ms, "spike")"#,
         "a marker wherever it holds",
     ),
     ("mark", r#"mark("deploy")"#, "a marker at the cursor"),
     ("clear_marks", "clear_marks()", "remove every marker"),
-    ("alert", r#"alert("api > 45ms")"#, "an alert"),
+    ("alert", r#"alert(api > 45ms)"#, "an alert"),
     ("unalert", r#"unalert("api > 45ms")"#, "remove an alert"),
     (
         "notify_to",
@@ -648,8 +679,8 @@ pub const USAGE: &[(&str, &str, &str)] = &[
     ),
     (
         "add_line",
-        r#"add_line("smooth", "ema(values(`api`), 30)")"#,
-        "a custom line",
+        r#"add_line("total", web + api)"#,
+        "a custom line, worked out at each point",
     ),
     (
         "remove_line",
@@ -872,8 +903,23 @@ pub struct Completions {
     pub signature: Option<(&'static str, &'static str)>,
 }
 
+/// What a marker rule can use besides series and functions.
+const MARK_VARS: &[&str] = &["value", "prev", "delta", "pct", "rate", "time", "name"];
+
 /// Suggestions for console input `text` with the cursor at char `cursor`.
 pub fn complete(text: &str, cursor: usize, series: &[String]) -> Completions {
+    complete_in(text, cursor, series, &[], false)
+}
+
+/// `extra`: more variables to offer (inside a marker rule); `in_code`: completing the
+/// text of an expression argument.
+fn complete_in(
+    text: &str,
+    cursor: usize,
+    series: &[String],
+    extra: &[&str],
+    in_code: bool,
+) -> Completions {
     let chars: Vec<char> = text.chars().collect();
     let cursor = cursor.min(chars.len());
     // Walk up to the cursor: are we in a string, and in which calls?
@@ -935,9 +981,27 @@ pub fn complete(text: &str, cursor: usize, series: &[String]) -> Completions {
     };
     let close = |at: usize| chars.get(at) != Some(&'"');
     if let Some(q) = in_str {
+        let (func, arg) = call.clone().unwrap_or_default();
+        // Text that's code (add_line's expression, an alert, a marker rule): complete
+        // it as code, with `backticks` for any text inside so the quotes still hold.
+        if CODE_ARGS.contains(&(func.as_str(), arg)) {
+            let inner: String = chars[q + 1..cursor]
+                .iter()
+                .map(|&c| if c == '`' { '"' } else { c })
+                .collect();
+            let vars: &[&str] = if func == "mark_when" { MARK_VARS } else { &[] };
+            let mut c = complete_in(&inner, inner.chars().count(), series, vars, true);
+            c.start += q + 1;
+            for item in &mut c.items {
+                item.insert = item.insert.replace('"', "`");
+                item.label = item.label.replace('"', "`");
+            }
+            c.signature = c.signature.or(out.signature);
+            return c;
+        }
         // In text: a series name, or one of the argument's choices.
         let word: String = chars[q + 1..cursor].iter().collect();
-        let (func, arg) = call.unwrap_or_default();
+        let (func, arg) = (func, arg);
         let options: Vec<String> = if SERIES_ANY.contains(&func.as_str())
             || SERIES_FIRST.contains(&func.as_str()) && arg == 0
         {
@@ -1007,7 +1071,13 @@ pub fn complete(text: &str, cursor: usize, series: &[String]) -> Completions {
     }
     out.start = start;
     let funcs: Vec<String> = USAGE.iter().map(|u| u.0.to_string()).collect();
-    let idents: Vec<String> = series.iter().map(|s| ident(s)).collect();
+    let mut idents: Vec<String> = series.iter().map(|s| ident(s)).collect();
+    // A marker rule (quoted, or written as code): its own variables too.
+    let in_rule = call
+        .as_ref()
+        .is_some_and(|(f, a)| f == "mark_when" && *a == 0);
+    let vars: &[&str] = if in_rule { MARK_VARS } else { extra };
+    idents.extend(vars.iter().map(|v| v.to_string()));
     for name in ranked(funcs, &word) {
         let example = usage(&name).map_or("", |u| u.1);
         // `last("` for one that takes text first, `undo()` for one that takes nothing.
@@ -1025,11 +1095,19 @@ pub fn complete(text: &str, cursor: usize, series: &[String]) -> Completions {
             label: format!("{name}()"),
         });
     }
-    for id in ranked(idents, &word) {
-        out.items.push(Suggestion {
+    // Inside a call or an expression, series (and rule variables) usually are what's
+    // being typed: they go first.
+    let names: Vec<Suggestion> = ranked(idents, &word)
+        .into_iter()
+        .map(|id| Suggestion {
             insert: id.clone(),
             label: id,
-        });
+        })
+        .collect();
+    if call.is_some() || in_code {
+        out.items.splice(0..0, names);
+    } else {
+        out.items.extend(names);
     }
     // Typed in full already: nothing to add.
     out.items.retain(|s| s.insert != word);
@@ -2102,6 +2180,25 @@ mod tests {
             "free text: nothing to suggest"
         );
         assert!(items("5").is_empty());
+        // Inside an expression argument, quoted or not: series first, text in backticks.
+        let s2: Vec<String> = ["user", "sys", "busy"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let items2 = |t: &str| -> Vec<String> {
+            complete(t, t.chars().count(), &s2)
+                .items
+                .into_iter()
+                .map(|i| i.insert)
+                .collect()
+        };
+        assert_eq!(items2(r#"add_line("total", "us"#)[0], "user");
+        assert_eq!(items2(r#"add_line("total", us"#)[0], "user");
+        assert_eq!(items2(r#"add_line("total", "user + s"#)[0], "sys");
+        assert_eq!(items2(r#"add_line("t", "ema(values(`b"#), ["busy`"]);
+        assert!(items2(r#"add_line("t", "va"#).contains(&"values(`".to_string()));
+        assert_eq!(items2(r#"mark_when("del"#), ["delta"]);
+        assert_eq!(items2(r#"alert("sy"#)[0], "sys");
         let c = complete("slope(\"api\", ", 13, &s);
         assert_eq!(c.signature.map(|s| s.0), Some(r#"slope("api", "1h")"#));
     }

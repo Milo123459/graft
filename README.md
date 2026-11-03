@@ -588,6 +588,11 @@ Answers come in the series' unit and say which point they're from:
 placed, the value there too (`at("api")` is the value at the cursor). Trends read
 as words: `slope("api", "1h")` → `api is rising 2.1 ms per hour`.
 
+Expressions that are kept to run later can be written as code, no quotes needed:
+`add_line("total", user + sys)`, `alert(api > 45ms)`,
+`mark_when(value > 60ms, "spike")`, `bind("r", only("api"))`; Tab completes series,
+functions and (in a marker rule) `value`, `prev`, `delta`… inside them, quoted or not.
+
 A mistake is explained in plain words with a fix, and the console stays open on it
 with the cursor at the problem: `last(api)` → *last() needs the series' name in
 quotes: last("api")*; `lst("api")` → *did you mean last("api")?*.

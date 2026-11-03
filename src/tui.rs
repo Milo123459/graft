@@ -4544,6 +4544,32 @@ impl App {
                 self.rebuild(true);
             }
             Action::AddLine(name, expr) => {
+                // Custom lines are worked out from this chart's own data: a pane with a
+                // source of its own (a dashboard's memory pane) can't have one.
+                if let Some(src) = self.focused_pane().and_then(|p| p.source.clone()) {
+                    let theirs = self.pane_series_names().join(", ");
+                    let main: Vec<String> = self.opts.panes.as_ref().map_or(Vec::new(), |p| {
+                        p.panes
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, q)| q.source.is_none())
+                            .map(|(i, _)| (i + 1).to_string())
+                            .collect()
+                    });
+                    let go = match main.as_slice() {
+                        [] => "add a pane showing this chart (pane_source(\"main\"))".to_string(),
+                        [one] => format!("pick pane {one} first"),
+                        many => format!("pick one of panes {} first", many.join(", ")),
+                    };
+                    self.say(
+                        format!(
+                            "add_line: this pane shows '{src}' ({theirs}); custom lines are \
+                             worked out from the main chart's series — {go}"
+                        ),
+                        true,
+                    );
+                    return;
+                }
                 match crate::lines::CustomLine::parse(&format!("{name} = {expr}")) {
                     Ok(line) => {
                         match self.session.custom.iter().position(|l| l.name == line.name) {
@@ -8527,5 +8553,35 @@ pub(crate) mod tests {
         // One chart: the legend row does it, no box.
         run(&mut app, "single()");
         assert!(!screen_sized(&app, 160, 40).contains("│node1 58.8 GB "));
+    }
+
+    #[test]
+    fn expressions_without_quotes_and_lines_in_source_panes() {
+        let mut app = app(&["graft", LOG]);
+        // Code arguments can be written as code.
+        run(&mut app, "add_line(\"total\", node1 + node2)");
+        let total = app
+            .ds
+            .series
+            .iter()
+            .find(|s| s.name == "total")
+            .expect("total");
+        assert!(total.points.len() > 20);
+        run(&mut app, "alert(node1 < 59GB)");
+        assert_eq!(app.alerts, ["node1 < 59GB"]);
+        run(&mut app, r#"mark_when(delta < -1GB, "drop")"#);
+        assert_eq!(app.mark_rules.last().unwrap().expr, "delta < -1GB");
+        // A pane with its own source can't take a custom line: it says why.
+        let mut app =
+            super::tests::app(&["graft", LOG, "--kv", "--pane", "*", "--pane", "source=load"]);
+        run(&mut app, "focus_pane(2)");
+        run(&mut app, "add_line(\"t\", node1 + node2)");
+        let n = app.console_note.as_ref().unwrap();
+        assert!(
+            n.error && n.text.contains("this pane shows 'load'") && n.text.contains("pick pane 1"),
+            "{}",
+            n.text
+        );
+        assert!(app.session.custom.is_empty());
     }
 }
