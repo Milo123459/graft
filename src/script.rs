@@ -79,6 +79,8 @@ pub enum Action {
     Unmerge(String),
     /// Load a Rhai script file while running.
     Load(String),
+    /// `param("interval", "1h")`: set a source's parameter.
+    Param(String, String),
     /// Add (or, when editing, replace) an alert condition.
     Alert(String),
     Unalert(String),
@@ -693,6 +695,11 @@ pub const USAGE: &[(&str, &str, &str)] = &[
         "add a source's series",
     ),
     ("unmerge", r#"unmerge("cpu")"#, "remove a merged source"),
+    (
+        "param",
+        r#"param("interval", "1h")"#,
+        "set a source's setting (--param)",
+    ),
     // keeping things
     ("undo", "undo()", "a step back"),
     ("redo", "redo()", "a step forward"),
@@ -816,7 +823,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "layout",
         ],
     ),
-    ("sources", &["merge", "unmerge", "load", "format"]),
+    ("sources", &["merge", "unmerge", "param", "load", "format"]),
     (
         "keep",
         &["undo", "redo", "copy", "save", "svg", "bind", "quit"],
@@ -2231,6 +2238,10 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
     let st = state.clone();
     engine.register_fn("load", move |path: &str| {
         push(&st, Action::Load(path.into()))
+    });
+    let st = state.clone();
+    engine.register_fn("param", move |name: &str, value: &str| {
+        push(&st, Action::Param(name.into(), value.into()))
     });
     let st = state.clone();
     engine.register_fn("title", move |t: &str| push(&st, Action::Title(t.into())));

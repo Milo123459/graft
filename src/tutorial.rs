@@ -589,6 +589,10 @@ From here on the steps are a reference: read what's useful, skip the rest with E
                 "open the builder first (graft alone does too)",
             ),
             (
+                "--param 'interval = 1m | 5m | 1h'",
+                "a setting: {interval} in the command; a dropdown in the viewer runs it again",
+            ),
+            (
                 r#"--source 'mem = -c "cat /proc/meminfo" --kv' --pane 'source=mem'"#,
                 "a named source for a pane (it replaces a preset with that name)",
             ),
@@ -834,7 +838,10 @@ From here on the steps are a reference: read what's useful, skip the rest with E
                 "undo() redo() copy() save() load() bind()",
                 "undo, keep, scripts and keys",
             ),
-            ("merge() unmerge()", "add or drop a source"),
+            (
+                "merge() unmerge() param()",
+                "add or drop a source; set a source's setting",
+            ),
             ("mark() mark_when() clear_marks()", "markers"),
             (
                 "alert() unalert() notify_to() notify_off()",

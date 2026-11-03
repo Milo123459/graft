@@ -76,7 +76,17 @@ fn validate_stats_template(t: &str) -> Result<()> {
 }
 
 pub fn source_spec(cli: &Cli, interactive: bool) -> Result<SourceSpec> {
-    Ok(match (&cli.cmd, &cli.input) {
+    // --param values go into the command and the file name.
+    let params = crate::params::parse_all(&cli.param);
+    for p in &cli.param {
+        crate::params::Param::parse(p)?;
+    }
+    let cmd = cli.cmd.as_ref().map(|c| crate::params::fill(c, &params));
+    let input = cli
+        .input
+        .as_ref()
+        .map(|p| std::path::PathBuf::from(crate::params::fill(&p.display().to_string(), &params)));
+    Ok(match (&cmd, &input) {
         (Some(cmd), _) => {
             // Non-interactive runs take one sample unless told otherwise.
             let count = cli.count.or((!interactive).then_some(1));

@@ -246,6 +246,20 @@ graft -c 'now=$(date +%s)000; curl -s --json "{\"type\":\"candleSnapshot\",\"req
   --layout '1 /60% ((2 | 3) / 4)' --title 'ETH 1m'
 ```
 
+### Source settings (`--param`)
+
+A source can have settings with a few choices, filled in wherever its command (or
+file name) says `{name}`:
+
+```sh
+graft -c 'curl -s … "interval":"{interval}" …' --param 'interval = 1m | 5m | 15m | 1h | 4h | 1d' …
+```
+
+The viewer shows a dropdown for each (`interval: 1m ▾`); picking another value runs
+the source again with fresh data (`param("interval", "1h")` in the console does the
+same, so it can go on a key). `*` marks the current choice: `1m | *1h`. Merged and
+pane sources can have their own (`--merge 'b = -c "…{coin}…" --param "coin = ETH | BTC"'`).
+
 ### Combining sources (`--merge`)
 
 Several sources can share one chart: each `--merge` adds another source's

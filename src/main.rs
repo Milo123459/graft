@@ -9,6 +9,7 @@ mod interactive;
 mod lines;
 mod marks;
 mod notify;
+mod params;
 mod parse;
 mod profile;
 mod recent;

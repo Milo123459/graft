@@ -205,6 +205,9 @@ enum Hit {
     /// Sources menu: edit one (`None`: the main source), remove a merged one, add one.
     SourceEdit(Option<usize>),
     SourceRemove(usize),
+    /// A source parameter's dropdown (whose, which), and a choice in it.
+    ParamMenu(ParamTarget, usize),
+    ParamPick(ParamTarget, usize, usize),
     /// Pick another source for pane `n`, or edit the one it has.
     SourcePane(usize),
     SourcePaneEdit(usize),
@@ -217,6 +220,14 @@ enum Hit {
     /// The tutorial panel.
     Tutorial(TutorialHit),
     MenuBackground,
+}
+
+/// Whose parameters: the main source, merged source `n`, or pane `n`'s own source.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ParamTarget {
+    Main,
+    Merge(usize),
+    Pane(usize),
 }
 
 /// Tab completion in progress.
@@ -455,6 +466,8 @@ pub struct App {
     clipboard: Option<String>,
     /// The sources menu is open.
     sources_menu: bool,
+    /// A parameter's dropdown is open: whose, which.
+    param_menu: Option<(ParamTarget, usize)>,
     /// The open popup's area (as last drawn), and which of its buttons the arrow
     /// keys have picked.
     popup_rect: std::cell::Cell<Option<Rect>>,
@@ -588,6 +601,7 @@ impl App {
             tutorial,
             console_note: None,
             sources_menu: false,
+            param_menu: None,
             popup_rect: std::cell::Cell::new(None),
             popup_focus: std::cell::Cell::new(0),
             popup_kind: std::cell::Cell::new(0),
@@ -3424,6 +3438,21 @@ impl App {
             .into_iter()
             .filter_map(pick),
         );
+        // The main source's settings, as dropdowns: interval: 1h ▾
+        for (k, p) in self.params_of(ParamTarget::Main).iter().enumerate() {
+            let at = v
+                .iter()
+                .position(|b| b.action == Hit::Cmd(Cmd::RangeMenu))
+                .map_or(v.len(), |i| i + 1 + k);
+            v.insert(
+                at.min(v.len()),
+                Button::new(
+                    format!("{}: {} ▾", p.name, p.value()),
+                    Hit::ParamMenu(ParamTarget::Main, k),
+                )
+                .active(self.param_menu == Some((ParamTarget::Main, k))),
+            );
+        }
         // Markers and alerts, once there are some.
         if self.mark_rows() > 0 {
             v.extend(pick(Cmd::Markers));
@@ -3674,6 +3703,8 @@ impl App {
             3
         } else if self.alerts_menu {
             4
+        } else if self.param_menu.is_some() {
+            5
         } else {
             0
         }
@@ -3776,6 +3807,212 @@ impl App {
             if let Some(cell) = buf.cell_mut((x, r.y)) {
                 cell.set_style(Style::default().fg(Color::Black).bg(Color::Yellow));
             }
+        }
+    }
+
+    // ───────────── source parameters ─────────────
+
+    /// The parameters of a source: the main one, a merged one, or a pane's own.
+    fn params_of(&self, t: ParamTarget) -> Vec<crate::params::Param> {
+        let specs = match t {
+            ParamTarget::Main => self.cli.param.clone(),
+            ParamTarget::Merge(i) => self
+                .cli
+                .merge
+                .get(i)
+                .and_then(|s| crate::sources::Merge::parse(s).ok())
+                .map(|m| m.cli().param)
+                .unwrap_or_default(),
+            ParamTarget::Pane(id) => self
+                .opts
+                .panes
+                .as_ref()
+                .and_then(|p| p.panes.get(id))
+                .and_then(|p| p.source.clone())
+                .and_then(|name| {
+                    crate::sources::cli_for(&name, self.cli.ssh.as_deref(), &self.cli.source).ok()
+                })
+                .map(|c| c.param)
+                .unwrap_or_default(),
+        };
+        crate::params::parse_all(&specs)
+    }
+
+    /// Set a source's parameter and run it again with the new value.
+    fn set_param(&mut self, t: ParamTarget, param: &str, value: &str) -> Result<(), String> {
+        let args = |c: &Cli| {
+            c.to_args()
+                .iter()
+                .map(|a| crate::cli::shell_quote(a))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        match t {
+            ParamTarget::Main => {
+                self.cli.param =
+                    crate::params::set(&self.cli.param, param, value).map_err(|e| e.to_string())?;
+                self.restart_main().map_err(|e| format!("{e:#}"))?;
+            }
+            ParamTarget::Merge(i) => {
+                let m = self
+                    .cli
+                    .merge
+                    .get(i)
+                    .and_then(|s| crate::sources::Merge::parse(s).ok())
+                    .ok_or("no such merged source")?;
+                let mut c = m.cli();
+                c.param = crate::params::set(&c.param, param, value).map_err(|e| e.to_string())?;
+                let spec = format!("{} = {}", m.name, args(&c));
+                self.set_merged_source(Some(&m.name), spec)
+                    .map_err(|e| format!("{e:#}"))?;
+            }
+            ParamTarget::Pane(id) => {
+                let name = self
+                    .opts
+                    .panes
+                    .as_ref()
+                    .and_then(|p| p.panes.get(id))
+                    .and_then(|p| p.source.clone())
+                    .ok_or("that pane has no source of its own")?;
+                let mut c =
+                    crate::sources::cli_for(&name, self.cli.ssh.as_deref(), &self.cli.source)
+                        .map_err(|e| format!("{e:#}"))?;
+                c.param = crate::params::set(&c.param, param, value).map_err(|e| e.to_string())?;
+                let spec = format!("{name} = {}", args(&c));
+                self.set_pane_source_def(id, Some(&name), spec)
+                    .map_err(|e| format!("{e:#}"))?;
+            }
+        }
+        self.say(format!("{param}: {value}"), false);
+        Ok(())
+    }
+
+    /// Run the main source again (its parameters changed): fresh data, same view.
+    fn restart_main(&mut self) -> anyhow::Result<()> {
+        let cli = self.current_cli();
+        let spec = crate::setup::source_spec(&cli, true)?;
+        let setup = crate::setup::build(cli, spec.clone(), false)?;
+        self.session = setup.session;
+        self.cli = setup.cli;
+        self.live = Live::new(spec);
+        self.view = None;
+        self.selection = None;
+        self.anchor = None;
+        self.cursor = None;
+        self.started = Instant::now();
+        self.rebuild(true);
+        Ok(())
+    }
+
+    /// `param("interval", "1h")`: the picked pane's source if it has that setting,
+    /// else the main source, else a merged one.
+    fn param_from_console(&mut self, name: &str, value: &str) {
+        let mut targets = Vec::new();
+        if let Some(p) = &self.opts.panes
+            && p.panes.get(p.focus).is_some_and(|q| q.source.is_some())
+        {
+            targets.push(ParamTarget::Pane(p.focus));
+        }
+        targets.push(ParamTarget::Main);
+        targets.extend((0..self.cli.merge.len()).map(ParamTarget::Merge));
+        let Some(t) = targets
+            .into_iter()
+            .find(|t| self.params_of(*t).iter().any(|p| p.name == name))
+        else {
+            let all: Vec<String> = self
+                .params_of(ParamTarget::Main)
+                .into_iter()
+                .map(|p| p.name)
+                .collect();
+            let have = if all.is_empty() {
+                "this chart's source has none (add one with --param 'interval = 1m | 1h')"
+                    .to_string()
+            } else {
+                format!("it has {}", all.join(", "))
+            };
+            return self.say(format!("param: no setting called '{name}' — {have}"), true);
+        };
+        if let Err(e) = self.set_param(t, name, value) {
+            self.say(format!("param: {e}"), true);
+        }
+    }
+
+    /// A parameter's choices, under its toolbar button.
+    fn draw_param_menu(&self, f: &mut Frame) {
+        let Some((t, k)) = self.param_menu else {
+            return;
+        };
+        let Some(p) = self.params_of(t).into_iter().nth(k) else {
+            return;
+        };
+        let area = f.area();
+        let w = (p
+            .choices
+            .iter()
+            .map(|c| c.chars().count())
+            .max()
+            .unwrap_or(4) as u16
+            + 6)
+        .max(p.name.chars().count() as u16 + 4)
+        .min(area.width);
+        let h = (p.choices.len() as u16 + 2).min(area.height);
+        let anchor = self
+            .hits
+            .find(|h| matches!(h, Hit::ParamMenu(pt, pk) if *pt == t && *pk == k));
+        let (x, y) = match anchor {
+            Some(r) => (
+                r.x.min(area.width.saturating_sub(w)),
+                if r.y >= h {
+                    r.y - h
+                } else {
+                    (r.y + 1).min(area.height.saturating_sub(h))
+                },
+            ),
+            None => ((area.width - w) / 2, area.height.saturating_sub(h) / 2),
+        };
+        let rect = Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        };
+        Clear.render(rect, f.buffer_mut());
+        self.popup_rect.set(Some(rect));
+        let block = Block::bordered()
+            .title(format!(" {} ", p.name))
+            .border_style(Style::default().fg(Color::Yellow));
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        self.hits.push(rect, Hit::MenuBackground);
+        for (i, c) in p.choices.iter().enumerate() {
+            let y = inner.y + i as u16;
+            if y >= inner.bottom() {
+                break;
+            }
+            let r = Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            };
+            let on = i == p.current;
+            let style = if on {
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let mark = if on { "●" } else { " " };
+            f.render_widget(
+                Span::styled(
+                    format!(
+                        "{mark} {c:<width$}",
+                        width = r.width.saturating_sub(2) as usize
+                    ),
+                    style,
+                ),
+                r,
+            );
+            self.hits.push(r, Hit::ParamPick(t, k, i));
         }
     }
 
@@ -4611,6 +4848,7 @@ impl App {
             Action::Svg(path) => self.export_view(path),
             Action::Pane(a) => self.apply_pane_action(a),
             Action::Copy(text) => self.copy(text),
+            Action::Param(name, value) => self.param_from_console(&name, &value),
             Action::Merge(spec) => match crate::sources::Merge::parse(&spec) {
                 Ok(m) => {
                     self.cli.merge.retain(|s| {
@@ -5014,7 +5252,8 @@ impl App {
             || self.source_menu.is_some()
             || self.marks_menu.is_some()
             || self.alerts_menu
-            || self.sources_menu)
+            || self.sources_menu
+            || self.param_menu.is_some())
     }
 
     fn cli_bits(&self) -> CliBits {
@@ -5240,6 +5479,10 @@ impl App {
         if self.sources_menu {
             return self.on_sources_menu_key(key);
         }
+        if self.param_menu.is_some() {
+            self.param_menu = None;
+            return Transition::None;
+        }
         if self.alerts_menu {
             match key.code {
                 KeyCode::Char('a') => self.edit_alert(None),
@@ -5458,6 +5701,23 @@ impl App {
                         }
                         Hit::SourceEdit(i) => self.edit_source(i),
                         Hit::SourceAdd => self.edit_source(Some(usize::MAX)),
+                        Hit::ParamMenu(t, k) => {
+                            self.param_menu = match self.param_menu {
+                                Some(open) if open == (t, k) => None,
+                                _ => Some((t, k)),
+                            };
+                            Transition::None
+                        }
+                        Hit::ParamPick(t, k, i) => {
+                            self.param_menu = None;
+                            if let Some(p) = self.params_of(t).into_iter().nth(k)
+                                && let Some(v) = p.choices.get(i).cloned()
+                                && let Err(e) = self.set_param(t, &p.name, &v)
+                            {
+                                self.say(e, true);
+                            }
+                            Transition::None
+                        }
                         Hit::SourcePaneEdit(id) => {
                             self.sources_menu = false;
                             self.pane_to_edit = Some(id);
@@ -6097,6 +6357,7 @@ impl App {
         self.draw_marks_menu(f);
         self.draw_alerts_menu(f);
         self.draw_sources_menu(f);
+        self.draw_param_menu(f);
         self.draw_popup_focus(f);
         if self.help {
             let mut entries: Vec<(String, String, Color)> = HELP
@@ -8773,6 +9034,46 @@ pub(crate) mod tests {
         assert_eq!(
             app.console.as_ref().map(|c| c.value.as_str()),
             Some(r#"at("api")"#)
+        );
+    }
+
+    #[test]
+    fn source_parameters_rerun_the_source() {
+        let mut app = app(&[
+            "graft",
+            "-c",
+            "echo {interval}=1",
+            "--count",
+            "1",
+            "--kv",
+            "--param",
+            "interval = m1 | h1",
+        ]);
+        assert_eq!(app.ds_names(), ["m1"]);
+        // The toolbar has a dropdown; picking a value runs the source again.
+        let (x, y) = find(&app, "interval: m1 ▾");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert!(app.param_menu.is_some());
+        let (x, y) = find(&app, "  h1");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        let t0 = Instant::now();
+        while !app.live.eof && t0.elapsed() < Duration::from_secs(5) {
+            app.tick();
+        }
+        app.rebuild(true);
+        assert_eq!(app.ds_names(), ["h1"], "fresh data with the new value");
+        assert_eq!(app.current_cli().param, ["interval = m1 | *h1"]);
+        // And from the console; a value it doesn't have is refused, with the choices.
+        run(&mut app, r#"param("interval", "d1")"#);
+        let n = app.console_note.as_ref().unwrap();
+        assert!(n.error && n.text.contains("m1, h1"), "{}", n.text);
+        run(&mut app, r#"param("coin", "ETH")"#);
+        assert!(
+            app.console_note
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("no setting called 'coin'")
         );
     }
 }

@@ -58,6 +58,13 @@ pub struct Cli {
     #[arg(long, value_name = "NAME[ = ARGS]", help_heading = "Input")]
     pub merge: Vec<String>,
 
+    /// A setting of the source, with its choices: `--param 'interval = 1m | 5m | 1h'`,
+    /// filled in wherever the command (or file name) says `{interval}`. The viewer
+    /// offers a dropdown (and `param("interval", "1h")`); picking another value runs
+    /// the source again. `*` marks the current choice (else it's the first). Repeatable.
+    #[arg(long, value_name = "NAME = A | B | …", help_heading = "Input")]
+    pub param: Vec<String>,
+
     /// A point at the same time (x) as one already read replaces it, instead of adding
     /// another: for APIs that return the same history every poll, like price candles
     /// (the newest one still changing).
@@ -547,6 +554,9 @@ impl Cli {
         }
         for s in &self.source {
             opt("--source", Some(s.clone()));
+        }
+        for p in &self.param {
+            opt("--param", Some(p.clone()));
         }
         opt(
             "--every",
