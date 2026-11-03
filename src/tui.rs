@@ -4721,7 +4721,7 @@ impl App {
                 let area = self.chart_rect.get();
                 if let Some(p) = self.opts.panes.as_mut() {
                     if p.count() > 1
-                        && let Some((path, a)) = p.border_at(area, col, row)
+                        && let Some((path, a)) = p.grab_border(area, col, row)
                     {
                         let bits = path
                             .iter()

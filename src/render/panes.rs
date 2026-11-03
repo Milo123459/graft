@@ -262,23 +262,29 @@ impl Panes {
     /// Move a border of the focused pane towards `dir` by `step` (a share of the split):
     /// the edge on that side if it has one, else the opposite edge (zellij-style).
     pub fn resize(&mut self, dir: Dir, step: f64) -> bool {
-        let path = path_to(&self.root, self.focus).unwrap_or_default();
         let want = match dir {
             Dir::Left | Dir::Right => Split::Across,
             Dir::Up | Dir::Down => Split::Down,
         };
+        // In a grid, `(1 | 2) / (3 | 4)` would move 2 along with 1: turn that part into
+        // columns, `(1 / 3) | (2 / 4)`, so only 1's column changes (and back again for
+        // side to side). Only when every pane keeps its size.
+        for _ in 0..8 {
+            let path = path_to(&self.root, self.focus).unwrap_or_default();
+            let Some(depth) = self.resize_depth(&path, want, dir) else {
+                return false;
+            };
+            let shares_border = matches!(
+                node_at(&self.root, &path[..=depth]),
+                Node::Split { split, .. } if *split != want
+            );
+            if !(shares_border && transpose(node_at_mut(&mut self.root, &path[..depth]))) {
+                break;
+            }
+        }
+        let path = path_to(&self.root, self.focus).unwrap_or_default();
         let towards_end = matches!(dir, Dir::Right | Dir::Down);
-        let splits: Vec<usize> = (0..path.len())
-            .rev()
-            .filter(|&d| matches!(node_at_mut(&mut self.root.clone(), &path[..d]), Node::Split { split, .. } if *split == want))
-            .collect();
-        // The edge on the `dir` side: the pane is in the first part when it's the right/bottom edge.
-        let depth = splits
-            .iter()
-            .copied()
-            .find(|&d| !path[d] == towards_end)
-            .or_else(|| splits.first().copied());
-        let Some(depth) = depth else {
+        let Some(depth) = self.resize_depth(&path, want, dir) else {
             return false;
         };
         if let Node::Split { ratio, .. } = node_at_mut(&mut self.root, &path[..depth]) {
@@ -288,11 +294,38 @@ impl Panes {
         true
     }
 
+    /// Which split on the focused pane's `path` a resize towards `dir` moves.
+    fn resize_depth(&self, path: &[bool], want: Split, dir: Dir) -> Option<usize> {
+        let towards_end = matches!(dir, Dir::Right | Dir::Down);
+        let splits: Vec<usize> = (0..path.len())
+            .rev()
+            .filter(|&d| matches!(node_at(&self.root, &path[..d]), Node::Split { split, .. } if *split == want))
+            .collect();
+        // The edge on the `dir` side: the pane is in the first part when it's the right/bottom edge.
+        splits
+            .iter()
+            .copied()
+            .find(|&d| !path[d] == towards_end)
+            .or_else(|| splits.first().copied())
+    }
+
     /// The border under (col, row), as a split to drag: (path, its area).
     pub fn border_at(&self, area: Rect, col: u16, row: u16) -> Option<(Vec<bool>, Rect)> {
         let mut found = None;
         find_border(&self.root, area, col, row, &mut Vec::new(), &mut found);
         found
+    }
+
+    /// The border to drag from (col, row): in a grid, just the part beside the panes
+    /// there (like resizing with keys), not the whole row or column of them.
+    pub fn grab_border(&mut self, area: Rect, col: u16, row: u16) -> Option<(Vec<bool>, Rect)> {
+        for _ in 0..8 {
+            let (path, _) = self.border_at(area, col, row)?;
+            if !transpose(node_at_mut(&mut self.root, &path)) {
+                break;
+            }
+        }
+        self.border_at(area, col, row)
     }
 
     /// Drag a border (from `border_at`) to (col, row).
@@ -486,6 +519,59 @@ fn path_to(node: &Node, id: usize) -> Option<Vec<bool>> {
             }
         }
     }
+}
+
+fn node_at<'a>(mut node: &'a Node, path: &[bool]) -> &'a Node {
+    for &second in path {
+        match node {
+            Node::Split { a, b, .. } => node = if second { b } else { a },
+            Node::Leaf(_) => break,
+        }
+    }
+    node
+}
+
+/// `(a | b) / (c | d)` → `(a / c) | (b / d)`, or the other way: only when both halves
+/// split at the same place, so every pane keeps its size. Whether it did.
+fn transpose(node: &mut Node) -> bool {
+    let Node::Split { split, ratio, a, b } = node else {
+        return false;
+    };
+    let (
+        Node::Split {
+            split: sa,
+            ratio: ra,
+            a: a1,
+            b: a2,
+        },
+        Node::Split {
+            split: sb,
+            ratio: rb,
+            a: b1,
+            b: b2,
+        },
+    ) = (a.as_ref(), b.as_ref())
+    else {
+        return false;
+    };
+    if sa != sb || sa == split || (ra - rb).abs() > 0.01 {
+        return false;
+    }
+    let half = |x: &Node, y: &Node| {
+        Box::new(Node::Split {
+            split: *split,
+            ratio: *ratio,
+            a: Box::new(x.clone()),
+            b: Box::new(y.clone()),
+        })
+    };
+    *node = Node::Split {
+        split: *sa,
+        ratio: (ra + rb) / 2.0,
+        a: half(a1, b1),
+        b: half(a2, b2),
+    };
+    true
 }
 
 fn node_at_mut<'a>(mut node: &'a mut Node, path: &[bool]) -> &'a mut Node {
@@ -780,6 +866,49 @@ mod tests {
         assert!(parse_layout("1 | ").is_err());
         assert!(parse_layout("1 + 2").is_err());
         assert!(Panes::from_args(&[], Some("1 | 1")).is_err());
+    }
+
+    #[test]
+    fn resizing_in_a_grid_moves_only_that_column_or_row() {
+        let mut p = Panes::from_args(&[], Some("(1 | 2) / (3 | 4)"))
+            .unwrap()
+            .unwrap();
+        let area = Rect::new(0, 0, 100, 40);
+        let sizes = |p: &Panes| -> Vec<(u16, u16)> {
+            let mut r = p.rects(area);
+            r.sort_by_key(|x| x.0);
+            r.iter().map(|x| (x.1.width, x.1.height)).collect()
+        };
+        let before = sizes(&p);
+        // Pane 1 taller: pane 2 (beside it) stays as it was.
+        p.focus = 0;
+        assert!(p.resize(Dir::Down, 0.1));
+        let after = sizes(&p);
+        assert_eq!(after[0], (before[0].0, before[0].1 + 4), "{after:?}");
+        assert_eq!(after[1], before[1], "pane 2 untouched");
+        assert_eq!(after[2].1, before[2].1 - 4, "pane 3 (below) gives way");
+        assert_eq!(after[3], before[3]);
+        // Side to side now moves the column border (1 and 3 together: they're a column).
+        assert!(p.resize(Dir::Right, 0.1));
+        assert_eq!(sizes(&p)[1].1, before[1].1, "2 keeps its height");
+        // Dragging the middle border under pane 4 moves only 2 and 4's border.
+        let mut q = Panes::from_args(&[], Some("(1 | 2) / (3 | 4)"))
+            .unwrap()
+            .unwrap();
+        let (path, a) = q.grab_border(area, 75, 20).unwrap();
+        q.drag_border(&path, a, 75, 30);
+        let s = sizes(&q);
+        assert_eq!(
+            (s[0], s[2]),
+            (before[0], before[2]),
+            "the left column is untouched"
+        );
+        assert!(s[1].1 > before[1].1 && s[3].1 < before[3].1, "{s:?}");
+        // Layouts that can't be columns (3 spans the width) resize as before.
+        let mut r = Panes::from_args(&[], Some("(1 | 2) / 3")).unwrap().unwrap();
+        r.focus = 0;
+        assert!(r.resize(Dir::Down, 0.1));
+        assert_eq!(sizes(&r)[1].1, sizes(&r)[0].1, "1 and 2 move together");
     }
 
     #[test]
