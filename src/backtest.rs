@@ -145,6 +145,23 @@ pub struct Trades {
 }
 
 impl Trades {
+    /// From (time, % return) of each closed trade: the drawdown in time order.
+    pub fn from_closed(mut closed: Vec<(f64, f64)>, open: Option<f64>, in_market: f64) -> Trades {
+        closed.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let (mut equity, mut peak, mut drawdown) = (1.0f64, 1.0f64, 0.0f64);
+        for &(_, r) in &closed {
+            equity *= 1.0 + r / 100.0;
+            peak = peak.max(equity);
+            drawdown = drawdown.max((peak - equity) / peak * 100.0);
+        }
+        Trades {
+            closed: closed.into_iter().map(|c| c.1).collect(),
+            open,
+            drawdown,
+            in_market,
+        }
+    }
+
     /// The closed trades' compounded return, in %.
     pub fn total(&self) -> f64 {
         (self
@@ -153,22 +170,6 @@ impl Trades {
             .fold(1.0, |acc, r| acc * (1.0 + r / 100.0))
             - 1.0)
             * 100.0
-    }
-
-    /// One line for a table of strategies: `name +3.1% · 6 trades, 67% won · dd 1.2%`.
-    pub fn line(&self, name: &str) -> String {
-        let n = self.closed.len();
-        if n == 0 {
-            return format!("{name}: no finished trades");
-        }
-        let wins = self.closed.iter().filter(|r| **r > 0.0).count();
-        format!(
-            "{name} {:+.2}% · {n} {}, {:.0}% won · drawdown {:.1}%",
-            self.total(),
-            if n == 1 { "trade" } else { "trades" },
-            wins as f64 / n as f64 * 100.0,
-            self.drawdown
-        )
     }
 
     pub fn summary(&self, entry: &str, exit: &str, series: &str) -> String {
@@ -199,66 +200,265 @@ impl Trades {
     }
 }
 
-/// Buy at each entry (when not already in), sell at the next exit after it.
-/// `fee`: % taken on each buy and each sell (0.05 = 0.05%).
-pub fn trades(entries: &[&Mark], exits: &[&Mark], s: &Series, fee: f64) -> Trades {
-    let mut entries: Vec<f64> = entries.iter().map(|m| m.x).collect();
-    let mut exits: Vec<f64> = exits.iter().map(|m| m.x).collect();
-    entries.sort_by(f64::total_cmp);
-    exits.sort_by(f64::total_cmp);
-    let mut closed = Vec::new();
-    let mut open = None;
-    let (mut equity, mut peak, mut drawdown) = (1.0f64, 1.0f64, 0.0f64);
-    let mut time_in = 0.0;
+/// Long (buy at entries, sell at exits) or short (sell at exits… i.e. the other way:
+/// in at the exit rule's markers, out at the entry rule's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Long,
+    Short,
+}
+
+/// How trades are run: the side, a stop-loss and a take-profit (% from the entry
+/// price), and the fee (% per buy and per sell).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rules {
+    pub side: Side,
+    pub stop: Option<f64>,
+    pub take: Option<f64>,
+    pub fee: f64,
+}
+
+impl Rules {
+    pub fn long(fee: f64) -> Rules {
+        Rules {
+            side: Side::Long,
+            stop: None,
+            take: None,
+            fee,
+        }
+    }
+
+    /// `long · SL 1% · TP 3%` (`no SL` / `no TP` when there's none).
+    pub fn describe(&self) -> String {
+        let side = match self.side {
+            Side::Long => "long",
+            Side::Short => "short",
+        };
+        let stop = self
+            .stop
+            .map_or("no SL".to_string(), |v| format!("SL {v}%"));
+        let take = self
+            .take
+            .map_or("no TP".to_string(), |v| format!("TP {v}%"));
+        format!("{side} · {stop} · {take}")
+    }
+}
+
+/// The prices trades run on: the close, and the high and low if there are any (so a
+/// stop or take-profit is hit within a candle, not only at its close).
+#[derive(Debug, Clone, Copy)]
+pub struct Prices<'a> {
+    pub close: &'a Series,
+    pub high: Option<&'a Series>,
+    pub low: Option<&'a Series>,
+}
+
+impl<'a> Prices<'a> {
+    /// The close (`series_for`), with series called high and low if there are.
+    pub fn of(ds: &'a Dataset, close: &'a Series) -> Prices<'a> {
+        let find = |names: [&str; 2]| {
+            ds.series
+                .iter()
+                .find(|s| s.name.eq_ignore_ascii_case(names[0]))
+                .or_else(|| {
+                    ds.series
+                        .iter()
+                        .find(|s| s.name.eq_ignore_ascii_case(names[1]))
+                })
+        };
+        Prices {
+            close,
+            high: find(["high", "h"]),
+            low: find(["low", "l"]),
+        }
+    }
+}
+
+/// Run trades in `window` (from, to): in at each entry (when not already in), out at
+/// the next exit, the stop or the take-profit, whichever comes first. A trade still open
+/// at the end of the window is closed there, unless the window runs to the end of the
+/// data (then it's reported as open).
+pub fn simulate(
+    entries: &[f64],
+    exits: &[f64],
+    p: &Prices,
+    r: &Rules,
+    window: (f64, f64),
+) -> Trades {
+    let s = p.close;
+    let (ins, outs) = match r.side {
+        Side::Long => (entries, exits),
+        Side::Short => (exits, entries),
+    };
+    let mut ins: Vec<f64> = ins
+        .iter()
+        .copied()
+        .filter(|x| *x >= window.0 && *x < window.1)
+        .collect();
+    let mut outs: Vec<f64> = outs.to_vec();
+    ins.sort_by(f64::total_cmp);
+    outs.sort_by(f64::total_cmp);
+    let last_x = s.points.last().map_or(window.1, |p| p.0);
+    let to_end = window.1 >= last_x;
+    let short = r.side == Side::Short;
+    let ret =
+        |buy: f64, sell: f64| pct(buy, sell).map(|v| if short { -v } else { v } - 2.0 * r.fee);
+    let (mut closed, mut open, mut time_in) = (Vec::new(), None, 0.0);
     let mut from = f64::NEG_INFINITY;
-    for &x in &entries {
+    for &x in &ins {
         if x <= from {
             continue; // already in a trade
         }
-        let Some((_, buy)) = value_at(s, x) else {
+        let Some((i, entry)) = value_at(s, x) else {
             continue;
         };
-        match exits.iter().find(|e| **e > x) {
-            Some(&out) => {
-                let Some((_, sell)) = value_at(s, out) else {
-                    continue;
-                };
-                if let Some(r) = pct(buy, sell) {
-                    let r = r - 2.0 * fee;
-                    closed.push(r);
-                    equity *= 1.0 + r / 100.0;
-                    peak = peak.max(equity);
-                    drawdown = drawdown.max((peak - equity) / peak * 100.0);
+        let exit_at = outs
+            .iter()
+            .copied()
+            .find(|e| *e > x)
+            .filter(|e| *e <= window.1);
+        let stop_px = r.stop.map(|v| {
+            if short {
+                entry * (1.0 + v / 100.0)
+            } else {
+                entry * (1.0 - v / 100.0)
+            }
+        });
+        let take_px = r.take.map(|v| {
+            if short {
+                entry * (1.0 - v / 100.0)
+            } else {
+                entry * (1.0 + v / 100.0)
+            }
+        });
+        // Walk the candles after the entry until the exit (or the window's end).
+        let until = exit_at.unwrap_or(window.1.min(last_x));
+        let mut done: Option<(f64, f64)> = None;
+        for k in i + 1..s.points.len() {
+            let (t, c) = s.points[k];
+            if t > until {
+                break;
+            }
+            let at = |o: Option<&Series>| o.and_then(|o| value_at(o, t)).map_or(c, |v| v.1);
+            let (hi, lo) = (at(p.high).max(c), at(p.low).min(c));
+            // Both in one candle: the stop is assumed to come first.
+            let stopped = stop_px.filter(|&px| if short { hi >= px } else { lo <= px });
+            let took = take_px.filter(|&px| if short { lo <= px } else { hi >= px });
+            if let Some(px) = stopped.or(took) {
+                done = Some((t, px));
+                break;
+            }
+        }
+        let close_at = |t: f64| value_at(s, t).map(|v| (t, v.1));
+        let finish = done
+            .or_else(|| exit_at.and_then(close_at))
+            .or_else(|| (!to_end).then(|| close_at(window.1.min(last_x))).flatten());
+        match finish {
+            Some((t, px)) => {
+                if let Some(v) = ret(entry, px) {
+                    closed.push((t, v));
                 }
-                time_in += out - x;
-                from = out;
+                time_in += t - x;
+                from = t;
             }
             None => {
-                let last = s.points.last().map(|p| (p.0, p.1));
-                if let Some((end, now)) = last {
-                    open = pct(buy, now).map(|r| r - 2.0 * fee);
+                if let Some(&(end, now)) = s.points.last() {
+                    open = ret(entry, now);
                     time_in += end - x;
                 }
                 break;
             }
         }
     }
-    let span = match (entries.first(), s.points.last()) {
-        (Some(a), Some(b)) if b.0 > *a => b.0 - a,
+    let span = match ins.first() {
+        Some(a) if window.1.min(last_x) > *a => window.1.min(last_x) - a,
         _ => 0.0,
     };
-    Trades {
-        closed,
-        open,
-        drawdown,
-        in_market: if span > 0.0 { time_in / span } else { 0.0 },
-    }
+    Trades::from_closed(closed, open, if span > 0.0 { time_in / span } else { 0.0 })
 }
 
-/// What simply holding `s` from its first point to its last returned, in %.
-pub fn hold(s: &Series) -> Option<f64> {
-    pct(s.points.first()?.1, s.points.last()?.1)
+/// Buy at each entry (when not already in), sell at the next exit after it.
+/// `fee`: % taken on each buy and each sell (0.05 = 0.05%).
+pub fn trades(entries: &[&Mark], exits: &[&Mark], s: &Series, fee: f64) -> Trades {
+    let xs = |m: &[&Mark]| m.iter().map(|m| m.x).collect::<Vec<_>>();
+    let p = Prices {
+        close: s,
+        high: None,
+        low: None,
+    };
+    simulate(
+        &xs(entries),
+        &xs(exits),
+        &p,
+        &Rules::long(fee),
+        (f64::NEG_INFINITY, f64::INFINITY),
+    )
 }
+
+/// Stops and take-profits worth trying (%; `None`: none).
+pub const STOPS: [Option<f64>; 6] = [None, Some(0.5), Some(1.0), Some(2.0), Some(3.0), Some(5.0)];
+pub const TAKES: [Option<f64>; 6] = [None, Some(1.0), Some(2.0), Some(3.0), Some(5.0), Some(8.0)];
+
+/// The best way to trade a strategy: each side with each stop and take-profit, picked
+/// on the first `train` share of the time and then run on the rest (which it wasn't
+/// picked on) — a stop that only fits the past shows up there.
+#[derive(Debug, Clone)]
+pub struct Best {
+    pub rules: Rules,
+    /// On the part it was picked on.
+    pub picked_on: Trades,
+    /// On the rest.
+    pub after: Trades,
+    /// Every way's result on the part it was picked on (for the median).
+    pub all: Vec<f64>,
+}
+
+pub fn best(entries: &[f64], exits: &[f64], p: &Prices, fee: f64, train: f64) -> Option<Best> {
+    let (first, last) = (p.close.points.first()?.0, p.close.points.last()?.0);
+    let split = first + (last - first) * train;
+    let mut found: Option<Best> = None;
+    let mut all = Vec::new();
+    for side in [Side::Long, Side::Short] {
+        for stop in STOPS {
+            for take in TAKES {
+                let r = Rules {
+                    side,
+                    stop,
+                    take,
+                    fee,
+                };
+                let t = simulate(entries, exits, p, &r, (first, split));
+                all.push(t.total());
+                if found
+                    .as_ref()
+                    .is_none_or(|b| t.total() > b.picked_on.total())
+                {
+                    let after = simulate(entries, exits, p, &r, (split, f64::INFINITY));
+                    found = Some(Best {
+                        rules: r,
+                        picked_on: t,
+                        after,
+                        all: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+    found.map(|mut b| {
+        b.all = all;
+        b
+    })
+}
+
+/// What holding `s` from `from` to `to` returned, in %.
+pub fn hold_in(s: &Series, from: f64, to: f64) -> Option<f64> {
+    let a = s.points.iter().find(|p| p.0 >= from)?.1;
+    let b = s.points.iter().rev().find(|p| p.0 <= to)?.1;
+    pct(a, b)
+}
+
+/// The share of the time `best` picks its stops on (the rest checks them).
+pub const TRAIN: f64 = 0.7;
 
 /// The strategies among marker rules: pairs labelled `NAME in` and `NAME out` (or
 /// buy/sell, entry/exit), as (name, entry rule, exit rule).
@@ -354,6 +554,90 @@ mod tests {
             text.contains("2 times") && text.contains("up 100%"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn shorts_stops_and_take_profits() {
+        let s = price(); // 100, 110, 99, 120, 90, 100 a minute apart
+        let p = Prices {
+            close: &s,
+            high: None,
+            low: None,
+        };
+        let all = (f64::NEG_INFINITY, f64::INFINITY);
+        let rules = |side, stop, take| Rules {
+            side,
+            stop,
+            take,
+            fee: 0.0,
+        };
+        // Short: in at the exit rule's marker (120), out at the next entry's (90): +25%.
+        let t = simulate(&[240.0], &[180.0], &p, &rules(Side::Short, None, None), all);
+        assert_eq!(t.closed, [25.0]);
+        // Long from 100 with a 5% take-profit: out at 105 on the next candle.
+        let t = simulate(
+            &[0.0],
+            &[300.0],
+            &p,
+            &rules(Side::Long, None, Some(5.0)),
+            all,
+        );
+        assert_eq!(t.closed, [5.0]);
+        // Long from 110 with a 2% stop: 99 hits it, out at 107.8.
+        let t = simulate(
+            &[60.0],
+            &[300.0],
+            &p,
+            &rules(Side::Long, Some(2.0), None),
+            all,
+        );
+        assert!((t.closed[0] + 2.0).abs() < 1e-9, "{:?}", t.closed);
+        // With highs and lows, a candle that touches the stop stops it even if it closes
+        // above it.
+        let low = Series {
+            name: "low".into(),
+            unit: Unit::default(),
+            points: s.points.iter().map(|&(x, v)| (x, v - 15.0)).collect(),
+        };
+        let p2 = Prices {
+            close: &s,
+            high: None,
+            low: Some(&low),
+        };
+        let t = simulate(
+            &[0.0],
+            &[300.0],
+            &p2,
+            &rules(Side::Long, Some(10.0), None),
+            all,
+        );
+        assert_eq!(t.closed, [-10.0], "110's low is 95: stopped at 90");
+        // A window ending early closes the trade at its end.
+        let t = simulate(
+            &[0.0],
+            &[300.0],
+            &p,
+            &rules(Side::Long, None, None),
+            (0.0, 120.0),
+        );
+        assert_eq!(t.closed, [-1.0]);
+        assert!(t.open.is_none());
+        // The best way, picked on the first half, then run on the second.
+        let b = best(&[0.0, 180.0], &[120.0, 240.0], &p, 0.0, 0.5).unwrap();
+        assert_eq!(b.all.len(), 2 * STOPS.len() * TAKES.len());
+        assert!(b.picked_on.total() >= b.all.iter().copied().fold(f64::MIN, f64::max) - 1e-9);
+        let d = b.rules.describe();
+        assert!(
+            d.contains(" · ") && (d.contains("SL") && d.contains("TP")),
+            "{d}"
+        );
+        let r = Rules {
+            side: Side::Short,
+            stop: Some(1.0),
+            take: None,
+            fee: 0.0,
+        };
+        assert_eq!(r.describe(), "short · SL 1% · no TP");
     }
 
     #[test]

@@ -392,13 +392,18 @@ given, else a `close` series, else the one the markers are on. Nothing here is
 trading-specific: `backtest("deploy", "latency", "1h")` works the same way.
 
 **Many strategies, many settings.** Label rule pairs `NAME in` and `NAME out` (or
-`buy`/`sell`, `entry`/`exit`) and `:strategies()` trades them all, best first, next to
-what simply holding did; `:strategies(0.045)` takes a 0.045% fee off every buy and
-sell. Put settings in the lines with `--param` (`--param 'fast = 9 | 12 | 20'` and
-`ema(values("close"), {fast})`) and `:sweep()` runs every strategy for every
-combination of them — without fetching anything (settings the source's command uses
-are left as they are) — and shows each strategy's best setting with its median and
-worst: one that only works with one setting is probably luck. These tables stay above the
+`buy`/`sell`, `entry`/`exit`) and `:strategies()` trades them all: **long** (in at the
+in markers, out at the out markers), **short** (the other way round), and the best
+side, stop-loss and take-profit (SL none/0.5–5%, TP none/1–8%; stops and take-profits
+are checked against each candle's high and low, the stop first if a candle touches
+both). That best way is picked on the first 70% of the data and then run on the last
+30%, which it wasn't picked on — if it only did well on the part it was picked on, it
+fitted the past. Each result is next to what holding did (overall and in each part);
+`:strategies(0.045)` takes a 0.045% fee off every buy and sell. Put settings in the
+lines with `--param` (`--param 'fast = 9 | 12 | 20'` and `ema(values("close"),
+{fast})`) and `:sweep()` does all of that for every combination of them — without
+fetching anything (settings the source's command uses are left as they are) — ranked
+by the last 30%, with the median of every way it tried. These tables stay above the
 legend until you close them (Esc, a tap, or the next command).
 
 While it runs, press `K` (or tap **markers**) for the list of rules and
