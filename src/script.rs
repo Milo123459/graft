@@ -72,6 +72,10 @@ pub enum Action {
     Copy(Option<String>),
     /// A marker here (at the cursor, or the newest data) with this label.
     MarkHere(String),
+    /// Every strategy (rule pairs `NAME in` / `NAME out`), with this fee (%) per trade side.
+    Strategies(f64),
+    /// The strategies for every combination of the settings the lines and rules use.
+    Sweep(f64),
     /// What a series did after a rule's markers: (rule, series, after).
     Backtest(
         crate::backtest::RuleRef,
@@ -754,6 +758,16 @@ pub const USAGE: &[(&str, &str, &str)] = &[
         "trades: in at one rule's markers, out at the next of another's",
     ),
     (
+        "strategies",
+        "strategies()  ·  strategies(0.05)",
+        "every strategy (rules labelled NAME in / NAME out) against holding; a fee % per buy and sell",
+    ),
+    (
+        "sweep",
+        "sweep()  ·  sweep(0.05)",
+        "the strategies for every combination of the --param settings your lines and rules use",
+    ),
+    (
         "is_num",
         r#"is_num(ema50_prev)"#,
         "whether a value is there (a series that hasn't begun is ())",
@@ -919,6 +933,8 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "is_num",
             "backtest",
             "strategy",
+            "strategies",
+            "sweep",
         ],
     ),
     ("alerts", &["alert", "unalert", "notify_to", "notify_off"]),
@@ -2554,6 +2570,25 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
             Ok(())
         },
     );
+    let fee_of = |d: &Dynamic| -> FnResult<f64> {
+        dyn_to_f64(d)
+            .filter(|f| *f >= 0.0)
+            .ok_or_else(|| "the fee is a % per buy and per sell, e.g. 0.05".into())
+    };
+    let st = state.clone();
+    engine.register_fn("strategies", move || push(&st, Action::Strategies(0.0)));
+    let st = state.clone();
+    engine.register_fn("strategies", move |fee: Dynamic| -> FnResult<()> {
+        push(&st, Action::Strategies(fee_of(&fee)?));
+        Ok(())
+    });
+    let st = state.clone();
+    engine.register_fn("sweep", move || push(&st, Action::Sweep(0.0)));
+    let st = state.clone();
+    engine.register_fn("sweep", move |fee: Dynamic| -> FnResult<()> {
+        push(&st, Action::Sweep(fee_of(&fee)?));
+        Ok(())
+    });
     let st = state.clone();
     engine.register_fn("strategy", move |entry: Dynamic, exit: Dynamic| {
         push(

@@ -391,6 +391,15 @@ rule is named by its number in the markers menu or its label; the series is the 
 given, else a `close` series, else the one the markers are on. Nothing here is
 trading-specific: `backtest("deploy", "latency", "1h")` works the same way.
 
+**Many strategies, many settings.** Label rule pairs `NAME in` and `NAME out` (or
+`buy`/`sell`, `entry`/`exit`) and `:strategies()` trades them all, best first, next to
+what simply holding did; `:strategies(0.045)` takes a 0.045% fee off every buy and
+sell. Put settings in the lines with `--param` (`--param 'fast = 9 | 12 | 20'` and
+`ema(values("close"), {fast})`) and `:sweep()` runs every strategy for every
+combination of them — without fetching anything (settings the source's command uses
+are left as they are) — and shows each strategy's best setting with its median and
+worst: one that only works with one setting is probably luck.
+
 While it runs, press `K` (or tap **markers**) for the list of rules and
 markers: tap a rule to edit it (it opens in the console; Enter saves, Esc
 cancels), tap the buttons under it to cycle its symbol, colour or effect (plain, badge, bold,

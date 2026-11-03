@@ -145,6 +145,31 @@ pub struct Trades {
 }
 
 impl Trades {
+    /// The closed trades' compounded return, in %.
+    pub fn total(&self) -> f64 {
+        (self
+            .closed
+            .iter()
+            .fold(1.0, |acc, r| acc * (1.0 + r / 100.0))
+            - 1.0)
+            * 100.0
+    }
+
+    /// One line for a table of strategies: `name +3.1% · 6 trades, 67% won · dd 1.2%`.
+    pub fn line(&self, name: &str) -> String {
+        let n = self.closed.len();
+        if n == 0 {
+            return format!("{name}: no finished trades");
+        }
+        let wins = self.closed.iter().filter(|r| **r > 0.0).count();
+        format!(
+            "{name} {:+.2}% · {n} trades, {:.0}% won · drawdown {:.1}%",
+            self.total(),
+            wins as f64 / n as f64 * 100.0,
+            self.drawdown
+        )
+    }
+
     pub fn summary(&self, entry: &str, exit: &str, series: &str) -> String {
         let open = self
             .open
@@ -174,7 +199,8 @@ impl Trades {
 }
 
 /// Buy at each entry (when not already in), sell at the next exit after it.
-pub fn trades(entries: &[&Mark], exits: &[&Mark], s: &Series) -> Trades {
+/// `fee`: % taken on each buy and each sell (0.05 = 0.05%).
+pub fn trades(entries: &[&Mark], exits: &[&Mark], s: &Series, fee: f64) -> Trades {
     let mut entries: Vec<f64> = entries.iter().map(|m| m.x).collect();
     let mut exits: Vec<f64> = exits.iter().map(|m| m.x).collect();
     entries.sort_by(f64::total_cmp);
@@ -197,6 +223,7 @@ pub fn trades(entries: &[&Mark], exits: &[&Mark], s: &Series) -> Trades {
                     continue;
                 };
                 if let Some(r) = pct(buy, sell) {
+                    let r = r - 2.0 * fee;
                     closed.push(r);
                     equity *= 1.0 + r / 100.0;
                     peak = peak.max(equity);
@@ -208,7 +235,7 @@ pub fn trades(entries: &[&Mark], exits: &[&Mark], s: &Series) -> Trades {
             None => {
                 let last = s.points.last().map(|p| (p.0, p.1));
                 if let Some((end, now)) = last {
-                    open = pct(buy, now);
+                    open = pct(buy, now).map(|r| r - 2.0 * fee);
                     time_in += end - x;
                 }
                 break;
@@ -225,6 +252,30 @@ pub fn trades(entries: &[&Mark], exits: &[&Mark], s: &Series) -> Trades {
         drawdown,
         in_market: if span > 0.0 { time_in / span } else { 0.0 },
     }
+}
+
+/// What simply holding `s` from its first point to its last returned, in %.
+pub fn hold(s: &Series) -> Option<f64> {
+    pct(s.points.first()?.1, s.points.last()?.1)
+}
+
+/// The strategies among marker rules: pairs labelled `NAME in` and `NAME out` (or
+/// buy/sell, entry/exit), as (name, entry rule, exit rule).
+pub fn pairs(labels: &[String]) -> Vec<(String, usize, usize)> {
+    const ENDS: [(&str, &str); 3] = [(" in", " out"), (" buy", " sell"), (" entry", " exit")];
+    let mut out = Vec::new();
+    for (i, l) in labels.iter().enumerate() {
+        let l = l.to_lowercase();
+        for (a, b) in ENDS {
+            if let Some(name) = l.strip_suffix(a) {
+                let exit = format!("{name}{b}");
+                if let Some(j) = labels.iter().position(|o| o.to_lowercase() == exit) {
+                    out.push((name.to_string(), i, j));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The series a backtest measures: the one named; else a close price (a series called
@@ -307,6 +358,7 @@ mod tests {
             &entries.iter().collect::<Vec<_>>(),
             &exits.iter().collect::<Vec<_>>(),
             &s,
+            0.0,
         );
         assert_eq!(t.closed.len(), 2);
         assert!((t.closed[0] + 1.0).abs() < 1e-9 && (t.closed[1] + 25.0).abs() < 1e-9);

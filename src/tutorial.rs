@@ -472,6 +472,14 @@ The database spikes now and then: mark it."#,
                 "trades: in at each marker of one rule, out at the next of another; the result, wins, drawdown, time in",
             ),
             (
+                r#":strategies(0.05)"#,
+                "every strategy at once — rule pairs labelled NAME in and NAME out (or buy/sell) — best first, against holding, with a 0.05% fee per buy and sell",
+            ),
+            (
+                r#":sweep()"#,
+                "the strategies again for every combination of the --param settings your lines and rules use (ema(values(\"close\"), {fast})): each one's best setting, and its median and worst — good only with one setting is probably luck",
+            ),
+            (
                 "--mark 'cross_above(api, db) => api passed db'",
                 "where one series crosses another (cross_below(), cross() either way; or a number: cross_above(api, 50ms); in the console they say whether it just crossed). is_num(x) says whether a series has a value there yet",
             ),

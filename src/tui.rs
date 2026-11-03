@@ -270,6 +270,45 @@ enum TutorialHit {
 }
 
 /// Greedy word wrap to `width` columns (long words are split).
+/// Each strategy (rule pairs NAME in / NAME out) traded on the close (else the series
+/// its markers are on), best first, with the series' name and what holding it returned.
+#[allow(clippy::type_complexity)]
+fn strategy_results(
+    ds: &crate::data::Dataset,
+    marks: &[crate::render::Mark],
+    labels: &[String],
+    fee: f64,
+) -> Vec<(String, crate::backtest::Trades, String, f64)> {
+    let of = |i: usize| {
+        marks
+            .iter()
+            .filter(|m| m.rule == Some(i))
+            .collect::<Vec<_>>()
+    };
+    let mut out: Vec<(String, crate::backtest::Trades, String, f64)> =
+        crate::backtest::pairs(labels)
+            .into_iter()
+            .filter_map(|(name, a, b)| {
+                let ins = of(a);
+                let s = crate::backtest::series_for(ds, None, &ins)?;
+                let t = crate::backtest::trades(&ins, &of(b), s, fee);
+                Some((
+                    name,
+                    t,
+                    s.name.clone(),
+                    crate::backtest::hold(s).unwrap_or(0.0),
+                ))
+            })
+            .collect();
+    out.sort_by(|a, b| b.1.total().total_cmp(&a.1.total()));
+    out
+}
+
+/// `1 strategy`, `3 strategies`.
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
 fn wrap(text: &str, width: usize) -> Vec<String> {
     use unicode_width::UnicodeWidthStr;
     let width = width.max(4);
@@ -1966,6 +2005,141 @@ impl App {
         Ok(crate::backtest::followed(&marks, s, after).summary(&name, &s.name, &after_text))
     }
 
+    /// `strategies(fee)`: every NAME in / NAME out pair, best first, against holding.
+    fn strategies(&self, fee: f64) -> String {
+        let labels = self.rule_labels();
+        let results = strategy_results(&self.ds, &self.opts.marks, &labels, fee);
+        let Some((_, _, on, hold)) = results.first() else {
+            return "strategies: label rule pairs NAME in and NAME out (or buy/sell), e.g. --mark 'cross_above(ema9, ema21) => cross in' --mark 'cross_below(ema9, ema21) => cross out'".into();
+        };
+        let mut lines = vec![format!(
+            "{} on {on} · holding {hold:+.2}% · fee {fee}% a side",
+            plural(results.len(), "strategy", "strategies"),
+        )];
+        lines.extend(results.iter().map(|(name, t, ..)| t.line(name)));
+        lines.join("\n")
+    }
+
+    /// `sweep(fee)`: the strategies again for every combination of the settings the
+    /// lines and rules use (not the source's: those would fetch other data).
+    fn sweep(&mut self, fee: f64) -> Result<String, String> {
+        let raw = self.current_cli();
+        let fetches = format!(
+            "{} {}",
+            raw.cmd.clone().unwrap_or_default(),
+            raw.input
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        );
+        let all = crate::params::parse_all(&raw.param);
+        let free: Vec<&crate::params::Param> = all
+            .iter()
+            .filter(|p| !fetches.contains(&format!("{{{}}}", p.name)))
+            .collect();
+        if free.is_empty() {
+            return Err("sweep: give the lines settings to try, e.g. --param 'fast = 9 | 12 | 20' and ema(values(\"close\"), {fast})".into());
+        }
+        // Every combination (each setting's choices), up to a few hundred.
+        let mut combos: Vec<Vec<usize>> = vec![Vec::new()];
+        for p in &free {
+            combos = combos
+                .into_iter()
+                .flat_map(|c| {
+                    (0..p.choices.len()).map(move |k| {
+                        let mut c = c.clone();
+                        c.push(k);
+                        c
+                    })
+                })
+                .collect();
+        }
+        if combos.len() > 400 {
+            return Err(format!(
+                "sweep: {} combinations is too many (400 at most) — fewer choices",
+                combos.len()
+            ));
+        }
+        let base = self.session.base_dataset();
+        let host = &self.session.script;
+        let binary = self.cli.binary_units;
+        // What holding returned (the same for every setting).
+        let mut hold: Option<(String, f64)> = None;
+        // strategy → (settings, result) for each combination.
+        let mut by_name: Vec<(String, Vec<(String, crate::backtest::Trades)>)> = Vec::new();
+        for combo in &combos {
+            let mut params = all.clone();
+            for (p, &k) in free.iter().zip(combo) {
+                if let Some(q) = params.iter_mut().find(|q| q.name == p.name) {
+                    q.current = k;
+                }
+            }
+            let fill = |t: &String| crate::params::fill(t, &params);
+            let lines: Vec<crate::lines::CustomLine> = raw
+                .line
+                .iter()
+                .filter_map(|l| crate::lines::CustomLine::parse(&fill(l)).ok())
+                .collect();
+            let rules: Vec<crate::marks::MarkRule> = raw
+                .mark
+                .iter()
+                .filter_map(|m| crate::marks::MarkRule::parse(&fill(m)).ok())
+                .collect();
+            let mut ds = base.clone();
+            crate::lines::apply(host, &lines, &mut ds, binary);
+            let (marks, _) = crate::marks::evaluate(host, &rules, &ds);
+            let labels: Vec<String> = rules
+                .iter()
+                .map(|r| r.label.clone().unwrap_or_else(|| r.expr.clone()))
+                .collect();
+            let setting = free
+                .iter()
+                .zip(combo)
+                .map(|(p, &k)| format!("{}={}", p.name, p.choices[k]))
+                .collect::<Vec<_>>()
+                .join(" ");
+            for (name, t, on, held) in strategy_results(&ds, &marks, &labels, fee) {
+                hold = Some((on, held));
+                match by_name.iter_mut().find(|b| b.0 == name) {
+                    Some(b) => b.1.push((setting.clone(), t)),
+                    None => by_name.push((name, vec![(setting.clone(), t)])),
+                }
+            }
+        }
+        // The lines and rules ran on other data: put the chart's back.
+        self.rebuild(true);
+        if by_name.is_empty() {
+            return Err("sweep: no strategies — label rule pairs NAME in and NAME out".into());
+        }
+        let (on, hold) = hold.unwrap_or_default();
+        // Best first; with the median over all settings (a strategy that's only good
+        // with one setting is probably luck).
+        let mut rows: Vec<(f64, String)> = by_name
+            .into_iter()
+            .map(|(name, mut runs)| {
+                runs.sort_by(|a, b| b.1.total().total_cmp(&a.1.total()));
+                let median = runs[runs.len() / 2].1.total();
+                let worst = runs.last().map_or(0.0, |r| r.1.total());
+                let (setting, best) = &runs[0];
+                (
+                    best.total(),
+                    format!(
+                        "{} · best with {setting} · median {median:+.2}%, worst {worst:+.2}%",
+                        best.line(&name)
+                    ),
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let mut out = vec![format!(
+            "sweep: {} × {} on {on} · holding {hold:+.2}% · fee {fee}% a side",
+            plural(combos.len(), "setting", "settings"),
+            plural(rows.len(), "strategy", "strategies"),
+        )];
+        out.extend(rows.into_iter().map(|r| r.1));
+        Ok(out.join("\n"))
+    }
+
     /// `strategy(entry, exit, series)`: trades from one rule's markers to another's.
     fn strategy(
         &self,
@@ -1978,7 +2152,7 @@ impl App {
         let s = crate::backtest::series_for(&self.ds, series, &ins).ok_or_else(|| {
             "say which series to trade, e.g. strategy(1, 2, \"close\")".to_string()
         })?;
-        Ok(crate::backtest::trades(&ins, &outs, s).summary(&in_name, &out_name, &s.name))
+        Ok(crate::backtest::trades(&ins, &outs, s, 0.0).summary(&in_name, &out_name, &s.name))
     }
 
     /// Open the console on a rule; running it replaces the rule.
@@ -5665,6 +5839,17 @@ impl App {
             Action::Redo => {
                 self.step_forward();
             }
+            Action::Strategies(fee) => {
+                let text = self.strategies(fee);
+                self.note(text, false);
+            }
+            Action::Sweep(fee) => {
+                let (text, error) = match self.sweep(fee) {
+                    Ok(t) => (t, false),
+                    Err(e) => (e, true),
+                };
+                self.note(text, error);
+            }
             Action::Backtest(rule, series, after) => match self.backtest(&rule, series.as_deref(), after) {
                 Ok(text) => self.note(text, false),
                 Err(e) => self.note(e, true),
@@ -7300,7 +7485,10 @@ impl App {
             ("▸ ", Style::default().fg(Color::White))
         };
         let w = width.saturating_sub(2).max(10) as usize;
-        let mut lines: Vec<Line> = wrap(&n.text, w)
+        // Several lines (a table of results): each wrapped, more of them shown.
+        let rows: Vec<String> = n.text.split('\n').flat_map(|l| wrap(l, w)).collect();
+        let max = if n.text.contains('\n') { 14 } else { 4 };
+        let mut lines: Vec<Line> = rows
             .into_iter()
             .enumerate()
             .map(|(i, l)| {
@@ -7313,7 +7501,7 @@ impl App {
                 ])
             })
             .collect();
-        lines.truncate(4);
+        lines.truncate(max);
         lines
     }
 
@@ -9862,6 +10050,41 @@ pub(crate) mod tests {
         run(&mut app, r#"backtest("nope")"#);
         let (text, error) = note(&app).unwrap();
         assert!(error && text.contains("1 fell, 2 rose"), "{text}");
+    }
+
+    #[test]
+    fn strategies_and_sweeps() {
+        let mut app = app(&[
+            "graft",
+            LOG,
+            "-s",
+            "node1",
+            "--param",
+            "n = 2 | 4",
+            "--line",
+            "avg = ema(values(\"node1\"), {n})",
+            "--mark",
+            "cross_above(node1, avg) => up in",
+            "--mark",
+            "cross_below(node1, avg) => up out",
+        ]);
+        let note = |app: &App| app.console_note.as_ref().unwrap().text.clone();
+        run(&mut app, "strategies(0.05)");
+        let text = note(&app);
+        assert!(text.starts_with("1 strategy on node1 · holding"), "{text}");
+        assert!(
+            text.contains("fee 0.05%") && text.contains("\nup"),
+            "{text}"
+        );
+        run(&mut app, "sweep()");
+        let text = note(&app);
+        assert!(
+            text.starts_with("sweep: 2 settings × 1 strategy on node1"),
+            "{text}"
+        );
+        assert!(text.contains("best with n="), "{text}");
+        // The chart is as it was.
+        assert!(app.ds.get("avg").is_some());
     }
 
     #[test]
