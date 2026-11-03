@@ -231,12 +231,16 @@ struct TabCycle {
 #[derive(Default)]
 struct TutorialContent {
     body: Vec<Line<'static>>,
+    /// For each body row, the example it shows (to copy on a tap).
+    example_rows: Vec<Option<usize>>,
     footer: Vec<Line<'static>>,
     buttons: Vec<Button<Hit>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum TutorialHit {
+    /// Copy example n of the step (or put a console one in the console).
+    Example(usize),
     Next,
     Back,
     Fold,
@@ -980,6 +984,24 @@ impl App {
                 t.folded = false;
             }
             TutorialHit::Back => t.back(),
+            TutorialHit::Example(n) => {
+                let Some(&(ex, _)) = t.current().examples.get(n) else {
+                    return Transition::None;
+                };
+                match ex.strip_prefix(':') {
+                    // A console command: into the console, ready to run or change.
+                    Some(code) => {
+                        let code = code.replace("  :", "; ");
+                        self.console = Some(TextInput::new(code));
+                        self.say("in the console: Enter runs it", false);
+                    }
+                    None => {
+                        self.copy(Some(ex.to_string()));
+                        self.say(format!("copied: {ex}"), false);
+                    }
+                }
+                return Transition::None;
+            }
             TutorialHit::Fold => t.folded = !t.folded,
             TutorialHit::Copy => {
                 if let Some(c) = t.current().command {
@@ -1028,46 +1050,74 @@ impl App {
             }
         }
         // Two columns when there's room, else the description under the key.
-        let table =
-            |body: &mut Vec<Line<'static>>, title: &str, rows: &[(&str, &str)], style: Style| {
-                if rows.is_empty() {
-                    return;
-                }
-                body.push(Line::styled(title.to_string(), head));
-                let col = rows
-                    .iter()
-                    .map(|r| unicode_width::UnicodeWidthStr::width(r.0))
-                    .max()
-                    .unwrap_or(0);
-                let two = w >= col + 30;
-                for (k, d) in rows {
-                    if two {
-                        let lines = wrap(d, w - col - 4);
-                        for (i, l) in lines.into_iter().enumerate() {
-                            let key = if i == 0 { *k } else { "" };
-                            let pad = col - unicode_width::UnicodeWidthStr::width(key);
-                            body.push(Line::from(vec![
-                                Span::styled(format!("  {key}{}", " ".repeat(pad)), style),
-                                Span::styled(format!("  {l}"), dim),
-                            ]));
-                        }
-                    } else {
-                        for l in wrap(k, w.saturating_sub(2)) {
-                            body.push(Line::styled(format!("  {l}"), style));
-                        }
-                        for l in wrap(d, w.saturating_sub(4)) {
-                            body.push(Line::styled(format!("    {l}"), dim));
-                        }
+        // Which example each body row belongs to (a tap copies it).
+        let mut example_rows: Vec<Option<usize>> = Vec::new();
+        let table = |body: &mut Vec<Line<'static>>,
+                     rows_of: &mut Vec<Option<usize>>,
+                     title: &str,
+                     rows: &[(&str, &str)],
+                     style: Style,
+                     tappable: bool| {
+            if rows.is_empty() {
+                return;
+            }
+            rows_of.resize(body.len(), None);
+            body.push(Line::styled(
+                if tappable {
+                    format!("{title} · tap one to copy it (: ones go into the console)")
+                } else {
+                    title.to_string()
+                },
+                head,
+            ));
+            rows_of.push(None);
+            let col = rows
+                .iter()
+                .map(|r| unicode_width::UnicodeWidthStr::width(r.0))
+                .max()
+                .unwrap_or(0);
+            let two = w >= col + 30;
+            for (n, (k, d)) in rows.iter().enumerate() {
+                let before = body.len();
+                if two {
+                    let lines = wrap(d, w - col - 4);
+                    for (i, l) in lines.into_iter().enumerate() {
+                        let key = if i == 0 { *k } else { "" };
+                        let pad = col - unicode_width::UnicodeWidthStr::width(key);
+                        body.push(Line::from(vec![
+                            Span::styled(format!("  {key}{}", " ".repeat(pad)), style),
+                            Span::styled(format!("  {l}"), dim),
+                        ]));
+                    }
+                } else {
+                    for l in wrap(k, w.saturating_sub(2)) {
+                        body.push(Line::styled(format!("  {l}"), style));
+                    }
+                    for l in wrap(d, w.saturating_sub(4)) {
+                        body.push(Line::styled(format!("    {l}"), dim));
                     }
                 }
-            };
+                rows_of.resize(before, None);
+                rows_of.extend((before..body.len()).map(|_| tappable.then_some(n)));
+            }
+        };
         table(
             &mut body,
+            &mut example_rows,
             "keys",
             step.keys,
             Style::default().fg(Color::Yellow),
+            false,
         );
-        table(&mut body, "examples", step.examples, code);
+        table(
+            &mut body,
+            &mut example_rows,
+            "examples",
+            step.examples,
+            code,
+            true,
+        );
+        example_rows.resize(body.len(), None);
         let mut footer = Vec::new();
         if let Some(task) = step.task {
             if t.is_done() {
@@ -1110,6 +1160,7 @@ impl App {
         }
         TutorialContent {
             body,
+            example_rows,
             footer,
             buttons,
         }
@@ -1208,6 +1259,23 @@ impl App {
         f.render_widget(block, area);
         // Taps on the panel's background do nothing (not the chart under it).
         self.hits.push(area, Hit::MenuBackground);
+        // Example rows can be tapped (pushed after the background, so they win).
+        for (k, ex) in c.example_rows.iter().enumerate().skip(scroll as usize) {
+            let y = inner.y + (k as u16 - scroll);
+            if y >= inner.y + body_h {
+                break;
+            }
+            if let Some(n) = ex {
+                self.hits.push(
+                    Rect {
+                        y,
+                        height: 1,
+                        ..inner
+                    },
+                    Hit::Tutorial(TutorialHit::Example(*n)),
+                );
+            }
+        }
         f.render_widget(
             Paragraph::new(c.body).scroll((scroll, 0)),
             Rect {
@@ -8583,5 +8651,34 @@ pub(crate) mod tests {
             n.text
         );
         assert!(app.session.custom.is_empty());
+    }
+
+    #[test]
+    fn tutorial_examples_can_be_tapped() {
+        let mut app = tutorial_app();
+        // The welcome step: a command line is copied (scrolled down to it).
+        screen(&app);
+        for _ in 0..4 {
+            key(&mut app, KeyCode::PageDown);
+            screen(&app);
+        }
+        let (x, y) = find(&app, "graft app.log --kv");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert_eq!(app.take_clipboard().as_deref(), Some("graft app.log --kv"));
+        // A console example goes into the console.
+        while app.tutorial.as_ref().unwrap().current().title != "read a value" {
+            key(&mut app, KeyCode::Enter);
+        }
+        screen(&app);
+        for _ in 0..4 {
+            key(&mut app, KeyCode::PageDown);
+            screen(&app);
+        }
+        let (x, y) = find(&app, r#":at("api")"#);
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert_eq!(
+            app.console.as_ref().map(|c| c.value.as_str()),
+            Some(r#"at("api")"#)
+        );
     }
 }

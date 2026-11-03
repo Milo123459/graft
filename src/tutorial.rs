@@ -87,6 +87,14 @@ Each step explains a feature, its keys and some examples, then asks you to try i
             ("Backspace / ◀ back", "the step before"),
             ("PgUp PgDn / scroll", "scroll this panel when there's more"),
             ("hide", "fold this panel to one line (tap it to unfold)"),
+            (
+                "tap an example",
+                "copies it; a :console one goes into the console",
+            ),
+            (
+                "m",
+                "mouse off, so your terminal can select text (m again: back on)",
+            ),
         ],
         examples: &[
             (
@@ -102,8 +110,8 @@ Each step explains a feature, its keys and some examples, then asks you to try i
                 "pipe anything in; it updates as lines arrive",
             ),
             (
-                "graft -c 'uptime' -n 5s --kv",
-                "run a command every 5 seconds and chart it",
+                r#"graft -c uptime -n 5s --regex 'averages?: (?P<load1>[\d.]+),? (?P<load5>[\d.]+)'"#,
+                "run a command every 5 s; a regex picks out the numbers (named groups are series)",
             ),
         ],
         ..BASE
