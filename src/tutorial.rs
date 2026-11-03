@@ -473,7 +473,7 @@ The database spikes now and then: mark it."#,
             ),
             (
                 r#":strategies(0.05)"#,
-                "every strategy at once — rule pairs labelled NAME in and NAME out (or buy/sell) — best first, against holding, with a 0.05% fee per buy and sell",
+                "every strategy at once — rule pairs labelled NAME in and NAME out (or buy/sell) — best first, against holding, with a 0.05% fee per buy and sell (the table stays until Esc or a tap)",
             ),
             (
                 r#":sweep()"#,

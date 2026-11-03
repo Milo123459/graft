@@ -398,7 +398,8 @@ sell. Put settings in the lines with `--param` (`--param 'fast = 9 | 12 | 20'` a
 `ema(values("close"), {fast})`) and `:sweep()` runs every strategy for every
 combination of them — without fetching anything (settings the source's command uses
 are left as they are) — and shows each strategy's best setting with its median and
-worst: one that only works with one setting is probably luck.
+worst: one that only works with one setting is probably luck. These tables stay above the
+legend until you close them (Esc, a tap, or the next command).
 
 While it runs, press `K` (or tap **markers**) for the list of rules and
 markers: tap a rule to edit it (it opens in the console; Enter saves, Esc

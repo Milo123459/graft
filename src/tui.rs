@@ -192,6 +192,8 @@ enum Hit {
     CycleMarkEffect(usize),
     /// The candles chip: a candlestick chart's four series together.
     Candles,
+    /// Close the table of results above the legend.
+    CloseNote,
     /// Alerts menu.
     EditAlert(Option<usize>),
     DeleteAlert(usize),
@@ -6429,7 +6431,14 @@ impl App {
             }
             // Esc never quits (that's q): it lets go of the cursor, or says how to quit.
             KeyCode::Esc => {
-                if self.cursor.take().is_none() {
+                // A table of results (sweep) stays until closed: Esc closes it first.
+                if self
+                    .console_note
+                    .as_ref()
+                    .is_some_and(|n| n.text.contains('\n'))
+                {
+                    self.console_note = None;
+                } else if self.cursor.take().is_none() {
                     self.say("q quits", false);
                 }
                 return Transition::None;
@@ -6698,6 +6707,10 @@ impl App {
                         }
                         Hit::Candles => {
                             self.toggle_candles();
+                            Transition::None
+                        }
+                        Hit::CloseNote => {
+                            self.console_note = None;
                             Transition::None
                         }
                         Hit::Layer(l, right) => {
@@ -7284,6 +7297,24 @@ impl App {
         }
         if note_h > 0 {
             f.render_widget(Paragraph::new(note), note_area);
+            if self
+                .console_note
+                .as_ref()
+                .is_some_and(|n| n.text.contains('\n'))
+            {
+                // Tap it (or Esc) to close.
+                let close = Rect {
+                    x: note_area.right().saturating_sub(3),
+                    width: 3.min(note_area.width),
+                    height: 1,
+                    ..note_area
+                };
+                f.render_widget(
+                    Span::styled(" ✕ ", Style::default().fg(Color::White).bg(Color::DarkGray)),
+                    close,
+                );
+                self.hits.push(note_area, Hit::CloseNote);
+            }
         }
         self.draw_legend_row(f, status);
         self.draw_message(f, chart);
@@ -7473,7 +7504,10 @@ impl App {
         let Some(n) = &self.console_note else {
             return Vec::new();
         };
-        if !n.error && n.at.elapsed() > Duration::from_secs(20) {
+        // A table of results (sweep, strategies) stays until closed (Esc, a tap, or the
+        // next command); a one-line answer for 20 seconds.
+        let table = n.text.contains('\n');
+        if !table && !n.error && n.at.elapsed() > Duration::from_secs(20) {
             return Vec::new();
         }
         if n.error && self.console.is_none() && n.at.elapsed() > Duration::from_secs(20) {
@@ -10085,6 +10119,24 @@ pub(crate) mod tests {
         assert!(text.contains("best with n="), "{text}");
         // The chart is as it was.
         assert!(app.ds.get("avg").is_some());
+    }
+
+    #[test]
+    fn result_tables_stay_until_closed() {
+        let mut app = app(&["graft", LOG]);
+        app.note("a table\nof results".into(), false);
+        app.console_note.as_mut().unwrap().at = Instant::now() - Duration::from_secs(120);
+        assert!(
+            screen(&app).contains("of results"),
+            "still there two minutes on"
+        );
+        key(&mut app, KeyCode::Esc);
+        assert!(app.console_note.is_none());
+        // A tap closes it too.
+        app.note("a table\nof results".into(), false);
+        let (x, y) = find(&app, "of results");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+        assert!(app.console_note.is_none());
     }
 
     #[test]
