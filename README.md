@@ -224,7 +224,10 @@ shows `$3,456.78`; `:unit("USD")` and `:title("ETH")` change it while running.
 Several sources can share one chart: each `--merge` adds another source's
 series, named after it — a preset or saved profile (`--merge load`), or inline,
 with that source's own arguments after `NAME =`. With only `--merge`s, the
-first becomes the main source. Custom lines can then combine them, e.g. ETH
+first becomes the main source. In the viewer, the **sources** button (`S`)
+lists them: **edit** opens one in the builder (source, format, live preview) and
+puts it back with **merge into the chart**; **+ add source** makes a new one;
+**✕** removes one. Custom lines can then combine them, e.g. ETH
 from two exchanges, their average, and an EMA30 of it:
 
 ```sh
@@ -513,6 +516,7 @@ mouse capture off, so your terminal's own text selection works.
 | `w` | pane panel (inside: `v` / `s` split right / down, `x` close, arrows pick, shift+arrows move, ctrl+arrows or `< > + -` resize, `=` even, `t` chart type, `T` lines, `1`–`9` series, `o` one chart) |
 | `Tab` / `Alt+arrows` | pick the next pane / the pane that way |
 | `K` | markers: edit, delete or add rules and markers |
+| `S` / **sources** | where the data comes from: edit the main source, add, edit or remove merged ones (in the builder, with a preview) |
 | `Ctrl+Z` / `u` | undo the last change (chart type, lines, panes, timeframe, markers…); `Ctrl+Y` / `U` redo. Also the **↶ undo** button once there's something to undo |
 | `f` / `G` | forecast / target lines on or off |
 | `r` / `[` `]` | timeframe dropdown / narrower, wider timeframe |

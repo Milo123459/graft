@@ -41,6 +41,7 @@ enum Field {
     TimeFormat,
     Targets,
     SaveName,
+    MergeName,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +148,10 @@ pub struct Builder {
     time_format: TextInput,
     targets: TextInput,
     save_name: Option<TextInput>,
+    /// Editing one of a chart's merged sources (or adding one): its name, and the name
+    /// it had (`None`: a new one).
+    merge_name: Option<TextInput>,
+    merge_old: Option<String>,
     focus: Option<Field>,
     sample: Vec<String>,
     from_command: bool,
@@ -303,6 +308,8 @@ impl Builder {
             time_format: TextInput::new(cli.time_format.clone().unwrap_or_default()),
             targets: TextInput::new(cli.target.join(",")),
             save_name: None,
+            merge_name: None,
+            merge_old: None,
             focus: None,
             sample: Vec::new(),
             from_command: false,
@@ -344,6 +351,24 @@ impl Builder {
         self.message = Some((msg, true));
     }
 
+    /// Edit a merged source of `chart` (`name` it's merged as, `cli` its arguments),
+    /// or make a new one: start puts it back into the chart.
+    pub fn for_source(name: String, cli: Cli, chart: Box<App>) -> Self {
+        let new = !chart
+            .current_cli()
+            .merge
+            .iter()
+            .any(|s| crate::sources::Merge::parse(s).is_ok_and(|m| m.name == name));
+        let mut b = Builder::new(cli, None, Some(chart));
+        b.merge_old = (!new).then(|| name.clone());
+        b.merge_name = Some(TextInput::new(name));
+        if new {
+            b.src = Src::Command;
+            b.focus = Some(Field::Source);
+        }
+        b
+    }
+
     pub fn take_previous(&mut self) -> Option<Box<App>> {
         self.previous.take()
     }
@@ -361,11 +386,16 @@ impl Builder {
             Field::TimeFormat => &mut self.time_format,
             Field::Targets => &mut self.targets,
             Field::SaveName => self.save_name.get_or_insert_with(TextInput::default),
+            Field::MergeName => self.merge_name.get_or_insert_with(TextInput::default),
         }
     }
 
     fn fields(&self) -> Vec<Field> {
-        let mut v = vec![Field::Source];
+        let mut v = Vec::new();
+        if self.merge_name.is_some() {
+            v.push(Field::MergeName);
+        }
+        v.push(Field::Source);
         if self.src == Src::Command {
             v.push(Field::Every);
         }
@@ -622,6 +652,9 @@ impl Builder {
             let (setup, live) = crate::tutorial::start()?;
             return Ok(App::new(setup, live));
         }
+        if self.merge_name.is_some() {
+            return self.launch_merged();
+        }
         self.apply()?;
         if self.cli.input.is_none() && self.cli.cmd.is_none() {
             bail!("choose a source first");
@@ -645,6 +678,43 @@ impl Builder {
             _ => Live::new(spec),
         };
         Ok(App::new(setup, live))
+    }
+
+    /// A merged source: back into the chart it came from.
+    fn launch_merged(&mut self) -> Result<App> {
+        let name = self
+            .merge_name
+            .as_ref()
+            .map_or(String::new(), |n| n.value.trim().to_string());
+        if name.is_empty() || name.contains(|c: char| c.is_whitespace() || c == '=') {
+            bail!("give the source a one-word name (its series are named after it)");
+        }
+        self.apply()?;
+        if self.cli.input.is_none() && self.cli.cmd.is_none() {
+            bail!("choose a file or command for the source");
+        }
+        if self.parser == Parser::Unset {
+            bail!("pick a format first: tap a suggestion, or choose a parser and write one");
+        }
+        if let Some(e) = &self.preview.error {
+            bail!("{e}");
+        }
+        let args: Vec<String> = self
+            .cli
+            .to_args()
+            .iter()
+            .map(|a| crate::cli::shell_quote(a))
+            .collect();
+        let spec = format!("{name} = {}", args.join(" "));
+        let mut app = self
+            .previous
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("there's no chart to add the source to"))?;
+        if let Err(e) = app.set_merged_source(self.merge_old.as_deref(), spec) {
+            self.previous = Some(app);
+            return Err(e);
+        }
+        Ok(*app)
     }
 
     pub fn tick(&mut self) {
@@ -1065,7 +1135,15 @@ impl Builder {
 
     fn action_buttons(&self) -> Vec<Button<Hit>> {
         vec![
-            Button::new("▶ start", Hit::Start).active(
+            Button::new(
+                if self.merge_name.is_some() {
+                    "▶ merge into the chart"
+                } else {
+                    "▶ start"
+                },
+                Hit::Start,
+            )
+            .active(
                 self.parser != Parser::Unset
                     && self.preview.error.is_none()
                     && self.preview.matched > 0,
@@ -1102,6 +1180,7 @@ impl Builder {
             Field::TimeFormat => &self.time_format,
             Field::Targets => &self.targets,
             Field::SaveName => self.save_name.as_ref().expect("save name shown"),
+            Field::MergeName => self.merge_name.as_ref().expect("merge name shown"),
         };
         ti.render(
             input,
@@ -1157,22 +1236,44 @@ impl Builder {
         ];
         let rows = Layout::vertical(constraints).split(area);
 
-        f.render_widget(
-            Line::from(vec![
+        if self.merge_name.is_some() {
+            let [t, n] =
+                Layout::horizontal([Constraint::Length(30), Constraint::Min(10)]).areas(rows[0]);
+            f.render_widget(
                 Span::styled(
-                    " graft · build a chart ",
+                    " graft · a source to merge ",
                     Style::default()
                         .fg(Color::Black)
-                        .bg(Color::Yellow)
+                        .bg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    "  tap anything · tab: next field · enter: start · esc: back",
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]),
-            rows[0],
-        );
+                t,
+            );
+            self.field(
+                f,
+                n,
+                "name ",
+                Field::MergeName,
+                "one word: its series are named after it",
+            );
+        } else {
+            f.render_widget(
+                Line::from(vec![
+                    Span::styled(
+                        " graft · build a chart ",
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "  tap anything · tab: next field · enter: start · esc: back",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]),
+                rows[0],
+            );
+        }
 
         // Source.
         render_buttons(&src_b, rows[1], f.buffer_mut(), &self.hits);
@@ -1900,6 +2001,91 @@ mod tests {
         assert!(b.gallery.is_some());
         // Phone-sized.
         assert!(screen(&b, 46, 30).contains("CPU usage"));
+    }
+
+    #[test]
+    fn sources_menu_edits_adds_and_removes_merged_sources() {
+        use crate::interactive::Transition as T;
+        let log = "examples/reclaimable.log";
+        let mut app =
+            crate::tui::tests::app(&["graft", log, "--kv", "--merge", &format!("b = {log} --kv")]);
+        // The menu: the main source and the merged one.
+        let ev = |app: &mut App, c: char| {
+            app.on_event(&ratatui::crossterm::event::Event::Key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            )))
+        };
+        ev(&mut app, 'S');
+        let s = crate::tui::tests::screen_of(&app, 100, 40);
+        assert!(
+            s.contains(" sources ") && s.contains("main") && s.contains("1 · b"),
+            "{s}"
+        );
+        // 1: edit merged source b in the builder; rename it c, and it goes back in.
+        assert_eq!(ev(&mut app, '1'), T::EditSource);
+        let (name, cli) = app.take_source_edit();
+        assert_eq!(name, "b");
+        let mut b = Builder::for_source(name, cli, Box::new(app));
+        let start = Instant::now();
+        while b.loading.is_some() && start.elapsed() < Duration::from_secs(5) {
+            b.tick();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(screen(&b, 100, 40).contains("a source to merge"));
+        assert!(screen(&b, 100, 40).contains("merge into the chart"));
+        b.merge_name.as_mut().unwrap().set("c");
+        let mut app = b.launch().expect("merged back");
+        let merged = app.current_cli().merge;
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].starts_with("c = "), "{merged:?}");
+        // (Merged sources are read in the background.)
+        let start = Instant::now();
+        while !app.ds_names().iter().any(|n| n.starts_with("c."))
+            && start.elapsed() < Duration::from_secs(5)
+        {
+            app.tick();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            app.ds_names().iter().any(|n| n.starts_with("c.")),
+            "{:?}",
+            app.ds_names()
+        );
+        // a: a new source, named for you.
+        ev(&mut app, 'S');
+        assert_eq!(ev(&mut app, 'a'), T::EditSource);
+        let (name, _) = app.take_source_edit();
+        assert_eq!(name, "source2");
+        let cli = Cli::parse_from(["graft", log, "--kv"]);
+        let mut b = Builder::for_source(name, cli, Box::new(app));
+        let start = Instant::now();
+        while b.loading.is_some() && start.elapsed() < Duration::from_secs(5) {
+            b.tick();
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mut app = b.launch().expect("added");
+        assert_eq!(app.current_cli().merge.len(), 2);
+        // ✕ removes one.
+        ev(&mut app, 'S');
+        let s = crate::tui::tests::screen_of(&app, 100, 40);
+        let (row, line) = s
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains('✕'))
+            .unwrap();
+        let col = line.chars().position(|c| c == '✕').unwrap() as u16;
+        app.on_event(&ratatui::crossterm::event::Event::Mouse(
+            ratatui::crossterm::event::MouseEvent {
+                kind: ratatui::crossterm::event::MouseEventKind::Down(
+                    ratatui::crossterm::event::MouseButton::Left,
+                ),
+                column: col,
+                row: row as u16,
+                modifiers: KeyModifiers::NONE,
+            },
+        ));
+        assert_eq!(app.current_cli().merge.len(), 1);
     }
 
     #[test]

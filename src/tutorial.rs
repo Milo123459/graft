@@ -519,12 +519,19 @@ The database spikes now and then: mark it."#,
     },
     Step {
         title: "getting data in",
-        text: r#"Three kinds of source: a file (read once, or followed as it grows), a command (run every few seconds, like watch) or stdin (a pipe). Any of them can run on another machine with --ssh, and --merge adds more sources to the same chart.
+        text: r#"Three kinds of source: a file (read once, or followed as it grows), a command (run every few seconds, like watch) or stdin (a pipe). Any of them can run on another machine with --ssh, and more sources can share one chart: their series are named after them (cb, or cb.price when there are several).
+The sources menu lists them: edit one in the builder (with a live preview), add another, or remove one.
 From here on the steps are a reference: read what's useful, skip the rest with Enter."#,
-        keys: &[(
-            "F",
-            "the builder: pick a source and a format, with suggestions and a preview",
-        )],
+        keys: &[
+            (
+                "S / sources",
+                "the sources menu: edit the main source; add, edit or remove merged ones",
+            ),
+            (
+                "F",
+                "the builder for the main source: source and format, with suggestions and a preview",
+            ),
+        ],
         examples: &[
             (
                 "graft app.log --kv -f",

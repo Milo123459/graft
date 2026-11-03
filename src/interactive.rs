@@ -100,6 +100,8 @@ pub enum Transition {
     Start,
     /// Turn mouse capture on/off.
     Mouse(bool),
+    /// Viewer → builder, for one of its merged sources (or a new one).
+    EditSource,
 }
 
 pub enum Start {
@@ -183,6 +185,10 @@ pub fn run(start: Start) -> Result<ExitCode> {
                     let cli = a.current_cli();
                     crate::recent::remember(&cli);
                     Screen::Builder(Box::new(Builder::new(cli, None, Some(a))))
+                }
+                (Screen::Viewer(mut a), Transition::EditSource) => {
+                    let (name, cli) = a.take_source_edit();
+                    Screen::Builder(Box::new(Builder::for_source(name, cli, a)))
                 }
                 (Screen::Builder(mut b), Transition::Back) => match b.take_previous() {
                     Some(app) => Screen::Viewer(app),

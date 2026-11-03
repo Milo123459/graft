@@ -162,6 +162,7 @@ enum Cmd {
     Copy,
     Markers,
     Alerts,
+    Sources,
     Undo,
 }
 
@@ -201,6 +202,11 @@ enum Hit {
     MarkAction(MarkAction),
     /// Timeframe dropdown: type a range in the console.
     CustomRange,
+    /// Sources menu: edit one (`None`: the main source), remove a merged one, add one.
+    SourceEdit(Option<usize>),
+    SourceRemove(usize),
+    SourceAdd,
+    CloseSources,
     /// A console suggestion (by position in the hint row).
     Complete(usize),
     /// A command in the `help` list: put it in the console.
@@ -440,6 +446,10 @@ pub struct App {
     pane_menu: bool,
     /// Text to put on the clipboard (written to the terminal by the event loop).
     clipboard: Option<String>,
+    /// The sources menu is open.
+    sources_menu: bool,
+    /// The source the builder is to edit: `Some(None)` is a new one.
+    source_to_edit: Option<Option<String>>,
     /// The console's last output (a result or an error), shown above the status line.
     console_note: Option<Message>,
     /// Tab pressed: the suggestions being cycled through, and the input before.
@@ -562,6 +572,8 @@ impl App {
             clipboard: None,
             tutorial,
             console_note: None,
+            sources_menu: false,
+            source_to_edit: None,
             error_at: None,
             tab_cycle: None,
             tutorial_rect: std::cell::Cell::new(Rect::default()),
@@ -3156,6 +3168,7 @@ impl App {
             Cmd::Copy => self.copy(None),
             Cmd::Undo => return self.step_back(),
             Cmd::Alerts => self.alerts_menu = !self.alerts_menu,
+            Cmd::Sources => self.sources_menu = !self.sources_menu,
             Cmd::Markers => {
                 self.marks_menu = match self.marks_menu {
                     Some(_) => None,
@@ -3270,6 +3283,254 @@ impl App {
             error,
             at: Instant::now(),
         });
+    }
+
+    // ───────────── sources menu ─────────────
+
+    /// The merged sources, as (name, what it reads).
+    fn merged_sources(&self) -> Vec<(String, String)> {
+        self.cli
+            .merge
+            .iter()
+            .filter_map(|s| crate::sources::Merge::parse(s).ok())
+            .map(|m| {
+                let what = crate::setup::source_spec(&m.cli(), false)
+                    .map_or_else(|_| m.args.join(" "), |s| s.describe());
+                (m.name, what)
+            })
+            .collect()
+    }
+
+    /// Edit a source in the builder: `None` the main one, `Some(i)` merged source `i`,
+    /// `Some(usize::MAX)` a new one.
+    fn edit_source(&mut self, which: Option<usize>) -> Transition {
+        self.sources_menu = false;
+        match which {
+            None => Transition::OpenBuilder,
+            Some(i) => {
+                self.source_to_edit = Some(
+                    self.cli
+                        .merge
+                        .get(i)
+                        .and_then(|s| crate::sources::Merge::parse(s).ok())
+                        .map(|m| m.name),
+                );
+                Transition::EditSource
+            }
+        }
+    }
+
+    /// The source the builder is about to edit: its name (`None`: a new one, named
+    /// here) and its arguments.
+    #[cfg(test)]
+    pub fn ds_names(&self) -> Vec<String> {
+        self.ds.series.iter().map(|s| s.name.clone()).collect()
+    }
+
+    pub fn take_source_edit(&mut self) -> (String, Cli) {
+        let name = self.source_to_edit.take().flatten();
+        let found = name.as_ref().and_then(|n| {
+            self.cli
+                .merge
+                .iter()
+                .filter_map(|s| crate::sources::Merge::parse(s).ok())
+                .find(|m| &m.name == n)
+        });
+        match found {
+            Some(m) => (m.name.clone(), m.cli()),
+            None => {
+                let taken: Vec<String> = self.merged_sources().into_iter().map(|m| m.0).collect();
+                let name = (2..)
+                    .map(|i| format!("source{i}"))
+                    .find(|n| !taken.contains(n))
+                    .expect("a free name");
+                (name, <Cli as clap::Parser>::parse_from(["graft"]))
+            }
+        }
+    }
+
+    /// Add or replace a merged source (from the builder): `old` is the name it had.
+    pub fn set_merged_source(&mut self, old: Option<&str>, spec: String) -> anyhow::Result<()> {
+        let m = crate::sources::Merge::parse(&spec)?;
+        self.cli.merge.retain(|s| {
+            crate::sources::Merge::parse(s)
+                .map_or(true, |o| o.name != m.name && Some(o.name.as_str()) != old)
+        });
+        self.cli.merge.push(m.spec);
+        self.start_merges();
+        self.rebuild(true);
+        self.say(format!("source '{}' merged in", m.name), false);
+        Ok(())
+    }
+
+    fn remove_source(&mut self, i: usize) {
+        if i < self.cli.merge.len() {
+            self.cli.merge.remove(i);
+            self.start_merges();
+            self.rebuild(true);
+        }
+    }
+
+    fn on_sources_menu_key(&mut self, key: KeyEvent) -> Transition {
+        match key.code {
+            KeyCode::Char('a') => return self.edit_source(Some(usize::MAX)),
+            KeyCode::Char('e') => return self.edit_source(None),
+            KeyCode::Char(d @ '1'..='9') => {
+                let i = d as usize - '1' as usize;
+                if i < self.cli.merge.len() {
+                    return self.edit_source(Some(i));
+                }
+            }
+            _ => self.sources_menu = false,
+        }
+        Transition::None
+    }
+
+    /// Where the data comes from: the main source and each merged one, to edit,
+    /// remove or add to.
+    fn draw_sources_menu(&self, f: &mut Frame) {
+        if !self.sources_menu {
+            return;
+        }
+        let area = f.area();
+        let merged = self.merged_sources();
+        let w = 72.min(area.width);
+        let inner_w = w.saturating_sub(2);
+        let actions = vec![
+            Button::new("+ add source", Hit::SourceAdd),
+            Button::new("done", Hit::CloseSources),
+        ];
+        let rows = 2 + 2 * (1 + merged.len()) + 1 + flow_height(&actions, inner_w) as usize + 1;
+        let h = (rows as u16 + 2).min(area.height);
+        let rect = Rect {
+            x: (area.width - w) / 2,
+            y: area.height.saturating_sub(h) / 2,
+            width: w,
+            height: h,
+        };
+        Clear.render(rect, f.buffer_mut());
+        let block = Block::bordered()
+            .title(" sources ")
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        self.hits.push(rect, Hit::MenuBackground);
+        let dim = Style::default().fg(Color::Gray);
+        let mut y = inner.y;
+        let line = |f: &mut Frame, y: u16, l: Line| {
+            if y < inner.bottom() {
+                f.render_widget(
+                    l,
+                    Rect {
+                        y,
+                        height: 1,
+                        ..inner
+                    },
+                );
+            }
+        };
+        line(f, y, Line::styled("where the data comes from", dim));
+        y += 2;
+        let fit = |s: &str, n: usize| -> String {
+            if s.chars().count() > n {
+                s.chars().take(n.saturating_sub(1)).collect::<String>() + "…"
+            } else {
+                s.to_string()
+            }
+        };
+        // Each source: its name and what it reads, then its buttons on the right.
+        let row = |f: &mut Frame, y: u16, name: &str, what: &str, buttons: Vec<Button<Hit>>| {
+            if y >= inner.bottom() {
+                return;
+            }
+            let bw: u16 = buttons
+                .iter()
+                .map(|b| b.label.chars().count() as u16 + 3)
+                .sum();
+            line(
+                f,
+                y,
+                Line::from(vec![Span::styled(
+                    format!("{name} "),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )]),
+            );
+            line(
+                f,
+                y + 1,
+                Line::styled(
+                    format!(
+                        "  {}",
+                        fit(what, inner.width.saturating_sub(bw + 3) as usize)
+                    ),
+                    dim,
+                ),
+            );
+            render_buttons(
+                &buttons,
+                Rect {
+                    x: inner.right().saturating_sub(bw),
+                    y: y + 1,
+                    width: bw,
+                    height: 1,
+                },
+                f.buffer_mut(),
+                &self.hits,
+            );
+        };
+        let main = if self.live.spec.is_live()
+            || !matches!(self.live.spec, crate::source::SourceSpec::Stdin)
+        {
+            self.live.spec.describe()
+        } else {
+            "stdin".to_string()
+        };
+        row(
+            f,
+            y,
+            "main",
+            &main,
+            vec![Button::new("edit", Hit::SourceEdit(None))],
+        );
+        y += 2;
+        for (i, (name, what)) in merged.iter().enumerate() {
+            row(
+                f,
+                y,
+                &format!("{} · {name}", i + 1),
+                what,
+                vec![
+                    Button::new("edit", Hit::SourceEdit(Some(i))),
+                    Button::new("✕", Hit::SourceRemove(i)),
+                ],
+            );
+            y += 2;
+        }
+        y += 1;
+        if y < inner.bottom() {
+            render_buttons(
+                &actions,
+                Rect {
+                    y,
+                    height: inner.bottom() - y,
+                    ..inner
+                },
+                f.buffer_mut(),
+                &self.hits,
+            );
+        }
+        if inner.height > 0 {
+            line(
+                f,
+                inner.bottom() - 1,
+                Line::styled(
+                    "a add · e edit main · 1-9 edit · Esc",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            );
+        }
     }
 
     // ───────────── console completion ─────────────
@@ -4095,7 +4356,8 @@ impl App {
             || self.console_help
             || self.source_menu.is_some()
             || self.marks_menu.is_some()
-            || self.alerts_menu)
+            || self.alerts_menu
+            || self.sources_menu)
     }
 
     fn cli_bits(&self) -> CliBits {
@@ -4302,6 +4564,9 @@ impl App {
             self.on_marks_menu_key(key);
             return Transition::None;
         }
+        if self.sources_menu {
+            return self.on_sources_menu_key(key);
+        }
         if self.alerts_menu {
             match key.code {
                 KeyCode::Char('a') => self.edit_alert(None),
@@ -4462,6 +4727,7 @@ impl App {
             KeyCode::Char('C') => Cmd::Copy,
             KeyCode::Char('K') => Cmd::Markers,
             KeyCode::Char('N') => Cmd::Alerts,
+            KeyCode::Char('S') => Cmd::Sources,
             KeyCode::Char('[') => Cmd::RangeStep(-1),
             KeyCode::Char(']') => Cmd::RangeStep(1),
             KeyCode::Char(' ' | 'p') => Cmd::Pause,
@@ -4515,6 +4781,16 @@ impl App {
                         Hit::Range(w) => {
                             self.set_timeframe(w.map_or_else(Timeframe::default, Timeframe::last));
                             self.range_menu = false;
+                            Transition::None
+                        }
+                        Hit::SourceEdit(i) => self.edit_source(i),
+                        Hit::SourceAdd => self.edit_source(Some(usize::MAX)),
+                        Hit::SourceRemove(i) => {
+                            self.remove_source(i);
+                            Transition::None
+                        }
+                        Hit::CloseSources => {
+                            self.sources_menu = false;
                             Transition::None
                         }
                         Hit::InsertCommand(name) => {
@@ -4834,7 +5110,8 @@ impl App {
                     || self.range_menu
                     || self.source_menu.is_some()
                     || self.marks_menu.is_some()
-                    || self.alerts_menu;
+                    || self.alerts_menu
+                    || self.sources_menu;
                 if !over_menu && let Some(plot) = self.plot_at(col, row) {
                     // Small steps: trackpads send many events per swipe.
                     let up = m.kind == MouseEventKind::ScrollUp;
@@ -4884,6 +5161,14 @@ impl App {
                 Cmd::Panes,
             )
             .active(self.pane_menu || self.opts.panes.is_some()),
+            b(
+                &match self.cli.merge.len() {
+                    0 => "sources".to_string(),
+                    n => format!("sources ({})", n + 1),
+                },
+                Cmd::Sources,
+            )
+            .active(self.sources_menu),
             b("forecast", Cmd::Forecast).active(self.opts.forecast.is_some()),
             b("split", Cmd::Split).active(self.opts.split),
         ];
@@ -5127,6 +5412,7 @@ impl App {
         self.draw_source_menu(f);
         self.draw_marks_menu(f);
         self.draw_alerts_menu(f);
+        self.draw_sources_menu(f);
         if self.help {
             let mut entries: Vec<(String, String, Color)> = HELP
                 .iter()
@@ -5666,7 +5952,7 @@ impl App {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::interactive::Live;
     use clap::Parser;
@@ -5708,6 +5994,10 @@ mod tests {
         s.chars().for_each(|c| {
             key(app, KeyCode::Char(c));
         });
+    }
+
+    pub(crate) fn screen_of(app: &App, w: u16, h: u16) -> String {
+        screen_sized(app, w, h)
     }
 
     fn screen_sized(app: &App, w: u16, h: u16) -> String {
@@ -7737,5 +8027,14 @@ mod tests {
         run(&mut app, "help");
         shot(&app, "help", 46, 40);
         shot(&app, "help-wide", 110, 34);
+        key(&mut app, KeyCode::Esc);
+        app.cli.merge.push("cb = -c 'curl -s https://api.coinbase.com/v2/prices/ETH-USD/spot' --regex 'amount\\W+(?P<p>[0-9.]+)' -n 2s".into());
+        app.cli.merge.push(
+            "pi = -c 'vcgencmd measure_temp' --ssh pi@raspberrypi --regex 'temp=(?P<t>[0-9.]+)'"
+                .into(),
+        );
+        key(&mut app, KeyCode::Char('S'));
+        shot(&app, "sources", 46, 30);
+        shot(&app, "sources-wide", 110, 34);
     }
 }
