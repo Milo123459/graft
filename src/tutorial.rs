@@ -345,7 +345,7 @@ api is slowly getting slower here. Give it a target and the stats say when it ge
     },
     Step {
         title: "chart types",
-        text: r#"line and scatter show change over time. bar shows the latest value of each series, for comparing; histogram how the values are spread (a latency distribution); sparkline a small chart per series; stat big-number tiles with change and a sparkline, for dashboards."#,
+        text: r#"line and scatter show change over time. bar shows the latest value of each series, for comparing; histogram how the values are spread (a latency distribution); sparkline a small chart per series; stat big-number tiles with change and a sparkline, for dashboards. candles draws candlesticks for prices: it takes the series called open, high, low and close (or o/h/l/c, also at the end of a name like eth.o; else the first four), one candle per time, green when it closed up and red when down, merged when there are more than columns. Any other series (an EMA) is a line over them. With fewer than four series it's a line chart."#,
         keys: &[
             (
                 "t / chart type",
@@ -361,6 +361,10 @@ api is slowly getting slower here. Give it a target and the stats say when it ge
         examples: &[
             ("--kind histogram", "start as a histogram"),
             ("--kind stat --select api", "one big number"),
+            (
+                "--pane 'open,high,low,close,ema30 kind=candles'",
+                "candlesticks with an EMA over them (see the trading recipe)",
+            ),
             (r#":chart("bar")"#, "in the console"),
         ],
         task: Some("press t a few times; t again comes back to line"),
@@ -971,9 +975,9 @@ The next pages are recipes for real use: copy puts one on your clipboard."#,
     },
     Step {
         title: "recipe: a trading dashboard",
-        text: "Hyperliquid candles (500 of them, polled every 5 s; --replace keeps the newest up to date instead of piling up copies), with EMA30/EMA50 and crossover markers, RSI, MACD and volume in panes. coin ▾ and interval ▾ switch asset and candle size; scroll back to the oldest candle and older ones load. RSI and MACD come from examples/indicators.rhai",
+        text: "Hyperliquid candles (500 of them, polled every 5 s; --replace keeps the newest up to date instead of piling up copies) drawn as candlesticks (kind=candles, from the open/high/low/close series), with EMA30/EMA50 over them and crossover markers, RSI, MACD and volume in panes. coin ▾ and interval ▾ switch asset and candle size; scroll back to the oldest candle and older ones load. RSI and MACD come from examples/indicators.rhai",
         command: Some(
-            r#"graft -c 'curl -s --json "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"{coin}\",\"interval\":\"{interval}\",\"startTime\":{from_ms:500*{interval}},\"endTime\":{now_ms}}}" https://api.hyperliquid.xyz/info' --param 'coin = ETH | BTC | SOL | HYPE' --param 'interval = 1m | 5m | 15m | 1h | 4h | 1d' -n 5s --json --time-field t --replace --script examples/indicators.rhai --series 'price:USD = c' --series 'volume = v' --select price,volume --line 'ema30 = ema(values("price"), 30)' --line 'ema50 = ema(values("price"), 50)' --line 'rsi14:% = rsi(values("price"), 14)' --line 'overbought:% = 70' --line 'oversold:% = 30' --line 'macd = macd(values("price"))' --line 'signal = ema(values("macd"), 9)' --mark 'name == "ema30" && prev < ema50_prev && value >= ema50 => golden cross | ▲ green' --mark 'name == "ema30" && prev > ema50_prev && value <= ema50 => death cross | ▼ red' --pane 'price,ema30,ema50 title={coin} {interval}' --pane 'rsi14,overbought,oversold' --pane 'macd,signal' --pane volume --layout '1 /60% ((2 | 3) / 4)' --title '{coin} {interval}'"#,
+            r#"graft -c 'curl -s --json "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"{coin}\",\"interval\":\"{interval}\",\"startTime\":{from_ms:500*{interval}},\"endTime\":{now_ms}}}" https://api.hyperliquid.xyz/info' --param 'coin = ETH | BTC | SOL | HYPE' --param 'interval = 1m | 5m | 15m | 1h | 4h | 1d' -n 5s --json --time-field t --replace --script examples/indicators.rhai --series 'open:USD = o' --series 'high:USD = h' --series 'low:USD = l' --series 'close:USD = c' --series 'volume = v' --select open,high,low,close,volume --line 'ema30 = ema(values("close"), 30)' --line 'ema50 = ema(values("close"), 50)' --line 'rsi14:% = rsi(values("close"), 14)' --line 'overbought:% = 70' --line 'oversold:% = 30' --line 'macd = macd(values("close"))' --line 'signal = ema(values("macd"), 9)' --mark 'name == "ema30" && prev < ema50_prev && value >= ema50 => golden cross | ▲ green' --mark 'name == "ema30" && prev > ema50_prev && value <= ema50 => death cross | ▼ red' --pane 'open,high,low,close,ema30,ema50 kind=candles title={coin} {interval}' --pane 'rsi14,overbought,oversold' --pane 'macd,signal' --pane volume --layout '1 /60% ((2 | 3) / 4)' --title '{coin} {interval}'"#,
         ),
         ..BASE
     },

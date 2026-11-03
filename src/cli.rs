@@ -873,6 +873,8 @@ pub enum ChartKind {
     Sparkline,
     /// A tile per series: the current value in big digits, its change, a sparkline.
     Stat,
+    /// Candlesticks from open/high/low/close series; other series drawn as lines over them.
+    Candles,
 }
 
 impl ChartKind {
@@ -883,7 +885,8 @@ impl ChartKind {
             Self::Bar => Self::Histogram,
             Self::Histogram => Self::Sparkline,
             Self::Sparkline => Self::Stat,
-            Self::Stat => Self::Line,
+            Self::Stat => Self::Candles,
+            Self::Candles => Self::Line,
         }
     }
 
@@ -895,6 +898,7 @@ impl ChartKind {
             Self::Histogram => "histogram",
             Self::Sparkline => "sparkline",
             Self::Stat => "stat",
+            Self::Candles => "candles",
         }
     }
 }

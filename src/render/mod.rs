@@ -894,6 +894,100 @@ fn draw_axis_labels(
     }
 }
 
+/// The open, high, low and close series of a candlestick chart: by name (`open`
+/// or `o`, also as the end of a name like `eth.open`), else the first four.
+fn candle_roles<'a>(visible: &[(usize, &'a Series)]) -> Option<[(usize, &'a Series); 4]> {
+    const NAMES: [[&str; 2]; 4] = [["open", "o"], ["high", "h"], ["low", "l"], ["close", "c"]];
+    let role = |s: &Series| {
+        let name = s.name.to_lowercase();
+        let tail = name
+            .rsplit(['.', '_', ' ', '-'])
+            .next()
+            .unwrap_or(&name)
+            .to_string();
+        NAMES
+            .iter()
+            .position(|n| n.contains(&name.as_str()) || n.contains(&tail.as_str()))
+    };
+    let mut found: [Option<(usize, &Series)>; 4] = [None; 4];
+    for &(i, s) in visible {
+        if let Some(r) = role(s)
+            && found[r].is_none()
+        {
+            found[r] = Some((i, s));
+        }
+    }
+    if let [Some(o), Some(h), Some(l), Some(c)] = found {
+        return Some([o, h, l, c]);
+    }
+    match visible {
+        [o, h, l, c, ..] => Some([*o, *h, *l, *c]),
+        _ => None,
+    }
+}
+
+/// Paint candlesticks into a plot: one per column (several candles sharing a
+/// column are merged into one), half-block bodies, │ wicks, green up, red down.
+fn draw_candles(
+    buf: &mut Buffer,
+    plot: &PlotArea,
+    (y0, y1): (f64, f64),
+    [open, high, low, close]: [&Series; 4],
+    ty: &dyn Fn(f64) -> f64,
+) {
+    let r = plot.rect;
+    if r.width == 0 || r.height == 0 || y1 <= y0 {
+        return;
+    }
+    let at = |s: &Series, x: f64| {
+        let i = s.points.partition_point(|p| p.0 < x);
+        s.points.get(i).filter(|p| p.0 == x).map(|p| p.1)
+    };
+    // (open, high, low, close) per column.
+    let mut cols: Vec<Option<(f64, f64, f64, f64)>> = vec![None; r.width as usize];
+    for &(x, o) in &open.points {
+        if x < plot.x0 || x > plot.x1 {
+            continue;
+        }
+        let (Some(h), Some(l), Some(c)) = (at(high, x), at(low, x), at(close, x)) else {
+            continue;
+        };
+        let k = (plot.col_of(x) - r.x) as usize;
+        cols[k] = Some(match cols[k] {
+            None => (o, h.max(o).max(c), l.min(o).min(c), c),
+            Some((o0, h0, l0, _)) => (o0, h0.max(h), l0.min(l), c),
+        });
+    }
+    let halves = f64::from(r.height) * 2.0;
+    // Half-rows from the top (0 = top edge of the plot).
+    let half = |v: f64| ((1.0 - (ty(v) - y0) / (y1 - y0)) * halves).clamp(0.0, halves);
+    for (k, c) in cols.iter().enumerate() {
+        let Some((o, h, l, c)) = *c else {
+            continue;
+        };
+        let color = if c >= o { Color::Green } else { Color::Red };
+        let top = half(o.max(c)).floor() as i64;
+        let bottom = (half(o.min(c)).ceil() as i64).max(top + 1);
+        let (wick_top, wick_bottom) = (half(h).floor() as i64, half(l).ceil() as i64);
+        let col = r.x + k as u16;
+        for row in 0..r.height {
+            let (a, b) = (i64::from(row) * 2, i64::from(row) * 2 + 1);
+            let upper = (top..bottom).contains(&a);
+            let lower = (top..bottom).contains(&b);
+            let symbol = match (upper, lower) {
+                (true, true) => "█",
+                (true, false) => "▀",
+                (false, true) => "▄",
+                _ if wick_top <= b && a < wick_bottom => "│",
+                _ => continue,
+            };
+            buf[(col, r.y + row)]
+                .set_symbol(symbol)
+                .set_style(Style::default().fg(color));
+        }
+    }
+}
+
 /// Where ratatui's Chart puts the plotting area (mirrors its layout rules).
 fn graph_area(inner: Rect, y_labels: &[Line], first_x_label: Option<&Line>) -> Rect {
     let y_w = y_labels.iter().map(Line::width).max().unwrap_or(0) as u16;
@@ -1234,10 +1328,16 @@ impl<'a> ChartWidget<'a> {
                 .map(|p| s.unit.format(p.1))
                 .unwrap_or_default()
         };
+        // Candlesticks: their four series set the y range and the readout but are
+        // painted as candles below, not as lines.
+        let ohlc = (self.opts.kind == ChartKind::Candles)
+            .then(|| candle_roles(&visible))
+            .flatten();
+        let is_ohlc = |s: &Series| ohlc.is_some_and(|r| r.iter().any(|&(_, o)| std::ptr::eq(o, s)));
         if raw_shown {
             // Under trend lines the raw data takes a darker shade of the series colour,
             // so each trend is clearly distinct from (but matches) its data.
-            for (i, s, pts) in &lines {
+            for (i, s, pts) in lines.iter().filter(|l| !is_ohlc(l.1)) {
                 let color = self.opts.color(*i);
                 let style = Style::default().fg(if trends.is_empty() {
                     color
@@ -1367,6 +1467,9 @@ impl<'a> ChartWidget<'a> {
         );
         if let Some(plots) = self.overlay.plots {
             plots.borrow_mut().push(plot);
+        }
+        if let Some(roles) = ohlc {
+            draw_candles(buf, &plot, (y0, y1), roles.map(|r| r.1), &ty);
         }
         self.draw_marks(buf, &plot, (y0, y1), &visible);
         if let Some(c) = self.overlay.cursor
@@ -2433,7 +2536,11 @@ impl Widget for ChartWidget<'_> {
         }
         if !matches!(
             self.opts.kind,
-            ChartKind::Line | ChartKind::Scatter | ChartKind::Bar | ChartKind::Stat
+            ChartKind::Line
+                | ChartKind::Scatter
+                | ChartKind::Bar
+                | ChartKind::Stat
+                | ChartKind::Candles
         ) && !self.opts.trends.is_empty()
         {
             let (ds, opts) = with_trend_series(self.ds, self.opts, self.overlay.hidden);
@@ -2441,7 +2548,7 @@ impl Widget for ChartWidget<'_> {
         }
         match self.opts.kind {
             ChartKind::Line | ChartKind::Scatter if self.opts.split => self.render_split(area, buf),
-            ChartKind::Line | ChartKind::Scatter => {
+            ChartKind::Line | ChartKind::Scatter | ChartKind::Candles => {
                 self.render_xy(area, buf, self.visible(), &self.opts.title, false)
             }
             ChartKind::Bar => self.render_bar(area, buf),
@@ -2574,6 +2681,61 @@ mod tests {
         // Too small for big digits: plain text.
         let text = crate::render::ansi::to_ansi(&render_to_buffer(&ds, &opts, 40, 4), false);
         assert!(text.contains("56 GB"), "{text}");
+    }
+
+    #[test]
+    fn candles_from_open_high_low_close() {
+        let mk = |name: &str, v: [f64; 3]| Series {
+            name: name.into(),
+            unit: Unit::default(),
+            points: v
+                .iter()
+                .enumerate()
+                .map(|(i, &y)| (i as f64 * 60.0, y))
+                .collect(),
+        };
+        // Up, down, up; with an EMA drawn over them.
+        let ds = Dataset {
+            x_kind: XKind::Time,
+            series: vec![
+                mk("ema", [12.0, 13.0, 13.0]),
+                mk("eth.o", [10.0, 16.0, 11.0]),
+                mk("eth.h", [17.0, 18.0, 19.0]),
+                mk("eth.l", [9.0, 10.0, 10.0]),
+                mk("eth.c", [15.0, 12.0, 18.0]),
+            ],
+        };
+        let roles = candle_roles(&ds.series.iter().enumerate().collect::<Vec<_>>()).unwrap();
+        assert_eq!(
+            roles.map(|r| r.1.name.as_str()),
+            ["eth.o", "eth.h", "eth.l", "eth.c"]
+        );
+        let opts = ChartOpts {
+            kind: ChartKind::Candles,
+            ..ChartOpts::default()
+        };
+        let buf = render_to_buffer(&ds, &opts, 40, 16);
+        let cells = |sym: &str, color: Color| {
+            buf.content
+                .iter()
+                .filter(|c| c.symbol() == sym && c.fg == color)
+                .count()
+        };
+        assert!(cells("█", Color::Green) > 0 && cells("█", Color::Red) > 0);
+        assert!(cells("│", Color::Green) > 0 && cells("│", Color::Red) > 0);
+        // Only the EMA is a line: no braille in the candles' colours.
+        let text = crate::render::ansi::to_ansi(&buf, false);
+        assert!(
+            text.contains(['⠁', '⠂', '⠄', '⡀', '⠈', '⠐', '⠠', '⢀', '⠉', '⠒', '⠤', '⣀']),
+            "{text}"
+        );
+        // Fewer than four series: a plain line chart.
+        let two = Dataset {
+            x_kind: XKind::Time,
+            series: ds.series[..2].to_vec(),
+        };
+        let buf = render_to_buffer(&two, &opts, 40, 16);
+        assert!(!buf.content.iter().any(|c| c.symbol() == "█"));
     }
 
     #[test]

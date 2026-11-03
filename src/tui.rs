@@ -7208,7 +7208,7 @@ pub(crate) mod tests {
         assert!(s.contains("node1 58.8 GB"), "{s}");
         assert!(s.contains("▼ -1.97 GB"), "{s}");
         assert!(s.contains(" forecast ") && s.contains(" ● node1 "), "{s}");
-        for _ in 0..6 {
+        for _ in 0..7 {
             key(&mut app, KeyCode::Char('t'));
             screen(&app);
         }

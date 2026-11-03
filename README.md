@@ -231,7 +231,9 @@ Hyperliquid's candles, polled every 5 s: **coin ▾** and **interval ▾** switc
 `{now_ms}`). Scroll back to the oldest candle and graft asks for the 500 before it
 (see below). The API returns a JSON array
 (one record per candle, `--json --time-field t`) and the same candles each time,
-so `--replace` updates the newest one instead of adding copies. RSI and MACD come
+so `--replace` updates the newest one instead of adding copies. The top pane is
+`kind=candles`: candlesticks from the open/high/low/close series (green closed up, red
+down; candles that share a column are merged), with the EMAs drawn over them. RSI and MACD come
 from [examples/indicators.rhai](examples/indicators.rhai); `hist = macd - signal`
 would add the histogram (series by name are worked out at each point).
 
@@ -240,13 +242,14 @@ graft -c 'curl -s --json "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"{coin
   --param 'coin = ETH | BTC | SOL | HYPE' --param 'interval = 1m | 5m | 15m | 1h | 4h | 1d' \
   -n 5s --json --time-field t --replace \
   --script examples/indicators.rhai \
-  --series 'price:USD = c' --series 'volume = v' --select price,volume \
-  --line 'ema30 = ema(values("price"), 30)' --line 'ema50 = ema(values("price"), 50)' \
-  --line 'rsi14:% = rsi(values("price"), 14)' --line 'overbought:% = 70' --line 'oversold:% = 30' \
-  --line 'macd = macd(values("price"))' --line 'signal = ema(values("macd"), 9)' \
+  --series 'open:USD = o' --series 'high:USD = h' --series 'low:USD = l' --series 'close:USD = c' \
+  --series 'volume = v' --select open,high,low,close,volume \
+  --line 'ema30 = ema(values("close"), 30)' --line 'ema50 = ema(values("close"), 50)' \
+  --line 'rsi14:% = rsi(values("close"), 14)' --line 'overbought:% = 70' --line 'oversold:% = 30' \
+  --line 'macd = macd(values("close"))' --line 'signal = ema(values("macd"), 9)' \
   --mark 'name == "ema30" && prev < ema50_prev && value >= ema50 => golden cross | ▲ green' \
   --mark 'name == "ema30" && prev > ema50_prev && value <= ema50 => death cross | ▼ red' \
-  --pane 'price,ema30,ema50 title={coin} {interval}' --pane 'rsi14,overbought,oversold' --pane 'macd,signal' --pane volume \
+  --pane 'open,high,low,close,ema30,ema50 kind=candles title={coin} {interval}' --pane 'rsi14,overbought,oversold' --pane 'macd,signal' --pane volume \
   --layout '1 /60% ((2 | 3) / 4)' --title '{coin} {interval}'
 ```
 
@@ -404,7 +407,7 @@ time. `{sum}` in `--stats-template` gives the total.
 
 | | |
 |---|---|
-| `-k line\|scatter\|bar\|histogram\|sparkline\|stat` | chart type (bar = latest values; stat = a tile per series with the value in big digits, its change, trend, target ETA and a sparkline — good as a pane above a chart) |
+| `-k line\|scatter\|bar\|histogram\|sparkline\|stat\|candles` | chart type (bar = latest values; stat = a tile per series with the value in big digits, its change, trend, target ETA and a sparkline — good as a pane above a chart; candles = candlesticks from series named open/high/low/close or o/h/l/c, else the first four, with any other series as lines over them) |
 | `--split` | one panel per series, each with its own y axis |
 | `--pane 'node1 kind=bar lines=live,avg'` | panes: several charts in one view (repeat `--pane`); each picks series (`*` = all), `kind=`, `lines=`, `source=` (another preset, saved profile or recent chart, with its own command and format) and `title=` (last: the rest of the spec; `{name}` fills in a source setting) |
 | `--layout '(1 \| 2) / 3'` | how panes are arranged: `\|` side by side, `/` stacked, `\|60%` sizes (default: two side by side, more in a grid) |

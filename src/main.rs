@@ -312,10 +312,19 @@ fn run_once(
     for e in errors {
         eprintln!("graft: {e}");
     }
-    let opts = &ChartOpts {
+    let mut opts = ChartOpts {
         marks: placed,
         ..opts.clone()
     };
+    // Titles can say the source's settings: --title '{coin} {interval}'.
+    let params = params::parse_all(&cli.param);
+    opts.title = params::fill(&opts.title, &params);
+    if let Some(p) = opts.panes.as_mut() {
+        for t in p.panes.iter_mut().filter_map(|q| q.title.as_mut()) {
+            *t = params::fill(t, &params);
+        }
+    }
+    let opts = &opts;
 
     let mut out = std::io::stdout().lock();
     if !cli.no_chart {
