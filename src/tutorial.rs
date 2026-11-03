@@ -597,7 +597,7 @@ From here on the steps are a reference: read what's useful, skip the rest with E
                 "a setting: {interval} in the command (and titles); a dropdown runs it again",
             ),
             (
-                "-c 'curl … start={from_ms:6h}&end={now_ms}'",
+                "graft -c 'curl -s \"https://…?start={from_ms:6h}&end={now_ms}\"' --json",
                 "the window it asks for: scroll back to the oldest data and older is fetched",
             ),
             (
