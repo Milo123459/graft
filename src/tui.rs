@@ -515,6 +515,10 @@ pub struct App {
     built_params: Vec<crate::params::Param>,
     /// The legend's rows so far, for the width they were for.
     legend_rows: std::cell::Cell<(u16, u16)>,
+    /// Paged back from a "last N" timeframe (the window moved, the timeframe kept).
+    paged: bool,
+    /// Whether the data was last built without the timeframe's cut.
+    built_uncut: bool,
     /// Markers placed by hand with `mark("…")`.
     manual_marks: Vec<crate::render::Mark>,
     /// The markers menu is open, with this row picked.
@@ -587,6 +591,8 @@ impl App {
             alerts: cli.with_params().alert,
             built_params: crate::params::parse_all(&cli.param),
             legend_rows: std::cell::Cell::new((0, 0)),
+            paged: false,
+            built_uncut: false,
             show_stats: cli.stats,
             mouse: !cli.no_mouse,
             cli,
@@ -797,6 +803,13 @@ impl App {
             self.shown_merge_problems = problems;
         }
         self.rebuild(false);
+        // Back at the newest (or the view reset): the timeframe cuts again.
+        if (self.paged && self.view.is_some()) != self.built_uncut {
+            if self.view.is_none() {
+                self.paged = false;
+            }
+            self.rebuild(true);
+        }
         self.tick_sources(false);
     }
 
@@ -857,7 +870,18 @@ impl App {
         }
         self.session.add_custom_lines(&mut self.full);
         self.presets = timeframe_presets(&self.full);
-        self.timeframe.apply(&mut self.full);
+        // Paged back from "last 1h": all the data, seen through the moved window.
+        let uncut = self.paged && self.view.is_some();
+        if uncut {
+            Timeframe {
+                last: None,
+                ..self.timeframe
+            }
+            .apply(&mut self.full);
+        } else {
+            self.timeframe.apply(&mut self.full);
+        }
+        self.built_uncut = uncut;
         self.ds = self.session.select(&self.full);
         for m in &self.merge_subs {
             let prefix = format!("{}.", m.name);
@@ -1713,18 +1737,18 @@ impl App {
     }
 
     fn pan(&mut self, frac: f64) {
-        // On "last 30d", going back moves a 30-day window back through all the data
-        // (the timeframe becomes everything, seen through that window).
+        // On "last 1h", going back pages that hour back through the data: still an
+        // hour wide, still "last 1h" (→ back at the newest returns to it).
         if self.view.is_none() && frac < 0.0 && self.timeframe.last.is_some() {
             let (a, b) = self.bounds();
-            self.set_timeframe(Timeframe {
-                last: None,
-                ..self.timeframe
-            });
+            self.paged = true;
+            self.view = Some((a, b));
+            self.rebuild(true);
             let d = (b - a) * frac;
             self.set_view(a + d, b + d);
-            // Nothing older loaded yet: ask the source for it.
+            // Nothing older loaded yet: stay on this hour and ask the source for more.
             if self.view.is_none() {
+                self.view = Some((a, b));
                 self.start_backfill();
             }
             return;
@@ -1750,7 +1774,11 @@ impl App {
         let (_, end) = self.full_bounds();
         if frac > 0.0 && x1 >= end - (x1 - x0) * 0.01 {
             self.view = None;
-            self.say("showing everything", false);
+            if self.paged {
+                self.say("back to the newest", false);
+            } else {
+                self.say("showing everything", false);
+            }
             return;
         }
         let d = (x1 - x0) * frac;
@@ -1821,6 +1849,7 @@ impl App {
 
     fn set_timeframe(&mut self, tf: Timeframe) {
         self.timeframe = tf;
+        self.paged = false;
         self.view = None;
         self.selection = None;
         self.anchor = None;
@@ -9680,11 +9709,18 @@ pub(crate) mod tests {
         let (a, b) = app.bounds();
         key(&mut app, KeyCode::Left);
         let (c, d) = app.view.expect("a window to move");
-        assert!(app.timeframe.last.is_none());
+        assert_eq!(app.timeframe.last, Some(Window::Span(21600.0)), "still 6h");
         assert!((d - c - (b - a)).abs() < 1.0, "still 6 hours wide");
-        assert!(d < b && c < a, "earlier than before");
+        assert!(d < b && c < a, "earlier than before: {a}..{b} → {c}..{d}");
         key(&mut app, KeyCode::Left);
         assert!(app.view.unwrap().1 < d, "and on back");
+        // → back to the newest: the last 6 hours again, live.
+        for _ in 0..20 {
+            key(&mut app, KeyCode::Right);
+            app.tick();
+        }
+        assert!(app.view.is_none() && !app.paged);
+        assert_eq!(app.bounds(), (a, b));
     }
 
     #[test]

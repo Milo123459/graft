@@ -189,7 +189,7 @@ graft works the same with a mouse, a keyboard or a phone over ssh: tap where you
             ("+ − / ↑ ↓", "zoom in / out"),
             (
                 "◀ ▶ / ← → / h l",
-                "move along when zoomed in; on a timeframe like 1h, ← moves that 1h window back through the data (older data loads if the source can fetch it)",
+                "move along when zoomed in; on a timeframe like 1h, ← pages that hour back (still 1h wide, older data loads if the source can fetch it) and → at the newest is the live last hour again",
             ),
             ("H L", "move half a screen"),
             (

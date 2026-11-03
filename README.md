@@ -577,7 +577,7 @@ mouse capture off, so your terminal's own text selection works.
 
 | Key | Action |
 |---|---|
-| `← →` / `h l` | move left / right when zoomed in; on a timeframe like `30d`, `←` moves that 30-day window back (loading older data if the source can) |
+| `← →` / `h l` | move left / right when zoomed in; on a timeframe like `1h`, `←` pages that hour back (still 1h wide, loading older data if the source can) and `→` at the newest is the live last hour again |
 | `↑ ↓` / `+ -` | zoom in / out |
 | `,` `.` / shift `← →` | step the cursor point by point |
 | `H L` | move by half a screen |
