@@ -72,6 +72,18 @@ pub enum Action {
     Copy(Option<String>),
     /// A marker here (at the cursor, or the newest data) with this label.
     MarkHere(String),
+    /// What a series did after a rule's markers: (rule, series, after).
+    Backtest(
+        crate::backtest::RuleRef,
+        Option<String>,
+        crate::backtest::After,
+    ),
+    /// Trades from one rule's markers to another's: (entry, exit, series).
+    Strategy(
+        crate::backtest::RuleRef,
+        crate::backtest::RuleRef,
+        Option<String>,
+    ),
     /// Remove every marker and marker rule.
     ClearMarks,
     Undo,
@@ -732,6 +744,16 @@ pub const USAGE: &[(&str, &str, &str)] = &[
         "in a marker rule: either way",
     ),
     (
+        "backtest",
+        r#"backtest("golden cross", 10)  ·  backtest(1, "close", "1h")"#,
+        "what a series did after each marker of a rule (points or a time later)",
+    ),
+    (
+        "strategy",
+        r#"strategy("golden cross", "death cross")"#,
+        "trades: in at one rule's markers, out at the next of another's",
+    ),
+    (
         "is_num",
         r#"is_num(ema50_prev)"#,
         "whether a value is there (a series that hasn't begun is ())",
@@ -895,6 +917,8 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "cross_below",
             "cross",
             "is_num",
+            "backtest",
+            "strategy",
         ],
     ),
     ("alerts", &["alert", "unalert", "notify_to", "notify_off"]),
@@ -2457,6 +2481,83 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
             engine.register_fn("mark_when", move |expr: &str| f(expr, ""));
         }
     }
+    // Backtests: `after` is a number of points or a time ("1h").
+    let after_of = |d: &Dynamic| -> FnResult<crate::backtest::After> {
+        if let Some(n) = d.as_int().ok().filter(|n| *n > 0) {
+            return Ok(crate::backtest::After::Points(n as usize));
+        }
+        let text = d.to_string();
+        crate::time::parse_duration_secs(&text)
+            .map(crate::backtest::After::Span)
+            .map_err(|_| {
+                format!("backtest: after is a number of points (10) or a time (\"1h\"), not {text}")
+                    .into()
+            })
+    };
+    let st = state.clone();
+    engine.register_fn("backtest", move |rule: Dynamic| {
+        push(
+            &st,
+            Action::Backtest(
+                crate::backtest::RuleRef::from_dynamic(&rule),
+                None,
+                crate::backtest::After::Points(10),
+            ),
+        )
+    });
+    let st = state.clone();
+    engine.register_fn(
+        "backtest",
+        move |rule: Dynamic, after: Dynamic| -> FnResult<()> {
+            let after = after_of(&after)?;
+            push(
+                &st,
+                Action::Backtest(crate::backtest::RuleRef::from_dynamic(&rule), None, after),
+            );
+            Ok(())
+        },
+    );
+    let st = state.clone();
+    engine.register_fn(
+        "backtest",
+        move |rule: Dynamic, series: &str, after: Dynamic| -> FnResult<()> {
+            let after = after_of(&after)?;
+            push(
+                &st,
+                Action::Backtest(
+                    crate::backtest::RuleRef::from_dynamic(&rule),
+                    Some(series.into()),
+                    after,
+                ),
+            );
+            Ok(())
+        },
+    );
+    let st = state.clone();
+    engine.register_fn("strategy", move |entry: Dynamic, exit: Dynamic| {
+        push(
+            &st,
+            Action::Strategy(
+                crate::backtest::RuleRef::from_dynamic(&entry),
+                crate::backtest::RuleRef::from_dynamic(&exit),
+                None,
+            ),
+        )
+    });
+    let st = state.clone();
+    engine.register_fn(
+        "strategy",
+        move |entry: Dynamic, exit: Dynamic, series: &str| {
+            push(
+                &st,
+                Action::Strategy(
+                    crate::backtest::RuleRef::from_dynamic(&entry),
+                    crate::backtest::RuleRef::from_dynamic(&exit),
+                    Some(series.into()),
+                ),
+            )
+        },
+    );
     let st = state.clone();
     engine.register_fn("mark", move |label: &str| {
         push(&st, Action::MarkHere(label.into()))

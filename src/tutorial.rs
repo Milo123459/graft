@@ -464,6 +464,14 @@ The database spikes now and then: mark it."#,
                 "one series only",
             ),
             (
+                r#":backtest("slow", 10)"#,
+                "what followed each marker of a rule: the series 10 points (or backtest(1, \"api\", \"1h\"): an hour) later, on average, how often up, best and worst",
+            ),
+            (
+                r#":strategy("dip", "spike")"#,
+                "trades: in at each marker of one rule, out at the next of another; the result, wins, drawdown, time in",
+            ),
+            (
                 "--mark 'cross_above(api, db) => api passed db'",
                 "where one series crosses another (cross_below(), cross() either way; or a number: cross_above(api, 50ms); in the console they say whether it just crossed). is_num(x) says whether a series has a value there yet",
             ),

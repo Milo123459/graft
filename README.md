@@ -381,6 +381,16 @@ tell apart from candles or lines in the same colours:
 --mark 'value > 4200 => ATH | ★ orange badge'            # a tag in orange
 ```
 
+**Backtests.** Once a rule has placed markers, ask what followed them:
+`:backtest("golden cross", 10)` says what the series did 10 points later (or
+`backtest(1, "close", "1h")`: an hour later) — on average, the median, how often it
+went up, the best and worst. `:strategy("golden cross", "death cross")` treats one
+rule's markers as entries and another's as exits: the trades' total, wins, average,
+best and worst, the largest drawdown and how much of the time it was in a trade. A
+rule is named by its number in the markers menu or its label; the series is the one
+given, else a `close` series, else the one the markers are on. Nothing here is
+trading-specific: `backtest("deploy", "latency", "1h")` works the same way.
+
 While it runs, press `K` (or tap **markers**) for the list of rules and
 markers: tap a rule to edit it (it opens in the console; Enter saves, Esc
 cancels), tap the buttons under it to cycle its symbol, colour or effect (plain, badge, bold,

@@ -1918,6 +1918,69 @@ impl App {
         self.mark_rules.len() + self.manual_marks.len()
     }
 
+    /// A rule's markers, and a name for it (its label, else its condition).
+    fn rule_marks(
+        &self,
+        rule: &crate::backtest::RuleRef,
+    ) -> Result<(String, Vec<&crate::render::Mark>), String> {
+        let Some(i) = rule.find(&self.mark_rules) else {
+            let have: Vec<String> = self
+                .mark_rules
+                .iter()
+                .enumerate()
+                .map(|(k, r)| format!("{} {}", k + 1, r.label.as_deref().unwrap_or(&r.expr)))
+                .collect();
+            return Err(if have.is_empty() {
+                "no marker rules yet: add one with mark_when(…) or --mark".into()
+            } else {
+                format!("no marker rule {rule}: there's {}", have.join(", "))
+            });
+        };
+        let r = &self.mark_rules[i];
+        let name = r.label.clone().unwrap_or_else(|| r.expr.clone());
+        let marks = self
+            .opts
+            .marks
+            .iter()
+            .filter(|m| m.rule == Some(i))
+            .collect();
+        Ok((name, marks))
+    }
+
+    /// `backtest(rule, series, after)`: what followed each of the rule's markers.
+    fn backtest(
+        &self,
+        rule: &crate::backtest::RuleRef,
+        series: Option<&str>,
+        after: crate::backtest::After,
+    ) -> Result<String, String> {
+        let (name, marks) = self.rule_marks(rule)?;
+        let s = crate::backtest::series_for(&self.ds, series, &marks).ok_or_else(|| {
+            format!("{name}: say which series to measure, e.g. backtest(1, \"close\", 10)")
+        })?;
+        let after_text = match after {
+            crate::backtest::After::Points(1) => "1 point".to_string(),
+            crate::backtest::After::Points(n) => format!("{n} points"),
+            crate::backtest::After::Span(d) => crate::time::fmt_duration(d),
+        };
+        Ok(crate::backtest::followed(&marks, s, after).summary(&name, &s.name, &after_text))
+    }
+
+    /// `strategy(entry, exit, series)`: trades from one rule's markers to another's.
+    fn strategy(
+        &self,
+        entry: &crate::backtest::RuleRef,
+        exit: &crate::backtest::RuleRef,
+        series: Option<&str>,
+    ) -> Result<String, String> {
+        let (in_name, ins) = self.rule_marks(entry)?;
+        let (out_name, outs) = self.rule_marks(exit)?;
+        let s = crate::backtest::series_for(&self.ds, series, &ins).ok_or_else(|| {
+            "say which series to trade, e.g. strategy(1, 2, \"close\")".to_string()
+        })?;
+        Ok(crate::backtest::trades(&ins, &outs, s).summary(&in_name, &out_name, &s.name))
+    }
+
     /// Open the console on a rule; running it replaces the rule.
     fn edit_rule(&mut self, i: usize) {
         let Some(rule) = self.mark_rules.get(i) else {
@@ -3496,6 +3559,10 @@ impl App {
         }
         if self.session.script.has_new_mark_rules() {
             self.update_marks();
+        }
+        // A command that answered in the console itself (backtest): that's the output.
+        if self.console_note.is_some() && result.is_ok() {
+            return;
         }
         // A command that complained (e.g. an unknown line name): its message is the
         // console's output.
@@ -5583,6 +5650,14 @@ impl App {
             Action::Redo => {
                 self.step_forward();
             }
+            Action::Backtest(rule, series, after) => match self.backtest(&rule, series.as_deref(), after) {
+                Ok(text) => self.note(text, false),
+                Err(e) => self.note(e, true),
+            },
+            Action::Strategy(entry, exit, series) => match self.strategy(&entry, &exit, series.as_deref()) {
+                Ok(text) => self.note(text, false),
+                Err(e) => self.note(e, true),
+            },
             Action::MarkHere(label) => {
                 let x = self.cursor.or_else(|| self.ds.x_range().map(|r| r.1));
                 match x {
@@ -9721,6 +9796,39 @@ pub(crate) mod tests {
         }
         assert!(app.view.is_none() && !app.paged);
         assert_eq!(app.bounds(), (a, b));
+    }
+
+    #[test]
+    fn backtests_from_the_console() {
+        let mut app = app(&[
+            "graft",
+            LOG,
+            "-s",
+            "node1",
+            "--mark",
+            "delta < 0 => fell",
+            "--mark",
+            "delta > 0 => rose",
+        ]);
+        let note = |app: &App| app.console_note.as_ref().map(|n| (n.text.clone(), n.error));
+        run(&mut app, r#"backtest("fell", 1)"#);
+        let (text, error) = note(&app).unwrap();
+        assert!(
+            !error && text.starts_with("fell: ") && text.contains("1 point later"),
+            "{text}"
+        );
+        run(&mut app, r#"backtest(1, "node1", "1h")"#);
+        assert!(
+            note(&app).unwrap().0.contains("60 min later"),
+            "{:?}",
+            note(&app)
+        );
+        run(&mut app, r#"strategy("fell", "rose")"#);
+        let (text, error) = note(&app).unwrap();
+        assert!(!error && text.starts_with("fell → rose on node1"), "{text}");
+        run(&mut app, r#"backtest("nope")"#);
+        let (text, error) = note(&app).unwrap();
+        assert!(error && text.contains("1 fell, 2 rose"), "{text}");
     }
 
     #[test]
