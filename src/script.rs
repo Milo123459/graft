@@ -567,6 +567,36 @@ pub const USAGE: &[(&str, &str, &str)] = &[
         "relative strength index, 0–100 (70 overbought, 30 oversold)",
     ),
     (
+        "bollinger",
+        r#"bollinger(values("close"), 20, 2.0)"#,
+        "Bollinger band: n-point average + k standard deviations (−k lower, 0 middle)",
+    ),
+    (
+        "vwap",
+        r#"vwap(values("close"), values("volume"))"#,
+        "volume-weighted average price",
+    ),
+    (
+        "atr",
+        r#"atr(values("high"), values("low"), values("close"), 14)"#,
+        "average true range: how far price moves per point",
+    ),
+    (
+        "stoch",
+        r#"stoch(values("high"), values("low"), values("close"), 14)"#,
+        "stochastic %K, 0–100: where the close sits in the recent range",
+    ),
+    (
+        "highest",
+        r#"highest(values("high"), 20)"#,
+        "the highest value over the last n points",
+    ),
+    (
+        "lowest",
+        r#"lowest(values("low"), 20)"#,
+        "the lowest value over the last n points",
+    ),
+    (
         "macd",
         r#"macd(values("api"))"#,
         "MACD: 12-point EMA minus 26-point EMA (signal: ema(values(\"macd\"), 9))",
@@ -796,6 +826,12 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "sma",
             "rsi",
             "macd",
+            "bollinger",
+            "vwap",
+            "atr",
+            "stoch",
+            "highest",
+            "lowest",
             "mean_of",
         ],
     ),
@@ -1361,6 +1397,10 @@ fn complete_in(
     } else {
         out.items.extend(names);
     }
+    // Whatever starts with what's typed comes before what only contains it.
+    let lower = word.to_lowercase();
+    out.items
+        .sort_by_key(|s| !s.label.to_lowercase().starts_with(&lower));
     // Typed in full already: nothing to add.
     out.items.retain(|s| s.insert != word);
     out
@@ -1976,6 +2016,56 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
     engine.register_fn("macd", move |a: Array| -> FnResult<Array> {
         Ok(to_array(crate::lines::macd(&floats(&a))))
     });
+    let window = |what: &str, n: i64| -> FnResult<usize> {
+        if n < 1 {
+            return Err(format!("{what}: n must be at least 1").into());
+        }
+        Ok(n as usize)
+    };
+    engine.register_fn(
+        "bollinger",
+        move |a: Array, n: i64, k: Dynamic| -> FnResult<Array> {
+            let n = window("bollinger(values, n, k)", n)?;
+            let k =
+                dyn_to_f64(&k).ok_or("bollinger(values, n, k): k is a number, e.g. 2.0 or -2.0")?;
+            Ok(to_array(crate::lines::bollinger(&floats(&a), n, k)))
+        },
+    );
+    engine.register_fn("vwap", move |p: Array, v: Array| -> FnResult<Array> {
+        Ok(to_array(crate::lines::vwap(&floats(&p), &floats(&v))))
+    });
+    engine.register_fn(
+        "atr",
+        move |h: Array, l: Array, c: Array, n: i64| -> FnResult<Array> {
+            let n = window("atr(high, low, close, n)", n)?;
+            Ok(to_array(crate::lines::atr(
+                &floats(&h),
+                &floats(&l),
+                &floats(&c),
+                n,
+            )))
+        },
+    );
+    engine.register_fn(
+        "stoch",
+        move |h: Array, l: Array, c: Array, n: i64| -> FnResult<Array> {
+            let n = window("stoch(high, low, close, n)", n)?;
+            Ok(to_array(crate::lines::stoch(
+                &floats(&h),
+                &floats(&l),
+                &floats(&c),
+                n,
+            )))
+        },
+    );
+    engine.register_fn("highest", move |a: Array, n: i64| -> FnResult<Array> {
+        let n = window("highest(values, n)", n)?;
+        Ok(to_array(crate::lines::highest(&floats(&a), n)))
+    });
+    engine.register_fn("lowest", move |a: Array, n: i64| -> FnResult<Array> {
+        let n = window("lowest(values, n)", n)?;
+        Ok(to_array(crate::lines::lowest(&floats(&a), n)))
+    });
     // In the console: whether it crossed at the newest point (in a marker rule these
     // are written out, and checked at every point).
     let crossing = |dir: i32| {
@@ -2506,7 +2596,7 @@ mod tests {
         assert_eq!(items("und"), ["undo()"]);
         assert_eq!(items("perc")[0], "percentile(\"");
         assert_eq!(items("zoom_"), ["zoom_in()", "zoom_out()"]);
-        assert_eq!(items("ap"), ["api"]);
+        assert_eq!(items("ap"), ["api", "vwap("], "starting with it first");
         // The last argument closes the call; one with more to come doesn't.
         assert_eq!(items("last(\"")[..3], ["web\")", "api\")", "db\")"]);
         assert_eq!(items("percentile(\"d"), ["db\""]);

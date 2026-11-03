@@ -307,10 +307,122 @@ pub fn macd(values: &[f64]) -> Vec<f64> {
     fast.iter().zip(&slow).map(|(a, b)| a - b).collect()
 }
 
+/// Bollinger band: the n-point moving average plus k standard deviations (k < 0: the
+/// lower band, 0: the middle).
+pub fn bollinger(values: &[f64], n: usize, k: f64) -> Vec<f64> {
+    let n = n.max(1);
+    (0..values.len())
+        .map(|i| {
+            let w = &values[(i + 1).saturating_sub(n)..=i];
+            let mean = w.iter().sum::<f64>() / w.len() as f64;
+            let var = w.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / w.len() as f64;
+            mean + k * var.sqrt()
+        })
+        .collect()
+}
+
+/// Volume-weighted average price, running from the first point.
+pub fn vwap(price: &[f64], volume: &[f64]) -> Vec<f64> {
+    let (mut pv, mut v) = (0.0, 0.0);
+    price
+        .iter()
+        .zip(volume)
+        .map(|(p, q)| {
+            pv += p * q;
+            v += q;
+            if v > 0.0 { pv / v } else { *p }
+        })
+        .collect()
+}
+
+/// Average true range over n points (Wilder's smoothing): how far price moves.
+pub fn atr(high: &[f64], low: &[f64], close: &[f64], n: usize) -> Vec<f64> {
+    let n = n.max(1) as f64;
+    let len = high.len().min(low.len()).min(close.len());
+    let mut out = Vec::with_capacity(len);
+    let mut avg = 0.0;
+    for i in 0..len {
+        let range = high[i] - low[i];
+        let tr = if i == 0 {
+            range
+        } else {
+            range
+                .max((high[i] - close[i - 1]).abs())
+                .max((low[i] - close[i - 1]).abs())
+        };
+        avg = if (i as f64) < n {
+            (avg * i as f64 + tr) / (i as f64 + 1.0)
+        } else {
+            (avg * (n - 1.0) + tr) / n
+        };
+        out.push(avg);
+    }
+    out
+}
+
+/// Highest value over the last n points (including this one).
+pub fn highest(values: &[f64], n: usize) -> Vec<f64> {
+    let n = n.max(1);
+    (0..values.len())
+        .map(|i| {
+            values[(i + 1).saturating_sub(n)..=i]
+                .iter()
+                .copied()
+                .fold(f64::MIN, f64::max)
+        })
+        .collect()
+}
+
+/// Lowest value over the last n points (including this one).
+pub fn lowest(values: &[f64], n: usize) -> Vec<f64> {
+    let n = n.max(1);
+    (0..values.len())
+        .map(|i| {
+            values[(i + 1).saturating_sub(n)..=i]
+                .iter()
+                .copied()
+                .fold(f64::MAX, f64::min)
+        })
+        .collect()
+}
+
+/// Stochastic %K: where the close is within the high–low range of the last n points,
+/// 0–100 (above 80 is often read as overbought, below 20 as oversold).
+pub fn stoch(high: &[f64], low: &[f64], close: &[f64], n: usize) -> Vec<f64> {
+    let (hh, ll) = (highest(high, n), lowest(low, n));
+    let len = hh.len().min(ll.len()).min(close.len());
+    (0..len)
+        .map(|i| {
+            let range = hh[i] - ll[i];
+            if range > 0.0 {
+                (close[i] - ll[i]) / range * 100.0
+            } else {
+                50.0
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::data::XKind;
+
+    #[test]
+    fn more_indicators() {
+        let v = [1.0, 2.0, 3.0, 4.0, 5.0];
+        assert_eq!(bollinger(&v, 3, 0.0)[4], 4.0, "k = 0: the moving average");
+        let up = bollinger(&v, 3, 2.0)[4];
+        assert!((up - (4.0 + 2.0 * (2.0f64 / 3.0).sqrt())).abs() < 1e-9);
+        assert_eq!(vwap(&[10.0, 20.0], &[1.0, 3.0]), [10.0, 17.5]);
+        assert_eq!(highest(&v, 2), [1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(lowest(&v, 2), [1.0, 1.0, 2.0, 3.0, 4.0]);
+        let (h, l, c) = ([2.0, 3.0, 4.0], [1.0, 1.0, 2.0], [1.5, 3.0, 2.0]);
+        assert_eq!(stoch(&h, &l, &c, 3), [50.0, 100.0, 1.0 / 3.0 * 100.0]);
+        let a = atr(&h, &l, &c, 2);
+        assert_eq!(a[0], 1.0);
+        assert_eq!(a[1], 1.5, "true range 2: high 3 - low 1");
+    }
 
     #[test]
     fn rsi_and_macd() {

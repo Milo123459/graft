@@ -201,7 +201,9 @@ whole-series functions.
 `--line 'NAME[:UNIT] = EXPR'` (repeatable). Otherwise the expression returns an array
 (one value per point of the series it names; a shorter one lines up with the
 newest points), `[x, y]` pairs, or a number for a flat line. Built in:
-`ema(a, n)`, `sma(a, n)`, `rsi(a, n)`, `macd(a)`, `values(name)`, `xs(name)`, `values_at(name, xs)`
+`ema(a, n)`, `sma(a, n)`, `rsi(a, n)`, `macd(a)`, `bollinger(a, n, k)` (k < 0 the
+lower band), `vwap(price, volume)`, `atr(high, low, close, n)`, `stoch(high, low, close, n)`,
+`highest(a, n)`, `lowest(a, n)`, `values(name)`, `xs(name)`, `values_at(name, xs)`
 (another series at those times), and every console function (`mean`, `p95`,
 `slope`…). Functions from `--script` work too: `examples/indicators.rhai` has an
 EMA, Bollinger bands and a spread written in Rhai:
