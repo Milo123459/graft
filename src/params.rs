@@ -113,6 +113,50 @@ pub fn set(specs: &[String], name: &str, value: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Time placeholders, filled for a window that ends at `end` (seconds since the
+/// epoch): `{now}` / `{now_ms}` the end, `{from:6h}` / `{from_ms:6h}` that long
+/// before it (an hour if no length is given), or `{from_ms:500*1m}` (500 × 1m).
+pub fn fill_times(text: &str, end: f64) -> String {
+    static TIMES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"\{(now|now_ms|from|from_ms)(?::(?:([0-9.]+)\s*\*\s*)?([0-9.]+\s*[a-z]+))?\}",
+        )
+        .expect("valid")
+    });
+    if !text.contains('{') {
+        return text.to_string();
+    }
+    TIMES
+        .replace_all(text, |c: &regex::Captures| {
+            // `6h`, or `500*1m` (500 candles of a minute: with {interval} inside, the
+            // window follows the candle size).
+            let times: f64 = c
+                .get(2)
+                .and_then(|m| m.as_str().parse().ok())
+                .unwrap_or(1.0);
+            let span = c
+                .get(3)
+                .and_then(|m| crate::time::parse_duration_secs(m.as_str()).ok())
+                .unwrap_or(3600.0)
+                * times;
+            let t = match &c[1] {
+                "now" | "now_ms" => end,
+                _ => end - span,
+            };
+            if c[1].ends_with("_ms") {
+                format!("{}", (t * 1000.0).round() as i64)
+            } else {
+                format!("{}", t.round() as i64)
+            }
+        })
+        .into_owned()
+}
+
+/// Whether a command asks for a time window (so older data can be fetched).
+pub fn has_window(text: &str) -> bool {
+    text.contains("{from") && text.contains("{now")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +190,20 @@ mod tests {
         assert!(set(&specs, "coin", "ETH").is_err());
         assert!(Param::parse("no equals").is_err());
         assert!(Param::parse("x = a || b").is_err());
+    }
+
+    #[test]
+    fn time_placeholders() {
+        let t = fill_times(
+            r#"{"startTime":{from_ms:6h},"endTime":{now_ms}} {from:1d} {now}"#,
+            100_000.0,
+        );
+        assert_eq!(
+            t,
+            r#"{"startTime":78400000,"endTime":100000000} 13600 100000"#
+        );
+        assert!(has_window("{from_ms:6h} {now_ms}") && !has_window("{now}"));
+        assert_eq!(fill_times("no braces", 1.0), "no braces");
+        assert_eq!(fill_times("{from:500*1m}", 100_000.0), "70000");
     }
 }

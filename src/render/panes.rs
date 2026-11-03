@@ -19,12 +19,22 @@ pub struct Pane {
     pub lines: Option<Lines>,
     /// Data from elsewhere: a preset, saved profile or recent chart (`cpu`, `@2`).
     pub source: Option<String>,
+    /// Its own title (`{name}` fills in a source setting): `title={coin} {interval}`.
+    pub title: Option<String>,
 }
 
 impl Pane {
     /// `node1,node2 kind=bar lines=live,avg` (`*` or nothing = all series).
     pub fn parse(spec: &str) -> Result<Pane, String> {
         let mut pane = Pane::default();
+        // title= takes the rest of the spec, spaces and all.
+        let (spec, title) = match spec.find("title=") {
+            Some(i) if i == 0 || spec[..i].ends_with(char::is_whitespace) => {
+                (&spec[..i], Some(spec[i + 6..].trim().to_string()))
+            }
+            _ => (spec, None),
+        };
+        pane.title = title.filter(|t| !t.is_empty());
         for word in spec.split_whitespace() {
             if let Some(v) = word.strip_prefix("kind=") {
                 pane.kind = Some(
@@ -37,7 +47,7 @@ impl Pane {
                 pane.lines = Some(Lines::parse(v).map_err(|e| format!("pane: {e}"))?);
             } else if word.contains('=') {
                 return Err(format!(
-                    "pane: unknown setting '{word}' (kind=…, lines=…, source=…)"
+                    "pane: unknown setting '{word}' (kind=…, lines=…, source=…, title=…)"
                 ));
             } else if word != "*" {
                 pane.series
@@ -61,6 +71,9 @@ impl Pane {
         }
         if let Some(src) = &self.source {
             words.push(format!("source={src}"));
+        }
+        if let Some(t) = &self.title {
+            words.push(format!("title={t}"));
         }
         words.join(" ")
     }
@@ -919,6 +932,11 @@ mod tests {
         assert_eq!(p.kind, Some(ChartKind::Bar));
         assert_eq!(Pane::parse(&p.to_spec()).unwrap(), p);
         assert_eq!(Pane::parse("*").unwrap(), Pane::default());
+        // A title takes the rest, spaces and all.
+        let t = Pane::parse("price,ema30 kind=line title={coin} {interval} price").unwrap();
+        assert_eq!(t.title.as_deref(), Some("{coin} {interval} price"));
+        assert_eq!(t.series, ["price", "ema30"]);
+        assert_eq!(Pane::parse(&t.to_spec()).unwrap(), t);
         assert!(Pane::parse("kind=pie").is_err());
         // Without a layout: two side by side, more in a grid.
         let specs: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();

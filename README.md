@@ -226,25 +226,37 @@ shows `$3,456.78`; `:unit("USD")` and `:title("ETH")` change it while running.
 
 ### A trading dashboard (candles, EMAs, RSI, MACD)
 
-Hyperliquid's 1-minute candles, polled every 5 s: the API returns a JSON array
+Hyperliquid's candles, polled every 5 s: **coin ▾** and **interval ▾** switch the asset and candle size
+(`--param`), and the window is 500 candles of it (`{from_ms:500*{interval}}` …
+`{now_ms}`). Scroll back to the oldest candle and graft asks for the 500 before it
+(see below). The API returns a JSON array
 (one record per candle, `--json --time-field t`) and the same candles each time,
 so `--replace` updates the newest one instead of adding copies. RSI and MACD come
 from [examples/indicators.rhai](examples/indicators.rhai); `hist = macd - signal`
 would add the histogram (series by name are worked out at each point).
 
 ```sh
-graft -c 'now=$(date +%s)000; curl -s --json "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"ETH\",\"interval\":\"1m\",\"startTime\":$((now - 6*3600000)),\"endTime\":$now}}" https://api.hyperliquid.xyz/info' \
+graft -c 'curl -s --json "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"{coin}\",\"interval\":\"{interval}\",\"startTime\":{from_ms:500*{interval}},\"endTime\":{now_ms}}}" https://api.hyperliquid.xyz/info' \
+  --param 'coin = ETH | BTC | SOL | HYPE' --param 'interval = 1m | 5m | 15m | 1h | 4h | 1d' \
   -n 5s --json --time-field t --replace \
   --script examples/indicators.rhai \
-  --series 'eth:USD = c' --series 'volume:ETH = v' --select eth,volume \
-  --line 'ema30 = ema(values("eth"), 30)' --line 'ema50 = ema(values("eth"), 50)' \
-  --line 'rsi14:% = rsi(values("eth"), 14)' --line 'overbought:% = 70' --line 'oversold:% = 30' \
-  --line 'macd = macd(values("eth"))' --line 'signal = ema(values("macd"), 9)' \
+  --series 'price:USD = c' --series 'volume = v' --select price,volume \
+  --line 'ema30 = ema(values("price"), 30)' --line 'ema50 = ema(values("price"), 50)' \
+  --line 'rsi14:% = rsi(values("price"), 14)' --line 'overbought:% = 70' --line 'oversold:% = 30' \
+  --line 'macd = macd(values("price"))' --line 'signal = ema(values("macd"), 9)' \
   --mark 'name == "ema30" && prev < ema50_prev && value >= ema50 => golden cross | ▲ green' \
   --mark 'name == "ema30" && prev > ema50_prev && value <= ema50 => death cross | ▼ red' \
-  --pane 'eth,ema30,ema50' --pane 'rsi14,overbought,oversold' --pane 'macd,signal' --pane volume \
-  --layout '1 /60% ((2 | 3) / 4)' --title 'ETH 1m'
+  --pane 'price,ema30,ema50 title={coin} {interval}' --pane 'rsi14,overbought,oversold' --pane 'macd,signal' --pane volume \
+  --layout '1 /60% ((2 | 3) / 4)' --title '{coin} {interval}'
 ```
+
+### Older data as you scroll back
+
+A command can say which time window it wants with placeholders, filled in each time
+it runs: `{now}` / `{now_ms}` (the end: now) and `{from:6h}` / `{from_ms:6h}` (that
+long before; `{from_ms:500*1m}` is 500 one-minute steps). Scroll or zoom back to the
+oldest data and graft runs it once more for the window before that, adding what comes
+back (`--replace` takes care of the overlap), until the source has nothing older.
 
 ### Source settings (`--param`)
 
@@ -394,7 +406,7 @@ time. `{sum}` in `--stats-template` gives the total.
 |---|---|
 | `-k line\|scatter\|bar\|histogram\|sparkline\|stat` | chart type (bar = latest values; stat = a tile per series with the value in big digits, its change, trend, target ETA and a sparkline — good as a pane above a chart) |
 | `--split` | one panel per series, each with its own y axis |
-| `--pane 'node1 kind=bar lines=live,avg'` | panes: several charts in one view (repeat `--pane`); each picks series (`*` = all), `kind=`, `lines=`, and `source=` (another preset, saved profile or recent chart, with its own command and format) |
+| `--pane 'node1 kind=bar lines=live,avg'` | panes: several charts in one view (repeat `--pane`); each picks series (`*` = all), `kind=`, `lines=`, `source=` (another preset, saved profile or recent chart, with its own command and format) and `title=` (last: the rest of the spec; `{name}` fills in a source setting) |
 | `--layout '(1 \| 2) / 3'` | how panes are arranged: `\|` side by side, `/` stacked, `\|60%` sizes (default: two side by side, more in a grid) |
 | `-m braille\|dot\|block\|half-block\|bar` | marker |
 | `--log`, `--ymin 0`, `--ymax 500GB` | y axis |

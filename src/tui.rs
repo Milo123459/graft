@@ -468,6 +468,11 @@ pub struct App {
     sources_menu: bool,
     /// A parameter's dropdown is open: whose, which.
     param_menu: Option<(ParamTarget, usize)>,
+    /// Fetching older data (scrolled back to the oldest): that run of the command,
+    /// and the oldest time when it started.
+    backfill: Option<(Live, f64)>,
+    /// The source had nothing older to give.
+    backfill_done: bool,
     /// The open popup's area (as last drawn), and which of its buttons the arrow
     /// keys have picked.
     popup_rect: std::cell::Cell<Option<Rect>>,
@@ -602,6 +607,8 @@ impl App {
             console_note: None,
             sources_menu: false,
             param_menu: None,
+            backfill: None,
+            backfill_done: false,
             popup_rect: std::cell::Cell::new(None),
             popup_focus: std::cell::Cell::new(0),
             popup_kind: std::cell::Cell::new(0),
@@ -728,6 +735,7 @@ impl App {
         for m in &mut self.merge_subs {
             m.pump(Duration::from_millis(10));
         }
+        self.tick_backfill();
         // A merged source in trouble says so, by name.
         let problems: Vec<String> = self
             .merge_subs
@@ -3405,6 +3413,19 @@ impl App {
     fn view_opts(&self) -> ChartOpts {
         let mut o = self.opts.clone();
         o.tidy = true;
+        // Titles can say a source's settings: --title '{coin} {interval}'.
+        if o.title.contains('{') {
+            o.title = crate::params::fill(&o.title, &self.params_of(ParamTarget::Main));
+        }
+        if let Some(p) = o.panes.as_mut() {
+            for (i, pane) in p.panes.iter_mut().enumerate() {
+                if let Some(t) = pane.title.as_mut().filter(|t| t.contains('{')) {
+                    let own = self.params_of(ParamTarget::Pane(i));
+                    let main = self.params_of(ParamTarget::Main);
+                    *t = crate::params::fill(&crate::params::fill(t, &own), &main);
+                }
+            }
+        }
         // With several panes the legend row only covers the picked one: each pane
         // keeps its own legend box.
         if self.opts.panes.as_ref().is_none_or(|p| p.count() <= 1) {
@@ -3810,6 +3831,73 @@ impl App {
         }
     }
 
+    // ───────────── older data ─────────────
+
+    /// The oldest point read so far (before any timeframe cut).
+    fn oldest_x(&self) -> Option<f64> {
+        self.session
+            .store
+            .series
+            .values()
+            .filter_map(|s| s.points.first().map(|p| p.0))
+            .min_by(f64::total_cmp)
+    }
+
+    /// Scrolled back to the oldest data, and the command asks for a time window
+    /// ({from_ms:6h} … {now_ms}): run it once more for the window before that, and add
+    /// what comes back (--replace takes care of the overlap).
+    fn tick_backfill(&mut self) {
+        if let Some((live, from)) = &mut self.backfill {
+            let session = &mut self.session;
+            let errors = live.pump(Duration::from_millis(40), &mut |line, meta| {
+                let _ = session.feed(line, meta);
+            });
+            let from = *from;
+            let done = live.eof;
+            if let Some(e) = errors.into_iter().last() {
+                self.say(e, true);
+            }
+            if done {
+                self.backfill = None;
+                if self.oldest_x().is_none_or(|o| o >= from - 1e-9) {
+                    self.backfill_done = true;
+                    self.say("no older data from the source", false);
+                } else {
+                    self.say("older data loaded", false);
+                }
+                self.rebuild(true);
+            }
+            return;
+        }
+        if self.backfill_done || self.paused {
+            return;
+        }
+        let crate::source::SourceSpec::Command {
+            cmd, every, ssh, ..
+        } = &self.live.spec
+        else {
+            return;
+        };
+        if !crate::params::has_window(cmd) {
+            return;
+        }
+        let (Some((a, b)), Some(oldest)) = (self.view, self.oldest_x()) else {
+            return;
+        };
+        // At (or very near) the start of what's loaded.
+        if a > oldest + (b - a) * 0.02 {
+            return;
+        }
+        let spec = crate::source::SourceSpec::Command {
+            cmd: crate::params::fill_times(cmd, oldest),
+            every: *every,
+            count: Some(1),
+            ssh: ssh.clone(),
+        };
+        self.backfill = Some((Live::new(spec), oldest));
+        self.say("loading older data…", false);
+    }
+
     // ───────────── source parameters ─────────────
 
     /// The parameters of a source: the main one, a merged one, or a pane's own.
@@ -3895,6 +3983,8 @@ impl App {
         self.session = setup.session;
         self.cli = setup.cli;
         self.live = Live::new(spec);
+        self.backfill = None;
+        self.backfill_done = false;
         self.view = None;
         self.selection = None;
         self.anchor = None;
@@ -9048,8 +9138,11 @@ pub(crate) mod tests {
             "--kv",
             "--param",
             "interval = m1 | h1",
+            "--title",
+            "ETH {interval}",
         ]);
         assert_eq!(app.ds_names(), ["m1"]);
+        assert_eq!(app.view_opts().title, "ETH m1", "titles say the setting");
         // The toolbar has a dropdown; picking a value runs the source again.
         let (x, y) = find(&app, "interval: m1 ▾");
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
@@ -9062,6 +9155,12 @@ pub(crate) mod tests {
         }
         app.rebuild(true);
         assert_eq!(app.ds_names(), ["h1"], "fresh data with the new value");
+        assert_eq!(app.view_opts().title, "ETH h1");
+        assert_eq!(
+            app.current_cli().title.as_deref(),
+            Some("ETH {interval}"),
+            "saved as written"
+        );
         assert_eq!(app.current_cli().param, ["interval = m1 | *h1"]);
         // And from the console; a value it doesn't have is refused, with the choices.
         run(&mut app, r#"param("interval", "d1")"#);
@@ -9074,6 +9173,55 @@ pub(crate) mod tests {
                 .unwrap()
                 .text
                 .contains("no setting called 'coin'")
+        );
+    }
+
+    #[test]
+    fn scrolling_back_fetches_older_data() {
+        // A fake candle API: one-minute candles for the window it's asked for.
+        let cmd = r#"awk -v f={from:10m} -v t={now} 'BEGIN { printf "["; n = 0; for (x = f - f % 60; x < t; x += 60) { printf "%s{\"t\":%d,\"c\":%d}", (n++ ? "," : ""), x * 1000, (x / 60) % 100 } print "]" }'"#;
+        let cli = Cli::parse_from([
+            "graft",
+            "-c",
+            cmd,
+            "-n",
+            "1h",
+            "--json",
+            "--time-field",
+            "t",
+            "--replace",
+        ]);
+        let spec = crate::setup::source_spec(&cli, true).unwrap();
+        let setup = crate::setup::build(cli, spec.clone(), false).unwrap();
+        let mut app = App::new(setup, Live::new(spec));
+        let t0 = Instant::now();
+        while app.oldest_x().is_none() && t0.elapsed() < Duration::from_secs(5) {
+            app.tick();
+        }
+        app.rebuild(true);
+        let first = app.oldest_x().expect("candles");
+        let n = app.ds.series[0].points.len();
+        assert!((9..=11).contains(&n), "{n} candles in the first 10 minutes");
+        // Zoom in, then scroll back to the start: the window before it is fetched.
+        run(&mut app, r#"zoom("5m")"#);
+        for _ in 0..20 {
+            run(&mut app, "pan(-0.5)");
+        }
+        let t0 = Instant::now();
+        while app.oldest_x() == Some(first) && t0.elapsed() < Duration::from_secs(5) {
+            app.tick();
+        }
+        let older = app.oldest_x().unwrap();
+        assert!(
+            first - older >= 9.0 * 60.0,
+            "about 10 more minutes: {}",
+            first - older
+        );
+        app.rebuild(true);
+        let m = app.ds.series[0].points.len();
+        assert!(
+            m >= n + 9 && m <= n + 11,
+            "{n} → {m}: added, no duplicates at the seam"
         );
     }
 }

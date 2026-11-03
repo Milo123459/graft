@@ -2254,7 +2254,9 @@ pub fn pane_view(ds: &Dataset, opts: &ChartOpts, pane: &panes::Pane) -> (Dataset
     if pane.lines.is_some() || !sub.trends.is_empty() {
         parts.push(lines.label());
     }
-    if !parts.is_empty() {
+    if let Some(t) = &pane.title {
+        sub.title = t.clone();
+    } else if !parts.is_empty() {
         // What this pane shows comes first: narrow panes cut the title short.
         sub.title = if opts.tidy {
             parts.join(" · ")

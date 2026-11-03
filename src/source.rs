@@ -242,6 +242,9 @@ fn run_command(
             index,
             time: now_secs(),
         };
+        // {now_ms}, {from_ms:6h}…: the window each run asks for, ending now.
+        let filled = crate::params::fill_times(cmd, sample.time);
+        let cmd = filled.as_str();
         let mut child = crate::remote::command(ssh, cmd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

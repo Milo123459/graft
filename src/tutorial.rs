@@ -379,6 +379,10 @@ api is slowly getting slower here. Give it a target and the stats say when it ge
                 "how they're arranged ('1 |70% 2' for sizes)",
             ),
             ("graft -p dashboard", "four built-in presets in panes"),
+            (
+                "--pane 'db kind=histogram title=db latency spread'",
+                "a pane's own title (title= goes last; {name} fills in a setting)",
+            ),
         ],
         task: Some(
             "tap panes (or press w), then | to split side by side. Then w to close the panel",
@@ -589,8 +593,12 @@ From here on the steps are a reference: read what's useful, skip the rest with E
                 "open the builder first (graft alone does too)",
             ),
             (
-                "--param 'interval = 1m | 5m | 1h'",
-                "a setting: {interval} in the command; a dropdown in the viewer runs it again",
+                "--param 'interval = 1m | 5m | 1h' --title 'ETH {interval}'",
+                "a setting: {interval} in the command (and titles); a dropdown runs it again",
+            ),
+            (
+                "-c 'curl … start={from_ms:6h}&end={now_ms}'",
+                "the window it asks for: scroll back to the oldest data and older is fetched",
             ),
             (
                 r#"--source 'mem = -c "cat /proc/meminfo" --kv' --pane 'source=mem'"#,
@@ -958,9 +966,9 @@ The next pages are recipes for real use: copy puts one on your clipboard."#,
     },
     Step {
         title: "recipe: a trading dashboard",
-        text: "Hyperliquid's 1-minute ETH candles (6 hours, polled every 5 s; --replace keeps the newest candle up to date instead of piling up copies), with EMA30/EMA50 and crossover markers, RSI, MACD and volume in panes. RSI and MACD come from examples/indicators.rhai.",
+        text: "Hyperliquid candles (500 of them, polled every 5 s; --replace keeps the newest up to date instead of piling up copies), with EMA30/EMA50 and crossover markers, RSI, MACD and volume in panes. coin ▾ and interval ▾ switch asset and candle size; scroll back to the oldest candle and older ones load. RSI and MACD come from examples/indicators.rhai",
         command: Some(
-            r#"graft -c 'now=$(date +%s)000; curl -s --json "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"ETH\",\"interval\":\"1m\",\"startTime\":$((now - 6*3600000)),\"endTime\":$now}}" https://api.hyperliquid.xyz/info' -n 5s --json --time-field t --replace --script examples/indicators.rhai --series 'eth:USD = c' --series 'volume:ETH = v' --select eth,volume --line 'ema30 = ema(values("eth"), 30)' --line 'ema50 = ema(values("eth"), 50)' --line 'rsi14:% = rsi(values("eth"), 14)' --line 'overbought:% = 70' --line 'oversold:% = 30' --line 'macd = macd(values("eth"))' --line 'signal = ema(values("macd"), 9)' --mark 'name == "ema30" && prev < ema50_prev && value >= ema50 => golden cross | ▲ green' --mark 'name == "ema30" && prev > ema50_prev && value <= ema50 => death cross | ▼ red' --pane 'eth,ema30,ema50' --pane 'rsi14,overbought,oversold' --pane 'macd,signal' --pane volume --layout '1 /60% ((2 | 3) / 4)' --title 'ETH 1m'"#,
+            r#"graft -c 'curl -s --json "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"{coin}\",\"interval\":\"{interval}\",\"startTime\":{from_ms:500*{interval}},\"endTime\":{now_ms}}}" https://api.hyperliquid.xyz/info' --param 'coin = ETH | BTC | SOL | HYPE' --param 'interval = 1m | 5m | 15m | 1h | 4h | 1d' -n 5s --json --time-field t --replace --script examples/indicators.rhai --series 'price:USD = c' --series 'volume = v' --select price,volume --line 'ema30 = ema(values("price"), 30)' --line 'ema50 = ema(values("price"), 50)' --line 'rsi14:% = rsi(values("price"), 14)' --line 'overbought:% = 70' --line 'oversold:% = 30' --line 'macd = macd(values("price"))' --line 'signal = ema(values("macd"), 9)' --mark 'name == "ema30" && prev < ema50_prev && value >= ema50 => golden cross | ▲ green' --mark 'name == "ema30" && prev > ema50_prev && value <= ema50 => death cross | ▼ red' --pane 'price,ema30,ema50 title={coin} {interval}' --pane 'rsi14,overbought,oversold' --pane 'macd,signal' --pane volume --layout '1 /60% ((2 | 3) / 4)' --title '{coin} {interval}'"#,
         ),
         ..BASE
     },
