@@ -4836,7 +4836,25 @@ impl App {
             return Default::default();
         };
         let names: Vec<String> = self.full.series.iter().map(|s| s.name.clone()).collect();
-        crate::script::complete(&input.value, input.cursor, &names)
+        crate::script::complete_with(&input.value, input.cursor, &names, &self.param_choices())
+    }
+
+    /// Every source setting the console's param() can change, with its choices.
+    fn param_choices(&self) -> Vec<(String, Vec<String>)> {
+        let mut targets = vec![ParamTarget::Main];
+        if let Some(p) = &self.opts.panes {
+            targets.extend((0..p.count()).map(ParamTarget::Pane));
+        }
+        targets.extend((0..self.cli.merge.len()).map(ParamTarget::Merge));
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        for t in targets {
+            for p in self.params_of(t) {
+                if !out.iter().any(|o| o.0 == p.name) {
+                    out.push((p.name, p.choices));
+                }
+            }
+        }
+        out
     }
 
     /// Tab: put the next suggestion in (Shift+Tab: the one before).
@@ -4856,7 +4874,12 @@ impl App {
             }
             _ => {
                 let names: Vec<String> = self.full.series.iter().map(|s| s.name.clone()).collect();
-                let comps = crate::script::complete(&input.value, input.cursor, &names);
+                let comps = crate::script::complete_with(
+                    &input.value,
+                    input.cursor,
+                    &names,
+                    &self.param_choices(),
+                );
                 if comps.items.is_empty() {
                     return;
                 }
@@ -9582,6 +9605,24 @@ pub(crate) mod tests {
             "saved as written"
         );
         assert_eq!(app.current_cli().param, ["interval = m1 | *h1"]);
+        // The console completes the setting's name, then its values.
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, "param(");
+        let labels = |app: &App| -> Vec<String> {
+            app.completions()
+                .items
+                .into_iter()
+                .map(|i| i.label)
+                .collect()
+        };
+        assert_eq!(labels(&app), ["interval"]);
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.console.as_ref().unwrap().value, r#"param("interval""#);
+        type_str(&mut app, ", ");
+        assert_eq!(labels(&app), ["m1", "h1"]);
+        type_str(&mut app, r#""h"#);
+        assert_eq!(labels(&app), ["h1"]);
+        key(&mut app, KeyCode::Esc);
         // And from the console; a value it doesn't have is refused, with the choices.
         run(&mut app, r#"param("interval", "d1")"#);
         let n = app.console_note.as_ref().unwrap();

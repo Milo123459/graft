@@ -1005,7 +1005,15 @@ fn arg_choices(func: &str, arg: usize) -> &'static [&'static str] {
 
 fn arg_choices_first(func: &str) -> &'static [&'static str] {
     match func {
-        "chart" => &["line", "scatter", "bar", "histogram", "sparkline", "stat"],
+        "chart" => &[
+            "line",
+            "scatter",
+            "bar",
+            "histogram",
+            "sparkline",
+            "stat",
+            "candles",
+        ],
         "lines" => &["live", "avg", "median", "p95", "line"],
         "trend" => &["avg", "median", "p95", "fit", "off"],
         "notify_to" | "notify_off" => &["bell", "desktop", "ntfy:", "webhook:", "cmd:"],
@@ -1061,7 +1069,20 @@ const MARK_VARS: &[&str] = &["value", "prev", "delta", "pct", "rate", "time", "n
 
 /// Suggestions for console input `text` with the cursor at char `cursor`.
 pub fn complete(text: &str, cursor: usize, series: &[String]) -> Completions {
-    complete_in(text, cursor, series, &[], false)
+    complete_with(text, cursor, series, &[])
+}
+
+/// The source settings (`--param`) the console can offer: name and choices.
+pub type ParamChoices = [(String, Vec<String>)];
+
+/// `complete`, also offering the source's settings in `param("name", "value")`.
+pub fn complete_with(
+    text: &str,
+    cursor: usize,
+    series: &[String],
+    params: &ParamChoices,
+) -> Completions {
+    complete_in(text, cursor, series, &[], false, params)
 }
 
 /// `extra`: more variables to offer (inside a marker rule); `in_code`: completing the
@@ -1072,12 +1093,13 @@ fn complete_in(
     series: &[String],
     extra: &[&str],
     in_code: bool,
+    params: &ParamChoices,
 ) -> Completions {
     let chars: Vec<char> = text.chars().collect();
     let cursor = cursor.min(chars.len());
     // Walk up to the cursor: are we in a string, and in which calls?
     let mut in_str: Option<usize> = None;
-    let mut calls: Vec<(String, usize)> = Vec::new(); // (function, args seen)
+    let mut calls: Vec<(String, usize, usize)> = Vec::new(); // (function, args seen, its `(`)
     let mut i = 0;
     while i < cursor {
         let c = chars[i];
@@ -1091,7 +1113,7 @@ fn complete_in(
                 while j > 0 && (chars[j - 1].is_alphanumeric() || chars[j - 1] == '_') {
                     j -= 1;
                 }
-                calls.push((chars[j..i].iter().collect(), 0));
+                calls.push((chars[j..i].iter().collect(), 0, i));
             }
             (None, ')') => {
                 calls.pop();
@@ -1105,7 +1127,39 @@ fn complete_in(
         }
         i += 1;
     }
-    let call = calls.last().cloned();
+    let open = calls.last().map(|c| c.2);
+    let call = calls.last().map(|c| (c.0.clone(), c.1));
+    // The choices for argument `arg` of `func`: series, a fixed list, or the source's
+    // settings (`param("interval", "1h")`: names, then that one's values).
+    let choices = |func: &str, arg: usize| -> Vec<String> {
+        if SERIES_ANY.contains(&func) || SERIES_FIRST.contains(&func) && arg == 0 {
+            return series.to_vec();
+        }
+        if func == "param" {
+            if arg == 0 {
+                return params.iter().map(|p| p.0.clone()).collect();
+            }
+            // The first argument as written: `"interval"`.
+            let first: String = open
+                .map(|o| {
+                    chars[o + 1..cursor]
+                        .iter()
+                        .take_while(|c| **c != ',')
+                        .collect()
+                })
+                .unwrap_or_default();
+            let first = first.trim().trim_matches('"');
+            return params
+                .iter()
+                .find(|p| p.0 == first)
+                .map(|p| p.1.clone())
+                .unwrap_or_default();
+        }
+        arg_choices(func, arg)
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    };
     let signature = call
         .as_ref()
         .and_then(|(f, _)| usage(f))
@@ -1143,7 +1197,7 @@ fn complete_in(
                 .map(|&c| if c == '`' { '"' } else { c })
                 .collect();
             let vars: &[&str] = if func == "mark_when" { MARK_VARS } else { &[] };
-            let mut c = complete_in(&inner, inner.chars().count(), series, vars, true);
+            let mut c = complete_in(&inner, inner.chars().count(), series, vars, true, params);
             c.start += q + 1;
             for item in &mut c.items {
                 item.insert = item.insert.replace('"', "`");
@@ -1155,16 +1209,7 @@ fn complete_in(
         // In text: a series name, or one of the argument's choices.
         let word: String = chars[q + 1..cursor].iter().collect();
         let (func, arg) = (func, arg);
-        let options: Vec<String> = if SERIES_ANY.contains(&func.as_str())
-            || SERIES_FIRST.contains(&func.as_str()) && arg == 0
-        {
-            series.to_vec()
-        } else {
-            arg_choices(&func, arg)
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
-        };
+        let options: Vec<String> = choices(&func, arg);
         out.start = q + 1;
         // The last argument (of the shortest form): close the call too.
         let last =
@@ -1203,16 +1248,7 @@ fn complete_in(
                 .find(|c| !c.is_whitespace())
                 .is_some_and(|c| matches!(c, '(' | ',' | '['))
         {
-            let options: Vec<String> = if SERIES_ANY.contains(&func.as_str())
-                || SERIES_FIRST.contains(&func.as_str()) && *arg == 0
-            {
-                series.to_vec()
-            } else {
-                arg_choices(func, *arg)
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect()
-            };
+            let options: Vec<String> = choices(func, *arg);
             let last = min_args(func).is_some_and(|n| *arg + 1 >= n)
                 && !SERIES_ANY.contains(&func.as_str());
             let paren = if last && !chars[cursor..].contains(&')') {

@@ -402,7 +402,7 @@ api is slowly getting slower here. Give it a target and the stats say when it ge
     Step {
         title: "the console",
         text: r#"The console runs Rhai, a small scripting language. Series names are variables holding their latest value, units work in numbers (50ms, 2GB, 1h, 5%), and every button has a command.
-As you type, the row above suggests commands, series names inside quotes, and how the call you're in is used: Tab (or a tap) puts one in. Answers come in the series' unit and say which point they're from. A mistake is explained, with a fix, and the console stays open on it."#,
+As you type, the row above suggests commands, series names inside quotes, a function's choices (chart types; for param(), the source's settings and then their values), and how the call you're in is used: Tab (or a tap) puts one in. Answers come in the series' unit and say which point they're from. A mistake is explained, with a fix, and the console stays open on it."#,
         keys: &[
             (":", "open the console"),
             ("Tab  Shift+Tab", "complete: the next / previous suggestion"),
