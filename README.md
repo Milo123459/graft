@@ -475,7 +475,7 @@ including over SSH from a phone.
 | toolbar / series chips | ◀ ▶ (move; ▶ at the newest data shows everything) + − **show all** cursor measure stats **lines** (menu) **side by side** forecast split **all time ▾** (menu); `⋯` shows more: targets, chart type, log, follow, pause, format, console, export, mouse, help, quit |
 
 **Timeframe** (anything on a time axis — log timestamps, or arrival times for
-live commands like `ping`): tap **all time ▾** (or press `R`) for a dropdown
+live commands like `ping`): tap **all time ▾** (or press `r`) for a dropdown
 of ranges that fit your data (`last 1d`, `last 6h`, … `last 5m`, `last 1m`) and
 **custom…**, which opens the console with `range("` ready to type
 (`range("2h")`, `range("2026-11-01", "2026-11-02 12:00")`). In the dropdown ↑ ↓
@@ -502,7 +502,7 @@ mouse capture off, so your terminal's own text selection works.
 | `↑ ↓` / `+ -` | zoom in / out |
 | `,` `.` / shift `← →` | step the cursor point by point |
 | `H L` | move by half a screen |
-| `0` / `r` | reset |
+| `0` | show all (reset the zoom) |
 | `c` / `o` | cursor / cursor follows the pointer |
 | `Home` / `End` | cursor to first / last point |
 | `v` … `v` | measure a range from the keyboard |
@@ -515,7 +515,7 @@ mouse capture off, so your terminal's own text selection works.
 | `K` | markers: edit, delete or add rules and markers |
 | `Ctrl+Z` / `u` | undo the last change (chart type, lines, panes, timeframe, markers…); `Ctrl+Y` / `U` redo. Also the **↶ undo** button once there's something to undo |
 | `f` / `G` | forecast / target lines on or off |
-| `R` / `[` `]` | timeframe dropdown / narrower, wider timeframe |
+| `r` / `[` `]` | timeframe dropdown / narrower, wider timeframe |
 | `F` | change the format or source (builder) |
 | `s` | stats panel |
 | `space` | pause the chart: the source keeps running and its data is kept, so resuming jumps to the latest |
@@ -563,9 +563,22 @@ timeframe applies to every pane.
 
 ### The Rhai console and scripts
 
-Press `:` and type `help` to see every command with a short explanation and
-examples. Inside the console, every series is a variable holding its latest value.
-Functions work on the visible range, or on the selection if you've made one:
+Press `:` to open the console. As you type, the row above it suggests commands
+(and, inside quotes, series names or a function's choices such as chart types),
+and shows how the call you're in is used: **Tab** (or a tap) puts the highlighted
+one in, again for the next. `help` lists every command at once, grouped; tap one to
+use it.
+
+Inside the console, every series is a variable holding its latest value.
+Functions work on the visible range, or on the selection if you've made one.
+Answers come in the series' unit and say which point they're from:
+`last("api")` → `api: 44.0 ms — the newest value (09:27:10)`, and with a cursor
+placed, the value there too (`at("api")` is the value at the cursor). Trends read
+as words: `slope("api", "1h")` → `api is rising 2.1 ms per hour`.
+
+A mistake is explained in plain words with a fix, and the console stays open on it
+with the cursor at the problem: `last(api)` → *last() needs the series' name in
+quotes: last("api")*; `lst("api")` → *did you mean last("api")?*.
 
 ```
 :node2 - node1
@@ -577,9 +590,9 @@ Functions work on the visible range, or on the selection if you've made one:
 ```
 
 Available functions:
-- Statistics: `series()`, `first`, `last`, `min`, `max`, `mean`/`avg`, `median`,
+- Statistics: `series()`, `first`, `last`, `at` (at the cursor), `min`, `max`, `mean`/`avg`, `median`,
   `stddev`, `p95`, `percentile(name, q)`, `sum`, `count`.
-- Trends: `slope(name[, "1d"])`, `r2`, `change`, `pct_change`, `span`,
+- Trends: `slope(name[, "1d" or 1d])`, `r2`, `change`, `pct_change`, `span`,
   `eta(name, target)`, `forecast(name, seconds_ahead)`.
 - Data: `values`, `xs`.
 - Formatting: `fmt(name, v)`, `fmt_dur`, `fmt_time`, `bytes`.
@@ -611,7 +624,7 @@ Available functions:
     `single()`. With panes, `chart(…)` and `lines(…)` change the picked pane
 - Output: `print(...)`.
 
-Unit literals such as `50GB`, `200ms` and `1d` work in all expressions.
+Unit literals such as `50GB`, `200ms`, `5m` and `1d` work in all expressions.
 
 `--script file.rhai` loads functions and key bindings
 ([examples/keys.rhai](examples/keys.rhai)):

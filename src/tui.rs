@@ -4,7 +4,11 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
+
+use regex::Regex;
+use rhai::Dynamic;
 
 use clap::ValueEnum;
 use ratatui::Frame;
@@ -18,13 +22,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, Widget};
 
 use crate::cli::{ChartKind, Cli, TrendStyle, Window, parse_window};
-use crate::data::Dataset;
+use crate::data::{Dataset, Series};
 use crate::interactive::{Live, Transition};
 use crate::render::panes::{Dir as PDir, Pane, Panes, Split as PSplit};
 use crate::render::{
     ChartOpts, ChartWidget, HLine, Horizon, Overlay, PlotArea, plot_x_bounds, value_at,
 };
-use crate::script::{Action, Flag, PaneAction, display};
+use crate::script::{Action, Flag, PaneAction};
 use crate::session::Session;
 use crate::setup::Setup;
 use crate::stats::SeriesReport;
@@ -41,7 +45,7 @@ const HELP: &[(&str, &str)] = &[
         "scroll",
         "zoom around the pointer; sideways scroll (or shift) moves",
     ),
-    ("reset / 0", "show everything again"),
+    ("show all / 0", "show everything again"),
     ("— looking at values —", ""),
     (
         "tap / cursor / c",
@@ -75,7 +79,7 @@ const HELP: &[(&str, &str)] = &[
     ),
     ("split / x", "one panel per series, each with its own scale"),
     (
-        "all time ▾ / R",
+        "all time ▾ / r",
         "timeframe menu: last 1d, 6h, 5m… or custom",
     ),
     (
@@ -119,229 +123,6 @@ const HELP: &[(&str, &str)] = &[
     ("m", "mouse on/off (off = select text in your terminal)"),
     (":", "Rhai console, e.g. :slope(\"node1\", \"1d\")"),
     ("q", "quit (Esc only clears a measurement or the cursor)"),
-];
-
-/// `:help` — the console's commands. Series names go in quotes.
-const CONSOLE_HELP: &[(&str, &str)] = &[
-    ("— the console —", ""),
-    (
-        "node2 - node1",
-        "series names are variables holding their latest value",
-    ),
-    (
-        "50GB  200ms  1d",
-        "units work in numbers, e.g. last(\"node1\") < 50GB",
-    ),
-    (
-        "",
-        "functions use the visible range, or the measured stretch if there is one",
-    ),
-    ("— values —", ""),
-    ("last(\"s\")  first(\"s\")", "the latest / first value"),
-    (
-        "min max mean median",
-        "smallest, largest, average (also avg), middle value",
-    ),
-    (
-        "stddev p95 sum count",
-        "spread, 95th percentile, total, number of points",
-    ),
-    ("percentile(\"s\", 90)", "any percentile"),
-    (
-        "change pct_change",
-        "difference from first to last (pct_change: in %)",
-    ),
-    (
-        "values(\"s\")  xs(\"s\")",
-        "all values / x positions, as arrays",
-    ),
-    ("series()", "the names of all series"),
-    ("— trends & forecasts —", ""),
-    (
-        "slope(\"s\", \"1d\")",
-        "average change per day (\"1h\", \"1w\"…; no 2nd arg: per second)",
-    ),
-    (
-        "r2(\"s\")",
-        "how well a straight line fits: 0 (noise) to 1 (perfect)",
-    ),
-    (
-        "eta(\"s\", 50GB)",
-        "seconds until the trend reaches 50 GB (nothing if never)",
-    ),
-    (
-        "forecast(\"s\", 3d)",
-        "the trend's value 3 days after the last point",
-    ),
-    ("— formatting —", ""),
-    (
-        "fmt(\"s\", v)",
-        "v in the series' unit, e.g. fmt(\"node1\", 5e10) → 50 GB",
-    ),
-    ("fmt_dur(secs)", "a duration in words, e.g. 3.5 days"),
-    (
-        "fmt_time(t)  bytes(v)",
-        "a timestamp / a byte count, readable",
-    ),
-    ("— every button has a command —", ""),
-    (
-        "timeframe(1h)",
-        "only recent data: 1h, 7d, \"500\" (points) or \"all\"",
-    ),
-    (
-        "timeframe(\"2026-11-01\", \"\")",
-        "from a time on (or between two times)",
-    ),
-    (
-        "lines(\"live,avg\")",
-        "which lines to show: live, avg, median, p95, line",
-    ),
-    ("window(50)", "points in the rolling average (\"auto\")"),
-    (
-        "stats() split() log()",
-        "toggle a button; or set it: stats(true), split(false)…",
-    ),
-    (
-        "side_by_side() targets()",
-        "also live() pause() follow() cursor() measure() mouse()",
-    ),
-    (
-        "forecast(\"7d\")",
-        "project trends 7 days ahead (\"auto\", \"off\")",
-    ),
-    (
-        "target(\"s\", 50GB)",
-        "a forecast target for a series (clear_target(\"s\"))",
-    ),
-    ("chart(\"bar\")", "line, scatter, bar, histogram, sparkline"),
-    ("show(\"s\")  hide(\"s\")", "show or hide a series"),
-    (
-        "zoom(6h)  reset()",
-        "zoom to the last 6 hours / show everything",
-    ),
-    (
-        "zoom_in() zoom_out()",
-        "pan(\"left\") pan(\"right\") — like the ◀ ▶ + − buttons",
-    ),
-    (
-        "hline(50GB, \"label\")",
-        "a reference line (clear_hlines() removes them)",
-    ),
-    (
-        "svg(\"out.svg\")  format()  quit()",
-        "export / change the format / quit",
-    ),
-    ("undo()  redo()", "step back / forward through your changes"),
-    (
-        "only(\"eth\", \"ema30\")",
-        "show just these lines (show_all(), toggle(\"coinbase\"))",
-    ),
-    (
-        "bind(\"r\", only(\"eth\"))",
-        "a key of your own (also --bind 'r = …')",
-    ),
-    (
-        "title(\"ETH\")  unit(\"USD\")",
-        "the chart's title / the unit for plain numbers",
-    ),
-    (
-        "load(\"indicators.rhai\")",
-        "load a script now: use its functions in add_line, mark_when…",
-    ),
-    (
-        "merge(\"cb = -c '…' --json\")",
-        "add another source's series (unmerge(\"cb\"))",
-    ),
-    (
-        "add_line(\"ema30\", \"ema(values(\\\"ETH\\\"), 30)\")",
-        "a custom line from Rhai (same name replaces it)",
-    ),
-    (
-        "remove_line(\"ema30\")",
-        "helpers: ema sma values xs values_at(name, xs) mean…",
-    ),
-    (
-        "copy()  copy(text)",
-        "copy this view's command (or any text) to your clipboard",
-    ),
-    (
-        "save(\"disks\")",
-        "save this view (source, format, panes…): graft -p disks",
-    ),
-    ("— alerts —", ""),
-    (
-        "alert(\"last(\\\"eth\\\") < 3000\")",
-        "an alert (unalert(…) removes it) · N lists them",
-    ),
-    (
-        "notify_to(\"ntfy:my-topic\")",
-        "where notifications go: bell desktop ntfy: webhook: cmd:",
-    ),
-    ("— markers —", ""),
-    (
-        "mark_when(\"delta < -1GB\", \"drop {delta}\")",
-        "▼ wherever it holds: value prev delta pct rate time name",
-    ),
-    (
-        "mark(\"deploy\")  clear_marks()",
-        "a marker at the cursor (or newest data) / remove all",
-    ),
-    (
-        "",
-        "K (or the markers button) lists them: edit, delete, add",
-    ),
-    ("— panes —", ""),
-    (
-        "split_right() split_down()",
-        "split the picked pane (close_pane() closes it)",
-    ),
-    (
-        "pane(\"node1 kind=bar\")",
-        "what the picked pane shows: series, kind=…, lines=…",
-    ),
-    (
-        "layout(\"(1 | 2) / 3\")",
-        "arrange: | side by side, / stacked, |60% sizes",
-    ),
-    (
-        "focus_pane(2)",
-        "pick a pane (or \"left\" \"right\" \"up\" \"down\")",
-    ),
-    (
-        "move_pane(\"left\")",
-        "swap with the pane that way; resize_pane(\"right\", 10)",
-    ),
-    ("even_panes()  single()", "equal sizes / back to one chart"),
-    (
-        "pane_source(\"cpu\")",
-        "the picked pane shows a preset/profile/@recent (\"main\": back)",
-    ),
-    ("print(x)", "show a value (several prints are joined)"),
-    ("— examples —", ""),
-    (
-        "fmt_dur(eta(\"node1\", 50GB))",
-        "when will node1 reach 50 GB?",
-    ),
-    (
-        "fmt(\"node2\", slope(\"node2\", \"1d\"))",
-        "how much node2 changes per day",
-    ),
-    (
-        "mean(\"node2\") - mean(\"node1\")",
-        "the average gap between two series",
-    ),
-    (
-        "target(\"node1\", 50GB); forecast(\"auto\")",
-        "aim for 50 GB and draw the forecast",
-    ),
-    (
-        "timeframe(6h); lines(\"live,median\"); stats(true)",
-        "several at once, separated by ;",
-    ),
-    (
-        "",
-        "your own functions and key bindings: --script file.rhai (see README)",
-    ),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -420,9 +201,22 @@ enum Hit {
     MarkAction(MarkAction),
     /// Timeframe dropdown: type a range in the console.
     CustomRange,
+    /// A console suggestion (by position in the hint row).
+    Complete(usize),
+    /// A command in the `help` list: put it in the console.
+    InsertCommand(&'static str),
     /// The tutorial panel.
     Tutorial(TutorialHit),
     MenuBackground,
+}
+
+/// Tab completion in progress.
+#[derive(Debug, Clone)]
+struct TabCycle {
+    base: String,
+    cursor: usize,
+    comps: crate::script::Completions,
+    i: usize,
 }
 
 /// The tutorial panel's parts, laid out for a width.
@@ -646,6 +440,12 @@ pub struct App {
     pane_menu: bool,
     /// Text to put on the clipboard (written to the terminal by the event loop).
     clipboard: Option<String>,
+    /// The console's last output (a result or an error), shown above the status line.
+    console_note: Option<Message>,
+    /// Tab pressed: the suggestions being cycled through, and the input before.
+    tab_cycle: Option<TabCycle>,
+    /// Where in the command the last error is (to put the cursor there).
+    error_at: Option<usize>,
     /// `--tutorial`: the guided tour, shown above the chart.
     tutorial: Option<crate::tutorial::Tutorial>,
     tutorial_rect: std::cell::Cell<Rect>,
@@ -761,6 +561,9 @@ impl App {
             pane_menu: false,
             clipboard: None,
             tutorial,
+            console_note: None,
+            error_at: None,
+            tab_cycle: None,
             tutorial_rect: std::cell::Cell::new(Rect::default()),
             subs: Vec::new(),
             mark_rules: Vec::new(),
@@ -3398,13 +3201,17 @@ impl App {
 
     fn eval(&mut self, code: &str) {
         if matches!(code.trim(), "help" | "help()" | "?" | "commands") {
+            // Every command, above an empty console to type one in.
             self.console_help = true;
-            self.help_scroll = 0;
+            self.console = Some(TextInput::default());
             return;
         }
         let script = self.session.script.clone();
         let binds_before = script.binds().len();
+        self.console_note = None;
+        self.error_at = None;
         script.set_data(self.full.clone(), self.focus());
+        script.set_cursor(self.cursor);
         let result = script.eval(code);
         let printed = script.take_output();
         self.message = None;
@@ -3424,8 +3231,12 @@ impl App {
         if self.session.script.has_new_mark_rules() {
             self.update_marks();
         }
-        // A command that complained (e.g. an unknown line name) keeps its message.
-        if self.message.as_ref().is_some_and(|m| m.error) {
+        // A command that complained (e.g. an unknown line name): its message is the
+        // console's output.
+        if let Some(m) = self.message.take_if(|m| m.error) {
+            let names: Vec<String> = self.full.series.iter().map(|s| s.name.clone()).collect();
+            let (text, _) = crate::script::explain_error(&m.text, code, &names);
+            self.note(text, true);
             return;
         }
         // …and so does one that explained itself (e.g. "timeframe: 6h — …").
@@ -3439,12 +3250,355 @@ impl App {
                     if !text.is_empty() {
                         text.push_str("  ");
                     }
-                    text.push_str(&display(&v));
+                    text.push_str(&self.describe_result(code, &v));
                 }
-                self.say(text, false);
+                self.note(text, false);
             }
-            Err(e) => self.say(e.to_string(), true),
+            Err(e) => {
+                let names: Vec<String> = self.full.series.iter().map(|s| s.name.clone()).collect();
+                let (text, at) = crate::script::explain_error(&e.to_string(), code, &names);
+                self.error_at = at;
+                self.note(text, true);
+            }
         }
+    }
+
+    /// Show console output above the status line.
+    fn note(&mut self, text: String, error: bool) {
+        self.console_note = Some(Message {
+            text,
+            error,
+            at: Instant::now(),
+        });
+    }
+
+    // ───────────── console completion ─────────────
+
+    /// What the console can suggest where its cursor is.
+    fn completions(&self) -> crate::script::Completions {
+        if let Some(t) = &self.tab_cycle {
+            return t.comps.clone();
+        }
+        let Some(input) = &self.console else {
+            return Default::default();
+        };
+        let names: Vec<String> = self.full.series.iter().map(|s| s.name.clone()).collect();
+        crate::script::complete(&input.value, input.cursor, &names)
+    }
+
+    /// Tab: put the next suggestion in (Shift+Tab: the one before).
+    fn tab_complete(&mut self, forward: bool) {
+        let Some(input) = &self.console else {
+            return;
+        };
+        let t = match self.tab_cycle.take() {
+            Some(mut t) if !t.comps.items.is_empty() => {
+                let n = t.comps.items.len();
+                t.i = if forward {
+                    (t.i + 1) % n
+                } else {
+                    (t.i + n - 1) % n
+                };
+                t
+            }
+            _ => {
+                let names: Vec<String> = self.full.series.iter().map(|s| s.name.clone()).collect();
+                let comps = crate::script::complete(&input.value, input.cursor, &names);
+                if comps.items.is_empty() {
+                    return;
+                }
+                TabCycle {
+                    base: input.value.clone(),
+                    cursor: input.cursor,
+                    i: if forward { 0 } else { comps.items.len() - 1 },
+                    comps,
+                }
+            }
+        };
+        self.put_suggestion(&t.base, t.cursor, &t.comps, t.i);
+        // Only one: nothing to cycle through, so the next Tab looks afresh (`slope("`
+        // then the series).
+        if t.comps.items.len() > 1 {
+            self.tab_cycle = Some(t);
+        }
+    }
+
+    /// Replace the word being typed with suggestion `i`.
+    fn put_suggestion(
+        &mut self,
+        base: &str,
+        cursor: usize,
+        comps: &crate::script::Completions,
+        i: usize,
+    ) {
+        let Some(s) = comps.items.get(i) else {
+            return;
+        };
+        let chars: Vec<char> = base.chars().collect();
+        let cursor = cursor.min(chars.len());
+        let start = comps.start.min(cursor);
+        let value: String = chars[..start]
+            .iter()
+            .chain(s.insert.chars().collect::<Vec<_>>().iter())
+            .chain(chars[cursor..].iter())
+            .collect();
+        let mut input = TextInput::new(value);
+        input.cursor = start + s.insert.chars().count();
+        self.console = Some(input);
+    }
+
+    /// The row above the console: how the call you're in is used, then suggestions
+    /// (Tab or tap to use one).
+    fn hint_rows(&self, width: u16) -> (Option<Line<'static>>, Vec<Button<Hit>>) {
+        if self.console.is_none() {
+            return (None, Vec::new());
+        }
+        let comps = self.completions();
+        let selected = self.tab_cycle.as_ref().map(|t| t.i);
+        // How to call: the call you're in, else the suggestion that Tab would use.
+        let shown = comps.signature.or_else(|| {
+            let s = comps.items.get(selected.unwrap_or(0))?;
+            let name = s.label.strip_suffix("()")?;
+            crate::script::usage(name).map(|u| (u.1, u.2))
+        });
+        let line = shown.map(|(how, what)| {
+            let mut text = format!("{how} — {what}");
+            let w = width.saturating_sub(1) as usize;
+            if text.chars().count() > w {
+                text = text.chars().take(w.saturating_sub(1)).collect::<String>() + "…";
+            }
+            Line::from(vec![
+                Span::styled(" ", Style::default()),
+                Span::styled(text, Style::default().fg(Color::Gray)),
+            ])
+        });
+        let mut buttons: Vec<Button<Hit>> = comps
+            .items
+            .iter()
+            .enumerate()
+            .take(20)
+            .map(|(i, s)| {
+                Button::new(s.label.clone(), Hit::Complete(i)).active(selected == Some(i))
+            })
+            .collect();
+        if !buttons.is_empty() && selected.is_none() {
+            buttons.insert(0, Button::new("Tab", Hit::Complete(0)));
+        }
+        (line, buttons)
+    }
+
+    // ───────────── console output ─────────────
+
+    /// A console result in words: values in their series' unit, saying which point
+    /// they come from (and, with a cursor placed, the value there too); trends as
+    /// "rising 2.1 ms per hour"; other numbers without scientific notation.
+    fn describe_result(&self, code: &str, v: &Dynamic) -> String {
+        static CALL: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r#"^\s*([a-z_0-9]+)\(\s*"([^"]+)"\s*(?:,\s*(.+?))?\s*\)\s*;?\s*$"#)
+                .expect("valid")
+        });
+        let num = v
+            .as_float()
+            .ok()
+            .or_else(|| v.as_int().ok().map(|i| i as f64));
+        let code = code.trim();
+        // `api` on its own is its newest value.
+        let (func, name, arg) = match CALL.captures(code) {
+            Some(c) => (
+                c[1].to_string(),
+                c[2].to_string(),
+                c.get(3).map(|m| m.as_str().to_string()),
+            ),
+            None => match self
+                .full
+                .series
+                .iter()
+                .find(|s| crate::script::ident(&s.name) == code)
+            {
+                Some(s) => ("last".to_string(), s.name.clone(), None),
+                None => return self.describe_plain(code, v),
+            },
+        };
+        let Some(s) = self.full.series.iter().find(|s| s.name == name) else {
+            return self.describe_plain(code, v);
+        };
+        let pts = s.in_view(self.focus());
+        let when = |x: f64| self.ds.fmt_x(crate::render::round_x(&self.ds, x), 1.0);
+        let shown = if self.selection.is_some() {
+            "the measured stretch"
+        } else if self.view.is_some() {
+            "what's in view"
+        } else {
+            "what's shown"
+        };
+        let u = &s.unit;
+        // With a cursor placed, the value there too: it's what the status line shows.
+        let at_cursor = || {
+            let c = self.cursor?;
+            let (y, projected) = value_at(s, &self.opts, c)?;
+            Some(format!(
+                " · at the cursor ({}): {}{}",
+                when(c),
+                u.format(y),
+                if projected { " (forecast)" } else { "" }
+            ))
+        };
+        let Some(n) = num else {
+            return crate::script::display(v);
+        };
+        let point_with = |y: f64| pts.iter().find(|p| p.1 == y).map(|p| when(p.0));
+        match func.as_str() {
+            "last" => {
+                let x = pts.last().map(|p| when(p.0)).unwrap_or_default();
+                let which = if self.selection.is_some() {
+                    "the end of the measured stretch"
+                } else if self.view.is_some() {
+                    "the newest in view"
+                } else {
+                    "the newest value"
+                };
+                format!(
+                    "{name}: {} — {which} ({x}){}",
+                    u.format(n),
+                    at_cursor().unwrap_or_default()
+                )
+            }
+            "first" => format!(
+                "{name}: {} — the oldest of {shown} ({}){}",
+                u.format(n),
+                pts.first().map(|p| when(p.0)).unwrap_or_default(),
+                at_cursor().unwrap_or_default()
+            ),
+            "at" => match self.cursor {
+                Some(c) => format!("{name}: {} at the cursor ({})", u.format(n), when(c)),
+                None => format!(
+                    "{name}: {} — the newest value (no cursor placed: tap the chart or press c)",
+                    u.format(n)
+                ),
+            },
+            "min" | "max" => format!(
+                "{name}: {} — the {} of {shown}{}{}",
+                u.format(n),
+                if func == "min" { "smallest" } else { "largest" },
+                point_with(n)
+                    .map(|t| format!(", at {t}"))
+                    .unwrap_or_default(),
+                at_cursor().unwrap_or_default()
+            ),
+            "mean" | "avg" | "median" | "p95" | "percentile" | "stddev" | "sum" => {
+                let what = match func.as_str() {
+                    "mean" | "avg" => "the average".to_string(),
+                    "median" => "the middle value".to_string(),
+                    "p95" => "the 95th percentile".to_string(),
+                    "percentile" => format!("the {}th percentile", arg.as_deref().unwrap_or("?")),
+                    "stddev" => "the spread (standard deviation)".to_string(),
+                    _ => "the total".to_string(),
+                };
+                format!(
+                    "{name}: {} — {what} of {shown} ({} points){}",
+                    u.format(n),
+                    pts.len(),
+                    at_cursor().unwrap_or_default()
+                )
+            }
+            "change" => format!(
+                "{name}: {}{} from the first to the last of {shown}",
+                if n > 0.0 { "+" } else { "" },
+                u.format(n)
+            ),
+            "pct_change" => format!("{name}: {n:+.1}% from the first to the last of {shown}"),
+            "count" => format!("{name}: {} points in {shown}", n as i64),
+            "span" => format!("{name}: {shown} covers {}", crate::time::fmt_duration(n)),
+            "slope" => {
+                // Per the duration asked for, else one that reads well for the data.
+                let (per, per_secs) = match &arg {
+                    Some(a) => {
+                        let a = a.trim().trim_matches('"').to_string();
+                        let secs = crate::time::parse_duration_secs(&a)
+                            .ok()
+                            .or_else(|| a.parse().ok())
+                            .unwrap_or(1.0);
+                        (secs, true)
+                    }
+                    None => {
+                        let span = pts.last().zip(pts.first()).map_or(0.0, |(b, a)| b.0 - a.0);
+                        (crate::time::auto_per(span), false)
+                    }
+                };
+                let per_value = if per_secs { n } else { n * per };
+                let dir = if per_value > 0.0 {
+                    "rising"
+                } else if per_value < 0.0 {
+                    "falling"
+                } else {
+                    "flat"
+                };
+                format!(
+                    "{name} is {dir} {} per {} (the trend over {shown})",
+                    u.format(per_value.abs()),
+                    crate::time::per_label(per)
+                )
+            }
+            "r2" => format!(
+                "{name}: R² = {n:.2} — {}",
+                if n >= 0.8 {
+                    "a straight line fits it well"
+                } else if n >= 0.4 {
+                    "it roughly follows a straight line"
+                } else {
+                    "mostly noise: the trend says little"
+                }
+            ),
+            "forecast" => format!(
+                "{name}: {} — where the trend is {} after the newest point",
+                u.format(n),
+                arg.as_deref().unwrap_or("")
+            ),
+            _ => self.describe_plain(code, v),
+        }
+    }
+
+    /// A result not tied to one series' value: in the unit of the series it uses
+    /// (when they share one and it's a sum or difference), else a plain number.
+    fn describe_plain(&self, code: &str, v: &Dynamic) -> String {
+        if code.contains("eta(") {
+            return match v.as_float() {
+                Ok(secs) if secs.is_finite() => format!(
+                    "in {} (around {})",
+                    crate::time::fmt_duration(secs),
+                    self.ds.fmt_x(
+                        self.ds.x_range().map_or(0.0, |r| r.1) + secs,
+                        secs.max(60.0)
+                    )
+                ),
+                _ if v.is_unit() => "never: the trend isn't heading there".into(),
+                _ => crate::script::display(v),
+            };
+        }
+        let Some(n) = v.as_float().ok() else {
+            return crate::script::display(v);
+        };
+        let used: Vec<&Series> = self
+            .full
+            .series
+            .iter()
+            .filter(|s| {
+                code.contains(&format!("\"{}\"", s.name))
+                    || regex::Regex::new(&format!(
+                        r"\b{}\b",
+                        regex::escape(&crate::script::ident(&s.name))
+                    ))
+                    .is_ok_and(|re| re.is_match(code))
+            })
+            .collect();
+        let same_unit = used
+            .first()
+            .is_some_and(|f| used.iter().all(|s| s.unit == f.unit));
+        let additive = !code.contains(['*', '/', '%', '<', '>', '=']);
+        if same_unit && additive && !code.contains("count(") && !code.contains("r2(") {
+            return used[0].unit.format(n);
+        }
+        crate::script::display(v)
     }
 
     fn apply(&mut self, action: Action) {
@@ -3514,7 +3668,7 @@ impl App {
                     }
                     None => self.opts.kind = kind,
                 },
-                Err(_) => self.say(format!("unknown chart type '{k}'"), true),
+                Err(_) => self.say(format!("chart: there's no chart type '{k}' — line, scatter, bar, histogram, sparkline or stat"), true),
             },
             Action::Target(name, value) => self.opts.analysis.targets.set(&name, value),
             Action::Forecast(h) => match h.map(|h| Horizon::parse(&h)).transpose() {
@@ -3746,6 +3900,11 @@ impl App {
     }
 
     fn on_console_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Tab => return self.tab_complete(true),
+            KeyCode::BackTab => return self.tab_complete(false),
+            _ => self.tab_cycle = None,
+        }
         let Some(input) = self.console.as_mut() else {
             return;
         };
@@ -3754,14 +3913,26 @@ impl App {
                 self.console = None;
                 self.editing_rule = None;
                 self.editing_alert = None;
+                self.console_note = None;
+                self.console_help = false;
             }
             KeyCode::Enter => {
                 let code = std::mem::take(&mut input.value);
                 self.console = None;
+                self.console_help = false;
                 self.history_pos = None;
                 if !code.trim().is_empty() {
                     self.history.push(code.clone());
                     self.eval(&code);
+                    // A mistake: the command comes back to fix, the cursor where it went
+                    // wrong.
+                    if self.console_note.as_ref().is_some_and(|n| n.error) {
+                        let mut input = TextInput::new(code.clone());
+                        if let Some(i) = self.error_at {
+                            input.cursor = i.min(code.chars().count());
+                        }
+                        self.console = Some(input);
+                    }
                 }
                 // An edit ends with this command, whatever it was: a later rule or alert
                 // (from a key binding, say) mustn't replace the one that was being edited.
@@ -4224,7 +4395,7 @@ impl App {
             }
             KeyCode::Char('+' | '=') => Cmd::ZoomIn,
             KeyCode::Char('-' | '_') => Cmd::ZoomOut,
-            KeyCode::Char('0' | 'r') => Cmd::Reset,
+            KeyCode::Char('0') => Cmd::Reset,
             KeyCode::Char('c') => Cmd::Cursor,
             KeyCode::Char('o') => Cmd::Follow,
             KeyCode::Home | KeyCode::End => {
@@ -4287,7 +4458,7 @@ impl App {
             KeyCode::Char('T') => Cmd::Trend,
             KeyCode::Char('D') => Cmd::SideBySide,
             KeyCode::Char('G') => Cmd::Targets,
-            KeyCode::Char('R') => Cmd::RangeMenu,
+            KeyCode::Char('r' | 'R') => Cmd::RangeMenu,
             KeyCode::Char('C') => Cmd::Copy,
             KeyCode::Char('K') => Cmd::Markers,
             KeyCode::Char('N') => Cmd::Alerts,
@@ -4325,11 +4496,10 @@ impl App {
                 return Transition::None;
             }
         }
-        if self.help || self.console_help {
+        if self.help {
             match m.kind {
                 MouseEventKind::Down(_) => {
                     self.help = false;
-                    self.console_help = false;
                 }
                 MouseEventKind::ScrollDown => self.help_scroll += 2,
                 MouseEventKind::ScrollUp => self.help_scroll = self.help_scroll.saturating_sub(2),
@@ -4345,6 +4515,45 @@ impl App {
                         Hit::Range(w) => {
                             self.set_timeframe(w.map_or_else(Timeframe::default, Timeframe::last));
                             self.range_menu = false;
+                            Transition::None
+                        }
+                        Hit::InsertCommand(name) => {
+                            // As if typed and completed: `last("`, `undo()`, `zoom(`.
+                            let names: Vec<String> =
+                                self.full.series.iter().map(|s| s.name.clone()).collect();
+                            let input = self.console.get_or_insert_with(TextInput::default);
+                            let (value, cursor) = (input.value.clone(), input.cursor);
+                            let comps = crate::script::complete(name, name.chars().count(), &names);
+                            let insert = comps
+                                .items
+                                .iter()
+                                .find(|s| s.label == format!("{name}()"))
+                                .map_or(name.to_string(), |s| s.insert.clone());
+                            let chars: Vec<char> = value.chars().collect();
+                            let at = cursor.min(chars.len());
+                            let new: String = chars[..at]
+                                .iter()
+                                .copied()
+                                .chain(insert.chars())
+                                .chain(chars[at..].iter().copied())
+                                .collect();
+                            let mut t = TextInput::new(new);
+                            t.cursor = at + insert.chars().count();
+                            self.console = Some(t);
+                            self.tab_cycle = None;
+                            Transition::None
+                        }
+                        Hit::Complete(i) => {
+                            // Tapped: as if Tab had picked it.
+                            if let Some(input) = &self.console {
+                                let comps = self.completions();
+                                let (base, cursor) = match &self.tab_cycle {
+                                    Some(t) => (t.base.clone(), t.cursor),
+                                    None => (input.value.clone(), input.cursor),
+                                };
+                                self.put_suggestion(&base, cursor, &comps, i);
+                                self.tab_cycle = None;
+                            }
                             Transition::None
                         }
                         Hit::CustomRange => {
@@ -4800,7 +5009,13 @@ impl App {
         } else {
             (0, 0)
         };
-        let console_h = u16::from(self.console.is_some());
+        let (hint_line, hint_buttons) = self.hint_rows(area.width);
+        let console_top = std::cell::Cell::new(area.bottom());
+        let console_h = u16::from(self.console.is_some())
+            + u16::from(hint_line.is_some())
+            + u16::from(!hint_buttons.is_empty());
+        let note = self.note_lines(area.width);
+        let note_h = note.len() as u16;
         let pane_h = self.pane_panel_height(area.width);
         let [
             chart,
@@ -4808,6 +5023,7 @@ impl App {
             stats,
             chips_area,
             tool_area,
+            note_area,
             status,
             console,
         ] = Layout::vertical([
@@ -4816,6 +5032,7 @@ impl App {
             Constraint::Length(stats_h),
             Constraint::Length(chips_h),
             Constraint::Length(tool_h),
+            Constraint::Length(note_h),
             Constraint::Length(1),
             Constraint::Length(console_h),
         ])
@@ -4846,8 +5063,43 @@ impl App {
             self.draw_chips(&chips, chips_area, f);
             render_buttons(&toolbar, tool_area, f.buffer_mut(), &self.hits);
         }
+        if note_h > 0 {
+            f.render_widget(Paragraph::new(note), note_area);
+        }
         f.render_widget(Paragraph::new(self.status_line()), status);
         if let Some(input) = &self.console {
+            console_top.set(console.y);
+            // Hints above the input line.
+            let mut y = console.y;
+            if let Some(l) = hint_line {
+                f.render_widget(
+                    l,
+                    Rect {
+                        y,
+                        height: 1,
+                        ..console
+                    },
+                );
+                y += 1;
+            }
+            if !hint_buttons.is_empty() {
+                render_buttons(
+                    &hint_buttons,
+                    Rect {
+                        y,
+                        height: 1,
+                        ..console
+                    },
+                    f.buffer_mut(),
+                    &self.hits,
+                );
+                y += 1;
+            }
+            let console = Rect {
+                y,
+                height: 1,
+                ..console
+            };
             let [prompt, field] =
                 Layout::horizontal([Constraint::Length(1), Constraint::Min(1)]).areas(console);
             f.render_widget(
@@ -4858,7 +5110,11 @@ impl App {
                 field,
                 f.buffer_mut(),
                 true,
-                "type help to see every command · Enter runs · Esc closes",
+                if self.console_help {
+                    "type a command (Tab completes) · Enter runs · Esc closes"
+                } else {
+                    "type help to see every command · Tab completes · Enter runs"
+                },
             );
             self.console_rect.set(field);
         }
@@ -4892,16 +5148,98 @@ impl App {
                 &entries,
             );
         }
-        if self.console_help {
-            let entries: Vec<(String, String, Color)> = CONSOLE_HELP
-                .iter()
-                .map(|(k, d)| (k.to_string(), d.to_string(), Color::Cyan))
-                .collect();
-            self.draw_overlay(
-                f,
-                " console commands (Rhai) · ↑↓ scroll · any other key or tap closes ",
-                &entries,
-            );
+        if self.console_help && self.console.is_some() {
+            self.draw_commands(f, console_top.get());
+        }
+    }
+
+    /// `help`: every console command at once, a line per group, above the console.
+    /// Tap one to put it in the console.
+    fn draw_commands(&self, f: &mut Frame, bottom: u16) {
+        let area = f.area();
+        let w = area.width.saturating_sub(2) as usize;
+        let name_style = Style::default().fg(Color::Cyan);
+        let head = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        // Lay the names out: each group starts a line, its label first.
+        let label_w = crate::script::GROUPS
+            .iter()
+            .map(|g| g.0.len())
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let mut rows: Vec<Vec<(String, Style, Option<&'static str>)>> = Vec::new();
+        for (group, names) in crate::script::GROUPS {
+            let mut row = vec![(format!("{group:<label_w$}"), head, None)];
+            let mut used = label_w;
+            for name in names.iter() {
+                let len = name.chars().count() + 1;
+                if used + len > w && used > label_w {
+                    rows.push(std::mem::take(&mut row));
+                    row.push((" ".repeat(label_w), head, None));
+                    used = label_w;
+                }
+                row.push((format!("{name} "), name_style, Some(*name)));
+                used += len;
+            }
+            rows.push(row);
+        }
+        let footer: Vec<String> = [
+            "tap one, or type: Tab completes · Esc closes",
+            "series names are variables (a - b) · units work: 50ms 2GB 1h 5%",
+        ]
+        .iter()
+        .flat_map(|l| wrap(l, w))
+        .collect();
+        let h = (rows.len() + footer.len() + 2) as u16;
+        let h = h.min(bottom.saturating_sub(area.y));
+        let rect = Rect {
+            x: area.x,
+            y: bottom.saturating_sub(h),
+            width: area.width,
+            height: h,
+        };
+        Clear.render(rect, f.buffer_mut());
+        let block = Block::bordered()
+            .title(" console commands ")
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        self.hits.push(rect, Hit::MenuBackground);
+        for (i, row) in rows.iter().chain(std::iter::empty()).enumerate() {
+            let y = inner.y + i as u16;
+            if y >= inner.bottom() {
+                break;
+            }
+            let mut x = inner.x;
+            for (text, style, name) in row {
+                let len = text.chars().count() as u16;
+                f.buffer_mut().set_string(x, y, text, *style);
+                if let Some(n) = name {
+                    self.hits.push(
+                        Rect {
+                            x,
+                            y,
+                            width: len.saturating_sub(1).max(1),
+                            height: 1,
+                        },
+                        Hit::InsertCommand(n),
+                    );
+                }
+                x += len;
+            }
+        }
+        for (k, line) in footer.iter().enumerate() {
+            let y = inner.y + (rows.len() + k) as u16;
+            if y < inner.bottom() {
+                f.buffer_mut().set_string(
+                    inner.x,
+                    y,
+                    line.as_str(),
+                    Style::default().fg(Color::Gray),
+                );
+            }
         }
     }
 
@@ -4936,6 +5274,41 @@ impl App {
             f.render_widget(line, rect);
             self.hits.push(rect, chip.action);
         }
+    }
+
+    /// The console's output, wrapped: an error stays while you fix it, a result for
+    /// a while (or until the next command).
+    fn note_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let Some(n) = &self.console_note else {
+            return Vec::new();
+        };
+        if !n.error && n.at.elapsed() > Duration::from_secs(20) {
+            return Vec::new();
+        }
+        if n.error && self.console.is_none() && n.at.elapsed() > Duration::from_secs(20) {
+            return Vec::new();
+        }
+        let (lead, style) = if n.error {
+            ("✗ ", Style::default().fg(Color::LightRed))
+        } else {
+            ("▸ ", Style::default().fg(Color::White))
+        };
+        let w = width.saturating_sub(2).max(10) as usize;
+        let mut lines: Vec<Line> = wrap(&n.text, w)
+            .into_iter()
+            .enumerate()
+            .map(|(i, l)| {
+                Line::from(vec![
+                    Span::styled(
+                        if i == 0 { lead } else { "  " },
+                        style.add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(l, style),
+                ])
+            })
+            .collect();
+        lines.truncate(4);
+        lines
     }
 
     fn status_line(&self) -> Line<'_> {
@@ -4975,6 +5348,8 @@ impl App {
             .as_ref()
             .filter(|m| m.at.elapsed() < Duration::from_secs(8) || m.error);
         if let Some(c) = self.cursor {
+            // Not the newest data: say so (console results can be about either).
+            spans.push(Span::styled("cursor ", Style::default().fg(Color::Yellow)));
             spans.push(Span::styled(
                 self.ds.fmt_x_full(crate::render::round_x(&self.ds, c)),
                 Style::default().add_modifier(Modifier::BOLD),
@@ -5567,11 +5942,11 @@ mod tests {
         );
         key(&mut app, KeyCode::Enter);
         assert_eq!(
-            app.message.as_ref().map(|m| m.text.as_str()),
+            app.console_note.as_ref().map(|m| m.text.as_str()),
             Some("356.9 GB")
         );
         key(&mut app, KeyCode::Char('D'));
-        let msg = &app.message.as_ref().unwrap().text;
+        let msg = &app.console_note.as_ref().unwrap().text;
         assert!(
             msg.starts_with("node1 -1.97 GB/day, empty in 29.1 days"),
             "{msg}"
@@ -5581,7 +5956,8 @@ mod tests {
         key(&mut app, KeyCode::Char(':'));
         type_str(&mut app, "nope(");
         key(&mut app, KeyCode::Enter);
-        assert!(app.message.as_ref().unwrap().error);
+        assert!(app.console_note.as_ref().unwrap().error);
+        key(&mut app, KeyCode::Esc);
         key(&mut app, KeyCode::Char(':'));
         key(&mut app, KeyCode::Up);
         assert_eq!(
@@ -5715,14 +6091,17 @@ mod tests {
         assert!(screen(&app).contains("type help to see every command"));
         type_str(&mut app, "help");
         key(&mut app, KeyCode::Enter);
+        // Every command at once, above the console; tap one to put it in.
         let s = screen(&app);
         assert!(
-            s.contains("console commands") && s.contains("slope(\"s\", \"1d\")"),
+            s.contains("console commands") && s.contains("trends  slope r2 eta forecast"),
             "{s}"
         );
-        key(&mut app, KeyCode::Down);
-        key(&mut app, KeyCode::Char('x'));
-        assert!(!app.console_help);
+        let (x, y) = find(&app, "slope ");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert_eq!(app.console.as_ref().unwrap().value, "slope(\"");
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.console_help && app.console.is_none());
         // The lines menu: tick any mix of layers.
         let (x, y) = find(&app, "lines: live");
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
@@ -5791,6 +6170,9 @@ mod tests {
     fn every_button_has_a_console_command() {
         let mut app = app(&["graft", LOG]);
         let run = |app: &mut App, code: &str| {
+            if app.console.is_some() {
+                key(app, KeyCode::Esc);
+            }
             key(app, KeyCode::Char(':'));
             type_str(app, code);
             key(app, KeyCode::Enter);
@@ -5807,7 +6189,7 @@ mod tests {
         run(&mut app, "lines(\"avg\")");
         assert!(!app.opts.show_raw && app.opts.trends == [TrendStyle::Avg]);
         run(&mut app, "lines(\"bogus\")");
-        assert!(app.message.as_ref().is_some_and(|m| m.error));
+        assert!(app.console_note.as_ref().is_some_and(|m| m.error));
         run(
             &mut app,
             "stats(); split(true); split(true); log(); targets(false)",
@@ -6067,10 +6449,11 @@ mod tests {
         type_str(&mut app, "pane_source(\"nope\")");
         key(&mut app, KeyCode::Enter);
         assert!(
-            app.message
+            app.console_note
                 .as_ref()
                 .is_some_and(|m| m.error && m.text.contains("no profile named 'nope'"))
         );
+        key(&mut app, KeyCode::Esc);
         key(&mut app, KeyCode::Char(':'));
         type_str(&mut app, "pane_source(\"processes\")");
         key(&mut app, KeyCode::Enter);
@@ -6154,10 +6537,11 @@ mod tests {
         type_str(&mut app, "mark_when(\"value\")");
         key(&mut app, KeyCode::Enter);
         assert!(
-            app.message
+            app.console_note
                 .as_ref()
-                .is_some_and(|m| m.error && m.text.contains("expected true/false"))
+                .is_some_and(|m| m.error && m.text.contains("needs a condition"))
         );
+        key(&mut app, KeyCode::Esc);
         assert_eq!(app.current_cli().mark.len(), 2);
         key(&mut app, KeyCode::Char(':'));
         type_str(&mut app, "clear_marks()");
@@ -6440,10 +6824,18 @@ mod tests {
         type_str(&mut app, "add_line(\"bad\", \"values(\\\"nope\\\")\")");
         key(&mut app, KeyCode::Enter);
         assert!(
-            app.message
+            app.console_note
                 .as_ref()
-                .is_some_and(|m| m.error && m.text.contains("unknown series 'nope'"))
+                .is_some_and(|m| m.error && m.text.contains("no series called \"nope\"")),
+            "{:?}",
+            app.console_note.as_ref().map(|m| &m.text)
         );
+        // The console stays open on the mistake; Esc closes it.
+        assert_eq!(
+            app.console.as_ref().unwrap().value,
+            "add_line(\"bad\", \"values(\\\"nope\\\")\")"
+        );
+        key(&mut app, KeyCode::Esc);
         key(&mut app, KeyCode::Char(':'));
         type_str(&mut app, "remove_line(\"bad\"); title(\"Disks\")");
         key(&mut app, KeyCode::Enter);
@@ -6525,7 +6917,7 @@ mod tests {
         type_str(&mut app, r#"only("nope")"#);
         key(&mut app, KeyCode::Enter);
         assert!(
-            app.message
+            app.console_note
                 .as_ref()
                 .is_some_and(|m| m.error && m.text.contains("no series called"))
         );
@@ -6769,6 +7161,10 @@ mod tests {
     }
 
     fn run(app: &mut App, code: &str) {
+        // (A mistake leaves the console open on it.)
+        if app.console.is_some() {
+            key(app, KeyCode::Esc);
+        }
         key(app, KeyCode::Char(':'));
         app.console.as_mut().unwrap().set(code);
         key(app, KeyCode::Enter);
@@ -7178,7 +7574,9 @@ mod tests {
         names.dedup();
         assert!(names.len() > 80, "only found {}: {names:?}", names.len());
         for n in names {
-            if !NOT_FUNCTIONS.contains(&n.as_str()) && !corpus.contains(&format!("{n}(")) {
+            // As a whole name: `at(` isn't mentioned by `values_at(`.
+            let named = Regex::new(&format!(r"(?:^|[^a-z0-9_]){n}\(")).unwrap();
+            if !NOT_FUNCTIONS.contains(&n.as_str()) && !named.is_match(&corpus) {
                 missing.push(format!("console function {n}()"));
             }
         }
@@ -7189,5 +7587,155 @@ mod tests {
              or examples):\n  {}",
             missing.join("\n  ")
         );
+    }
+
+    #[test]
+    fn console_explains_results_and_mistakes() {
+        let mut app = tutorial_app();
+        let out = |app: &mut App, code: &str| {
+            run(app, code);
+            let n = app.console_note.as_ref().expect("output");
+            (n.error, n.text.clone())
+        };
+        // Values in the series' unit, saying which point they're from.
+        let (err, t) = out(&mut app, r#"last("api")"#);
+        assert!(
+            !err && t.starts_with("api: ") && t.contains(" ms — the newest value ("),
+            "{t}"
+        );
+        assert_eq!(
+            out(&mut app, "api").1,
+            t,
+            "a series' name alone is its newest value"
+        );
+        // Trends in words, never scientific notation.
+        let t = out(&mut app, r#"slope("api", "1h")"#).1;
+        assert!(
+            t.starts_with("api is rising ") && t.contains(" ms per hour"),
+            "{t}"
+        );
+        assert_eq!(out(&mut app, r#"slope("api", 1h)"#).1, t);
+        let t = out(&mut app, r#"slope("api")"#).1;
+        assert!(
+            !Regex::new(r"\de[-+]?\d").unwrap().is_match(&t),
+            "no 4.8e-4: {t}"
+        );
+        assert!(out(&mut app, r#"eta("api", 60ms)"#).1.starts_with("in "));
+        assert!(out(&mut app, "api - web").1.ends_with(" ms"));
+        // With a cursor placed, the value there too; at() is the value there.
+        key(&mut app, KeyCode::Home);
+        let t = out(&mut app, r#"mean("db")"#).1;
+        assert!(t.contains(" · at the cursor ("), "{t}");
+        assert!(out(&mut app, r#"at("api")"#).1.contains("at the cursor"));
+        assert!(
+            screen(&app).contains("cursor 2"),
+            "the status line says it's the cursor"
+        );
+        // `5m` is five minutes.
+        run(&mut app, r#"zoom(5m)"#);
+        assert!(app.view.is_some_and(|(a, b)| (b - a - 300.0).abs() < 1.0));
+        // Mistakes: plain words, a fix, and the console stays open on the command.
+        for (code, says) in [
+            (
+                "last(api)",
+                r#"last() needs the series' name in quotes: last("api")"#,
+            ),
+            (r#"lst("api")"#, r#"did you mean last("api")?"#),
+            (r#"last("apu")"#, r#"did you mean "api"?"#),
+            ("zoom(5x)", "5x isn't a number graft understands"),
+            (r#"last("api""#, "last( is missing its closing )"),
+            ("apo + 1", "did you mean api?"),
+            (
+                r#"slope("api", "1h", 3)"#,
+                "slope() doesn't take (text, text, a number)",
+            ),
+            (r#"hline("x")"#, "hline needs a number — e.g. hline(50ms)"),
+            (r#"mark_when("value")"#, "needs a condition"),
+            (r#"chart("pie")"#, "there's no chart type 'pie'"),
+        ] {
+            let (err, t) = out(&mut app, code);
+            assert!(err && t.contains(says), "{code}: {t}");
+            assert_eq!(
+                app.console.as_ref().map(|c| c.value.as_str()),
+                Some(code),
+                "{code}"
+            );
+        }
+        // The cursor goes to the mistake.
+        out(&mut app, "zoom(5x)");
+        assert_eq!(app.console.as_ref().unwrap().cursor, 5);
+    }
+
+    #[test]
+    fn console_completes_commands_and_series() {
+        let mut app = tutorial_app();
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, "sl");
+        // The hint row: how it's used, and what Tab would put in.
+        let s = screen_sized(&app, 46, 30);
+        assert!(
+            s.contains(r#"slope("api", "1h") — the trend"#) && s.contains(" slope() "),
+            "{s}"
+        );
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.console.as_ref().unwrap().value, r#"slope(""#);
+        // Inside the quotes: the series. Tab cycles through them.
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.console.as_ref().unwrap().value, r#"slope("web""#);
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.console.as_ref().unwrap().value, r#"slope("api""#);
+        key(&mut app, KeyCode::BackTab);
+        assert_eq!(app.console.as_ref().unwrap().value, r#"slope("web""#);
+        // A letter narrows it; a tap works like Tab.
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, r#"max("d"#);
+        let (x, y) = find(&app, " db ");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert_eq!(app.console.as_ref().unwrap().value, r#"max("db""#);
+        type_str(&mut app, ")");
+        key(&mut app, KeyCode::Enter);
+        assert!(
+            app.console_note
+                .as_ref()
+                .is_some_and(|n| n.text.starts_with("db: "))
+        );
+        // Choices for other arguments: chart types, durations.
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, r#"chart("hi"#);
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.console.as_ref().unwrap().value, r#"chart("histogram""#);
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, r#"slope("api", "#);
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(app.console.as_ref().unwrap().value, r#"slope("api", "1m""#);
+    }
+
+    #[test]
+    #[ignore]
+    fn write_console_screens() {
+        let dir = std::env::var("GRAFT_SNAPSHOTS").unwrap();
+        let mut app = tutorial_app();
+        app.tutorial = None;
+        let shot = |app: &App, name: &str, w: u16, h: u16| {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| app.draw(f)).unwrap();
+            let ans = crate::render::ansi::to_ansi(term.backend().buffer(), true);
+            std::fs::write(format!("{dir}/console-{name}.ans"), ans).unwrap();
+        };
+        key(&mut app, KeyCode::Home);
+        run(&mut app, r#"mean("db")"#);
+        shot(&app, "result", 46, 30);
+        key(&mut app, KeyCode::Char(':'));
+        type_str(&mut app, r#"slope(""#);
+        shot(&app, "complete", 46, 30);
+        key(&mut app, KeyCode::Esc);
+        run(&mut app, "last(api)");
+        shot(&app, "error", 46, 30);
+        key(&mut app, KeyCode::Esc);
+        run(&mut app, "help");
+        shot(&app, "help", 46, 40);
+        shot(&app, "help-wide", 110, 34);
     }
 }

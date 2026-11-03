@@ -160,6 +160,8 @@ pub const FLAGS: &[(&str, Flag)] = &[
 pub struct ScriptState {
     pub data: Dataset,
     pub view: Option<(f64, f64)>,
+    /// Where the viewer's cursor is (for `at()`).
+    pub cursor: Option<f64>,
     pub actions: Vec<Action>,
     pub binds: Vec<(String, String)>,
     pub output: Vec<String>,
@@ -263,7 +265,7 @@ static UNIT_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
         r"\b(?P<n>\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)",
         r"(?:\s?(?P<long>KiB|MiB|GiB|TiB|PiB|kB|KB|MB|GB|TB|PB|ms|us|ns|min|day|days|week|weeks)",
-        r"|(?P<short>[KMGTPBshdw]))\b",
+        r"|(?P<short>[KMGTPBshdwm]))\b",
         r"|\b(?P<pn>\d+(?:\.\d+)?)%(?P<pct>)"
     ))
     .expect("valid unit literal regex")
@@ -442,6 +444,7 @@ fn rewrite_units(code: &str, binary: bool) -> String {
                 .or(c.name("short"))
                 .map_or("", |m| m.as_str());
             let mult = match unit {
+                "m" => 60.0,
                 "d" | "day" | "days" => 86400.0,
                 "w" | "week" | "weeks" => 604_800.0,
                 u => lookup_unit(u, binary).map_or(1.0, |(_, m)| m),
@@ -452,6 +455,804 @@ fn rewrite_units(code: &str, binary: bool) -> String {
             if s.contains('.') { s } else { format!("{s}.0") }
         })
         .into_owned()
+}
+
+/// Every console function: (name, how to call it, what it does). Used to explain
+/// mistakes ("slope needs …: slope(\"api\", \"1h\")").
+pub const USAGE: &[(&str, &str, &str)] = &[
+    // values
+    ("last", r#"last("api")"#, "the newest value shown"),
+    ("first", r#"first("api")"#, "the oldest value shown"),
+    (
+        "at",
+        r#"at("api")"#,
+        "the value at the cursor (or the newest)",
+    ),
+    ("min", r#"min("api")"#, "the smallest value shown"),
+    ("max", r#"max("api")"#, "the largest value shown"),
+    ("mean", r#"mean("api")"#, "the average of what's shown"),
+    ("avg", r#"avg("api")"#, "the average of what's shown"),
+    ("median", r#"median("api")"#, "the middle value"),
+    ("p95", r#"p95("api")"#, "the 95th percentile"),
+    ("percentile", r#"percentile("api", 99)"#, "any percentile"),
+    (
+        "stddev",
+        r#"stddev("api")"#,
+        "how spread out the values are",
+    ),
+    ("sum", r#"sum("api")"#, "all the values added up"),
+    ("count", r#"count("api")"#, "the number of points"),
+    ("span", r#"span("api")"#, "the time the points cover"),
+    ("change", r#"change("api")"#, "last minus first"),
+    ("pct_change", r#"pct_change("api")"#, "last vs first, in %"),
+    ("series", "series()", "the names of all series"),
+    ("values", r#"values("api")"#, "every value, as an array"),
+    ("xs", r#"xs("api")"#, "every point's time, as an array"),
+    (
+        "values_at",
+        r#"values_at("db", xs("api"))"#,
+        "one series' values at another's times",
+    ),
+    // trends
+    (
+        "slope",
+        r#"slope("api", "1h")"#,
+        "the trend: change per hour (or per second)",
+    ),
+    (
+        "r2",
+        r#"r2("api")"#,
+        "how well a straight line fits, 0 to 1",
+    ),
+    (
+        "eta",
+        r#"eta("api", 60ms)"#,
+        "seconds until the trend reaches a value",
+    ),
+    (
+        "forecast",
+        r#"forecast("api", 1h)  ·  forecast("1h")"#,
+        "the trend's value ahead · draw forecasts",
+    ),
+    (
+        "ema",
+        r#"ema(values("api"), 30)"#,
+        "exponential moving average of an array",
+    ),
+    (
+        "sma",
+        r#"sma(values("api"), 30)"#,
+        "simple moving average of an array",
+    ),
+    (
+        "mean_of",
+        r#"mean_of(["web", "api"])"#,
+        "several series averaged at each moment",
+    ),
+    // text
+    (
+        "fmt",
+        r#"fmt("api", 0.044)"#,
+        "a number in a series' unit: 44 ms",
+    ),
+    ("fmt_dur", "fmt_dur(5400)", "seconds in words: 1.5 hours"),
+    ("fmt_time", r#"fmt_time(last_x)"#, "a timestamp, readable"),
+    ("bytes", "bytes(5e9)", "a byte count, readable: 5 GB"),
+    // the view
+    (
+        "timeframe",
+        r#"timeframe("1h")  ·  timeframe("2026-11-01", "")"#,
+        "which data counts",
+    ),
+    (
+        "range",
+        r#"range("1h")  ·  range("all")"#,
+        "which data counts",
+    ),
+    ("zoom", r#"zoom("5m")"#, "zoom to the last 5 minutes"),
+    ("zoom_in", "zoom_in()", "zoom in"),
+    ("zoom_out", "zoom_out()", "zoom out"),
+    ("pan", r#"pan("left")  ·  pan(-0.5)"#, "move along"),
+    ("reset", "reset()", "show everything"),
+    (
+        "chart",
+        r#"chart("bar")"#,
+        "line scatter bar histogram sparkline stat",
+    ),
+    ("lines", r#"lines("live,avg")"#, "which lines to draw"),
+    (
+        "trend",
+        r#"trend("median")"#,
+        "the trend line: avg median p95 fit off",
+    ),
+    ("window", "window(60)", "points in the moving average"),
+    ("show", r#"show("api")"#, "show a series"),
+    ("hide", r#"hide("api")"#, "hide a series"),
+    ("toggle", r#"toggle("api")"#, "show or hide a series"),
+    (
+        "only",
+        r#"only("api")  ·  only("web", "api")"#,
+        "show just these",
+    ),
+    ("show_all", "show_all()", "show every series"),
+    (
+        "hline",
+        r#"hline(50ms)  ·  hline(50ms, "slow")"#,
+        "a reference line",
+    ),
+    ("clear_hlines", "clear_hlines()", "remove reference lines"),
+    ("target", r#"target("api", 60ms)"#, "a forecast target"),
+    ("clear_target", r#"clear_target("api")"#, "remove a target"),
+    ("title", r#"title("latency")"#, "the chart's title"),
+    ("unit", r#"unit("ms")"#, "the unit for bare numbers"),
+    // toggles
+    ("live", "live()  ·  live(false)", "the raw data on/off"),
+    ("raw", "raw()  ·  raw(false)", "the raw data on/off"),
+    ("side_by_side", "side_by_side()", "live left, trends right"),
+    ("stats", "stats()  ·  stats(true)", "the stats table"),
+    ("split", "split()", "a panel per series"),
+    ("log", "log()", "log scale"),
+    ("targets", "targets()", "target lines"),
+    ("pause", "pause()", "pause the chart"),
+    ("follow", "follow()", "the cursor follows the mouse"),
+    ("cursor", "cursor()", "the cursor on/off"),
+    ("mouse", "mouse()", "the mouse on/off"),
+    ("measure", "measure()", "start measuring a stretch"),
+    // panes
+    ("split_right", "split_right()", "a new pane to the right"),
+    ("split_down", "split_down()", "a new pane below"),
+    ("close_pane", "close_pane()", "close the picked pane"),
+    ("single", "single()", "back to one chart"),
+    ("even_panes", "even_panes()", "equal sizes"),
+    (
+        "focus_pane",
+        r#"focus_pane("left")  ·  focus_pane(2)"#,
+        "pick a pane",
+    ),
+    ("move_pane", r#"move_pane("right")"#, "move the picked pane"),
+    (
+        "resize_pane",
+        r#"resize_pane("right")  ·  resize_pane("right", 0.1)"#,
+        "grow the picked pane",
+    ),
+    (
+        "pane",
+        r#"pane("db kind=histogram")"#,
+        "what the picked pane shows",
+    ),
+    (
+        "pane_source",
+        r#"pane_source("cpu")"#,
+        "the picked pane's source",
+    ),
+    ("layout", r#"layout("(1 | 2) / 3")"#, "arrange the panes"),
+    // markers, alerts, lines, sources
+    (
+        "mark_when",
+        r#"mark_when("value > 60ms", "spike")"#,
+        "a marker wherever it holds",
+    ),
+    ("mark", r#"mark("deploy")"#, "a marker at the cursor"),
+    ("clear_marks", "clear_marks()", "remove every marker"),
+    ("alert", r#"alert("api > 45ms")"#, "an alert"),
+    ("unalert", r#"unalert("api > 45ms")"#, "remove an alert"),
+    (
+        "notify_to",
+        r#"notify_to("ntfy:my-topic")"#,
+        "bell desktop ntfy: webhook: cmd:",
+    ),
+    (
+        "notify_off",
+        r#"notify_off("desktop")"#,
+        "stop sending there",
+    ),
+    (
+        "add_line",
+        r#"add_line("smooth", "ema(values(`api`), 30)")"#,
+        "a custom line",
+    ),
+    (
+        "remove_line",
+        r#"remove_line("smooth")"#,
+        "remove a custom line",
+    ),
+    (
+        "merge",
+        r#"merge("cpu")  ·  merge("cb = -c '…' --json")"#,
+        "add a source's series",
+    ),
+    ("unmerge", r#"unmerge("cpu")"#, "remove a merged source"),
+    // keeping things
+    ("undo", "undo()", "a step back"),
+    ("redo", "redo()", "a step forward"),
+    (
+        "copy",
+        "copy()  ·  copy(\"text\")",
+        "copy this view's command (or text)",
+    ),
+    (
+        "save",
+        r#"save("latency")"#,
+        "save as a profile: graft -p latency",
+    ),
+    ("svg", r#"svg()  ·  svg("out.svg")"#, "export to SVG"),
+    ("load", r#"load("my.rhai")"#, "load a script"),
+    ("bind", r#"bind("r", only("api"))"#, "a key of your own"),
+    ("format", "format()", "open the format builder"),
+    ("help", "help", "every command"),
+    ("quit", "quit()", "quit"),
+];
+
+/// The console's commands by what they're for (the `help` list).
+pub const GROUPS: &[(&str, &[&str])] = &[
+    (
+        "values",
+        &[
+            "last",
+            "first",
+            "at",
+            "min",
+            "max",
+            "mean",
+            "avg",
+            "median",
+            "p95",
+            "percentile",
+            "stddev",
+            "sum",
+            "count",
+            "span",
+            "change",
+            "pct_change",
+        ],
+    ),
+    ("trends", &["slope", "r2", "eta", "forecast"]),
+    (
+        "arrays",
+        &[
+            "values",
+            "xs",
+            "values_at",
+            "series",
+            "ema",
+            "sma",
+            "mean_of",
+        ],
+    ),
+    ("text", &["fmt", "fmt_dur", "fmt_time", "bytes"]),
+    (
+        "view",
+        &[
+            "timeframe",
+            "range",
+            "zoom",
+            "zoom_in",
+            "zoom_out",
+            "pan",
+            "reset",
+            "chart",
+            "lines",
+            "trend",
+            "window",
+            "title",
+            "unit",
+        ],
+    ),
+    ("series", &["show", "hide", "toggle", "only", "show_all"]),
+    (
+        "toggles",
+        &[
+            "stats",
+            "split",
+            "log",
+            "targets",
+            "live",
+            "raw",
+            "side_by_side",
+            "pause",
+            "follow",
+            "cursor",
+            "mouse",
+            "measure",
+        ],
+    ),
+    (
+        "lines",
+        &[
+            "hline",
+            "clear_hlines",
+            "target",
+            "clear_target",
+            "add_line",
+            "remove_line",
+        ],
+    ),
+    ("markers", &["mark_when", "mark", "clear_marks"]),
+    ("alerts", &["alert", "unalert", "notify_to", "notify_off"]),
+    (
+        "panes",
+        &[
+            "split_right",
+            "split_down",
+            "close_pane",
+            "single",
+            "even_panes",
+            "focus_pane",
+            "move_pane",
+            "resize_pane",
+            "pane",
+            "pane_source",
+            "layout",
+        ],
+    ),
+    ("sources", &["merge", "unmerge", "load", "format"]),
+    (
+        "keep",
+        &["undo", "redo", "copy", "save", "svg", "bind", "quit"],
+    ),
+];
+
+/// How `name` is called, if it's a console function.
+pub fn usage(name: &str) -> Option<&'static (&'static str, &'static str, &'static str)> {
+    USAGE.iter().find(|u| u.0 == name)
+}
+
+/// Functions whose first argument is a series name (`last("api")`).
+const SERIES_FIRST: &[&str] = &[
+    "last",
+    "first",
+    "at",
+    "min",
+    "max",
+    "mean",
+    "avg",
+    "median",
+    "p95",
+    "percentile",
+    "stddev",
+    "sum",
+    "count",
+    "span",
+    "change",
+    "pct_change",
+    "values",
+    "xs",
+    "values_at",
+    "slope",
+    "r2",
+    "eta",
+    "forecast",
+    "fmt",
+    "show",
+    "hide",
+    "toggle",
+    "target",
+    "clear_target",
+];
+/// Functions where every text argument is a series name (`only("a", "b")`, `mean_of([…])`).
+const SERIES_ANY: &[&str] = &["only", "mean_of"];
+
+/// The choices for a text argument that isn't a series.
+fn arg_choices(func: &str, arg: usize) -> &'static [&'static str] {
+    match (func, arg) {
+        ("slope", 1) => &["1m", "1h", "1d", "1w"],
+        (_, 1..) => &[],
+        (func, _) => arg_choices_first(func),
+    }
+}
+
+fn arg_choices_first(func: &str) -> &'static [&'static str] {
+    match func {
+        "chart" => &["line", "scatter", "bar", "histogram", "sparkline", "stat"],
+        "lines" => &["live", "avg", "median", "p95", "line"],
+        "trend" => &["avg", "median", "p95", "fit", "off"],
+        "notify_to" | "notify_off" => &["bell", "desktop", "ntfy:", "webhook:", "cmd:"],
+        "timeframe" | "range" | "zoom" => &["5m", "15m", "1h", "6h", "1d", "7d", "all"],
+        "pan" | "focus_pane" | "move_pane" | "resize_pane" => &["left", "right", "up", "down"],
+        "forecast" => &["auto", "1h", "1d", "7d", "off"],
+        _ => &[],
+    }
+}
+
+/// One suggestion: what Tab puts in place of the word being typed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Suggestion {
+    pub insert: String,
+    /// What the hint row shows.
+    pub label: String,
+}
+
+/// What the console can offer at the cursor.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Completions {
+    /// Char offset where the word being completed starts (it's replaced up to the cursor).
+    pub start: usize,
+    pub items: Vec<Suggestion>,
+    /// The call the cursor is in: how it's used, and what it does.
+    pub signature: Option<(&'static str, &'static str)>,
+}
+
+/// Suggestions for console input `text` with the cursor at char `cursor`.
+pub fn complete(text: &str, cursor: usize, series: &[String]) -> Completions {
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = cursor.min(chars.len());
+    // Walk up to the cursor: are we in a string, and in which calls?
+    let mut in_str: Option<usize> = None;
+    let mut calls: Vec<(String, usize)> = Vec::new(); // (function, args seen)
+    let mut i = 0;
+    while i < cursor {
+        let c = chars[i];
+        match (in_str, c) {
+            (Some(_), '\\') => i += 1,
+            (Some(_), '"') => in_str = None,
+            (Some(_), _) => {}
+            (None, '"') => in_str = Some(i),
+            (None, '(') => {
+                let mut j = i;
+                while j > 0 && (chars[j - 1].is_alphanumeric() || chars[j - 1] == '_') {
+                    j -= 1;
+                }
+                calls.push((chars[j..i].iter().collect(), 0));
+            }
+            (None, ')') => {
+                calls.pop();
+            }
+            (None, ',') => {
+                if let Some(c) = calls.last_mut() {
+                    c.1 += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let call = calls.last().cloned();
+    let signature = call
+        .as_ref()
+        .and_then(|(f, _)| usage(f))
+        .map(|u| (u.1, u.2));
+    let mut out = Completions {
+        start: cursor,
+        items: Vec::new(),
+        signature,
+    };
+    let starts = |a: &str, b: &str| a.to_lowercase().starts_with(&b.to_lowercase());
+    let contains = |a: &str, b: &str| a.to_lowercase().contains(&b.to_lowercase());
+    // Prefix matches first, then other matches.
+    let ranked = |options: Vec<String>, word: &str| -> Vec<String> {
+        let mut v: Vec<String> = options
+            .iter()
+            .filter(|o| starts(o, word))
+            .cloned()
+            .collect();
+        v.extend(
+            options
+                .iter()
+                .filter(|o| !starts(o, word) && contains(o, word))
+                .cloned(),
+        );
+        v
+    };
+    let close = |at: usize| chars.get(at) != Some(&'"');
+    if let Some(q) = in_str {
+        // In text: a series name, or one of the argument's choices.
+        let word: String = chars[q + 1..cursor].iter().collect();
+        let (func, arg) = call.unwrap_or_default();
+        let options: Vec<String> = if SERIES_ANY.contains(&func.as_str())
+            || SERIES_FIRST.contains(&func.as_str()) && arg == 0
+        {
+            series.to_vec()
+        } else {
+            arg_choices(&func, arg)
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        };
+        out.start = q + 1;
+        out.items = ranked(options, &word)
+            .into_iter()
+            .filter(|o| *o != word || close(cursor))
+            .map(|o| Suggestion {
+                insert: if close(cursor) && !o.ends_with(':') {
+                    format!("{o}\"")
+                } else {
+                    o.clone()
+                },
+                label: o,
+            })
+            .collect();
+        return out;
+    }
+    // A word being typed: commands and series.
+    let mut start = cursor;
+    while start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_') {
+        start -= 1;
+    }
+    let word: String = chars[start..cursor].iter().collect();
+    if word.is_empty() {
+        // Right after `last(`: the series, quoted.
+        if let Some((func, arg)) = &call
+            && chars[..cursor]
+                .iter()
+                .rev()
+                .find(|c| !c.is_whitespace())
+                .is_some_and(|c| matches!(c, '(' | ',' | '['))
+        {
+            let options: Vec<String> = if SERIES_ANY.contains(&func.as_str())
+                || SERIES_FIRST.contains(&func.as_str()) && *arg == 0
+            {
+                series.to_vec()
+            } else {
+                arg_choices(func, *arg)
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            };
+            out.items = options
+                .into_iter()
+                .map(|o| Suggestion {
+                    insert: if o.ends_with(':') {
+                        format!("\"{o}")
+                    } else {
+                        format!("\"{o}\"")
+                    },
+                    label: o,
+                })
+                .collect();
+        }
+        return out;
+    }
+    if word.starts_with(|c: char| c.is_ascii_digit()) {
+        return out;
+    }
+    out.start = start;
+    let funcs: Vec<String> = USAGE.iter().map(|u| u.0.to_string()).collect();
+    let idents: Vec<String> = series.iter().map(|s| ident(s)).collect();
+    for name in ranked(funcs, &word) {
+        let example = usage(&name).map_or("", |u| u.1);
+        // `last("` for one that takes text first, `undo()` for one that takes nothing.
+        let insert = if example.starts_with(&format!("{name}(\"")) {
+            format!("{name}(\"")
+        } else if example.starts_with(&format!("{name}()")) {
+            format!("{name}()")
+        } else if example.starts_with(&format!("{name}(")) {
+            format!("{name}(")
+        } else {
+            name.clone()
+        };
+        out.items.push(Suggestion {
+            insert,
+            label: format!("{name}()"),
+        });
+    }
+    for id in ranked(idents, &word) {
+        out.items.push(Suggestion {
+            insert: id.clone(),
+            label: id,
+        });
+    }
+    // Typed in full already: nothing to add.
+    out.items.retain(|s| s.insert != word);
+    out
+}
+
+/// Letters to change to turn `a` into `b` (for "did you mean").
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1; b.len() + 1];
+        for (j, cb) in b.iter().enumerate() {
+            cur[j + 1] = (prev[j] + usize::from(ca != *cb))
+                .min(prev[j + 1] + 1)
+                .min(cur[j] + 1);
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+/// The closest of `options` to `word`, if it's close enough to be a typo.
+pub fn did_you_mean<'a>(word: &str, options: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    options
+        .into_iter()
+        .map(|o| (edit_distance(&word.to_lowercase(), &o.to_lowercase()), o))
+        .filter(|(d, o)| {
+            *d <= (o.chars().count() / 3).max(1) || o.starts_with(word) && word.len() >= 2
+        })
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, o)| o)
+}
+
+/// A friendly explanation of a Rhai error for `code`, and where in it the problem is
+/// (a character offset), when known. `series` are the chart's series names.
+pub fn explain_error(raw: &str, code: &str, series: &[String]) -> (String, Option<usize>) {
+    // From inside a custom line, marker rule or alert: explain the error in its own
+    // code, keep saying where it came from.
+    static WRAPPED: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^(line [^:]+|mark '[^']*'|alert '[^']*'): (?:Runtime error: )?(.*)$")
+            .expect("valid")
+    });
+    if let Some(c) = WRAPPED.captures(raw) {
+        let (inner, _) = explain_error(&c[2], "", series);
+        return (format!("{}: {inner}", &c[1]), None);
+    }
+    static POS: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\s*\(line (\d+), position (\d+)\)\s*$").expect("valid"));
+    // Where: Rhai counts lines and columns from 1.
+    let at = POS.captures(raw).and_then(|c| {
+        let (line, col): (usize, usize) = (c[1].parse().ok()?, c[2].parse().ok()?);
+        let before: usize = code
+            .split('\n')
+            .take(line - 1)
+            .map(|l| l.chars().count() + 1)
+            .sum();
+        Some(before + col.saturating_sub(1))
+    });
+    let msg = POS.replace(raw, "").to_string();
+    let msg = msg
+        .strip_prefix("Runtime error: ")
+        .unwrap_or(&msg)
+        .to_string();
+    let quoted = |names: &[String]| {
+        names
+            .iter()
+            .map(|n| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let how = |name: &str| usage(name).map_or(String::new(), |u| format!(" — e.g. {}", u.1));
+    // Function not found: name (types)
+    if let Some(rest) = msg.strip_prefix("Function not found: ") {
+        let (name, args) = rest.split_once(' ').unwrap_or((rest, ""));
+        let name = name.trim();
+        if usage(name).is_none() {
+            let names = USAGE.iter().map(|u| u.0);
+            return match did_you_mean(name, names) {
+                Some(m) => (
+                    format!(
+                        "there's no {name}() — did you mean {}?",
+                        usage(m).map_or(format!("{m}()"), |u| u.1.to_string())
+                    ),
+                    at,
+                ),
+                None => (
+                    format!("there's no {name}() — type help to see every command"),
+                    at,
+                ),
+            };
+        }
+        // A series given as a value (`last(api)`): it needs to be its name, in quotes.
+        let takes_name = usage(name).is_some_and(|u| u.1.starts_with(&format!("{name}(\"")));
+        if takes_name && (args.starts_with("(f64") || args.starts_with("(i64")) {
+            let fix = series
+                .iter()
+                .find(|s| code.contains(&format!("{name}({}", ident(s))));
+            let example = match fix {
+                Some(s) => format!("{name}(\"{s}\")"),
+                None => usage(name).map_or(String::new(), |u| u.1.to_string()),
+            };
+            return (
+                format!("{name}() needs the series' name in quotes: {example}"),
+                at,
+            );
+        }
+        // Rhai's type names, as a person would say them.
+        let kinds: Vec<&str> = args
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .split(", ")
+            .filter(|a| !a.trim().is_empty())
+            .map(|a| match a.trim() {
+                t if t.contains("str") || t.contains("String") => "text",
+                "i64" | "f64" => "a number",
+                "bool" => "true/false",
+                t if t.contains("Array") => "a list",
+                "()" => "nothing",
+                _ => "something else",
+            })
+            .collect();
+        let given = match kinds.len() {
+            0 => "no arguments".to_string(),
+            _ => format!("({})", kinds.join(", ")),
+        };
+        return (format!("{name}() doesn't take {given}{}", how(name)), at);
+    }
+    if let Some(var) = msg.strip_prefix("Variable not found: ") {
+        let var = var.trim();
+        let idents: Vec<String> = series.iter().map(|s| ident(s)).collect();
+        let options = idents
+            .iter()
+            .map(String::as_str)
+            .chain(USAGE.iter().map(|u| u.0));
+        let hint = match did_you_mean(var, options) {
+            Some(m) if usage(m).is_some() => format!(" — did you mean {m}()?{}", how(m)),
+            Some(m) => format!(" — did you mean {m}?"),
+            None if series.is_empty() => String::new(),
+            None => format!(" — the series here are {}", quoted(series)),
+        };
+        return (
+            format!("there's no series or variable called {var}{hint}"),
+            at,
+        );
+    }
+    // A number with letters it doesn't know (`5x`): units it does know, or a string.
+    if let Some(i) = at {
+        let chars: Vec<char> = code.chars().collect();
+        let word = |c: char| c.is_alphanumeric() || c == '.';
+        let mut start = i.min(chars.len());
+        while start > 0 && word(chars[start - 1]) {
+            start -= 1;
+        }
+        let token: String = chars[start..].iter().take_while(|c| word(**c)).collect();
+        if token.starts_with(|c: char| c.is_ascii_digit())
+            && token.contains(|c: char| c.is_alphabetic())
+        {
+            return (
+                format!(
+                    "{token} isn't a number graft understands — units it knows: ms s min h d w, \
+                     KB MB GB, % (or write it as text: \"{token}\")"
+                ),
+                Some(start),
+            );
+        }
+    }
+    if let Some(f) = msg
+        .strip_prefix("Expecting ')' to close the arguments list of this function call '")
+        .and_then(|r| r.strip_suffix('\''))
+    {
+        return (format!("{f}( is missing its closing ){}", how(f)), at);
+    }
+    if let Some(f) = msg
+        .strip_prefix("Expecting ',' to separate the arguments to function call '")
+        .and_then(|r| r.strip_suffix('\''))
+    {
+        return (format!("{f}(…): expected a , or ) here{}", how(f)), at);
+    }
+    if msg.starts_with("Unterminated string") || msg.contains("Open string is not terminated") {
+        return ("a \" is missing: text goes between two quotes".into(), at);
+    }
+    // Ours already say what's wrong (unknown series 'apu' …): add a did-you-mean.
+    if let Some(name) = msg
+        .strip_prefix("unknown series '")
+        .and_then(|r| r.split_once('\''))
+        .map(|r| r.0)
+    {
+        let hint = did_you_mean(name, series.iter().map(String::as_str)).map_or(
+            format!(" — the series here are {}", quoted(series)),
+            |m| format!(" — did you mean \"{m}\"?"),
+        );
+        return (format!("there's no series called \"{name}\"{hint}"), at);
+    }
+    // A rule that isn't a condition.
+    if let Some(t) = msg
+        .strip_prefix("returned ")
+        .and_then(|r| r.strip_suffix(", expected true/false"))
+    {
+        let what = match t {
+            "f64" | "i64" => "a number",
+            "string" | "ImmutableString" => "text",
+            "()" => "nothing",
+            _ => t,
+        };
+        return (
+            format!(
+                "it gives {what}, but this needs a condition (true or false), e.g. value > 60ms"
+            ),
+            at,
+        );
+    }
+    // Ours start with the function's name: add how to call it.
+    let first: String = msg
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    // (Unless it already lists what's allowed.)
+    if usage(&first).is_some() && !msg.contains("e.g.") && !msg.contains(" — ") {
+        return (format!("{msg}{}", how(&first)), at);
+    }
+    (msg, at)
 }
 
 fn dyn_to_f64(d: &Dynamic) -> Option<f64> {
@@ -533,6 +1334,10 @@ impl ScriptHost {
         let mut st = self.state.borrow_mut();
         st.data = data;
         st.view = view;
+    }
+
+    pub fn set_cursor(&self, x: Option<f64>) {
+        self.state.borrow_mut().cursor = x;
     }
 
     pub fn take_actions(&self) -> Vec<Action> {
@@ -752,10 +1557,33 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
         },
     );
 
-    // slope per duration: slope("node1", "1d")
+    // at(name): the value at the cursor (the point nearest it), else the newest.
     let st = state.clone();
-    engine.register_fn("slope", move |name: &str, per: &str| -> FnResult<f64> {
-        let per = crate::time::parse_duration_secs(per).map_err(|e| e.to_string())?;
+    engine.register_fn("at", move |name: &str| -> FnResult<f64> {
+        let cursor = st.borrow().cursor;
+        let pts = points(&st, name)?.points;
+        let p = match cursor {
+            Some(x) => {
+                let i = pts.partition_point(|p| p.0 < x);
+                [i.checked_sub(1), Some(i)]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|i| pts.get(i))
+                    .min_by(|a, b| (a.0 - x).abs().total_cmp(&(b.0 - x).abs()))
+            }
+            None => pts.last(),
+        };
+        p.map(|p| p.1)
+            .ok_or_else(|| format!("series '{name}' has no points in view").into())
+    });
+
+    // slope per duration: slope("node1", "1d") or slope("node1", 1d)
+    let st = state.clone();
+    engine.register_fn("slope", move |name: &str, per: Dynamic| -> FnResult<f64> {
+        let per = match per.clone().into_immutable_string() {
+            Ok(p) => crate::time::parse_duration_secs(&p).map_err(|e| e.to_string())?,
+            Err(_) => dyn_to_f64(&per).ok_or("slope's second argument is a duration: \"1h\"")?,
+        };
         Ok(stats(&st, name)?.slope * per)
     });
 
@@ -1217,6 +2045,67 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every console function has a usage line (for errors and hints) and a place in
+    /// the `help` list.
+    #[test]
+    fn every_function_has_usage_and_a_group() {
+        let src = include_str!("script.rs");
+        let names = |re: &str| -> Vec<String> {
+            Regex::new(re)
+                .unwrap()
+                .captures_iter(src)
+                .map(|c| c[1].to_string())
+                .collect()
+        };
+        let mut all = names(r#"register_fn\(\s*"([a-z_0-9]+)""#);
+        all.extend(names(r#"\("([a-z_0-9]+)", (?:\|s\||false|true)"#));
+        all.extend(FLAGS.iter().map(|f| f.0.to_string()));
+        all.extend(["range".to_string(), "timeframe".to_string()]);
+        for n in &all {
+            assert!(usage(n).is_some(), "{n}() needs a line in USAGE");
+            let groups = GROUPS.iter().filter(|g| g.1.contains(&n.as_str())).count();
+            assert!(
+                n == "help" || groups == 1,
+                "{n}() is in {groups} GROUPS (needs 1)"
+            );
+        }
+        for u in USAGE {
+            assert!(
+                all.iter().any(|n| n == u.0),
+                "USAGE has {} but there's no such function",
+                u.0
+            );
+        }
+    }
+
+    #[test]
+    fn completions() {
+        let s: Vec<String> = ["web", "api", "db"].iter().map(|s| s.to_string()).collect();
+        let items = |t: &str| -> Vec<String> {
+            complete(t, t.chars().count(), &s)
+                .items
+                .into_iter()
+                .map(|i| i.insert)
+                .collect()
+        };
+        assert_eq!(items("und"), ["undo()"]);
+        assert_eq!(items("perc")[0], "percentile(\"");
+        assert_eq!(items("zoom_"), ["zoom_in()", "zoom_out()"]);
+        assert_eq!(items("ap"), ["api"]);
+        assert_eq!(items("last(\"")[..3], ["web\"", "api\"", "db\""]);
+        assert_eq!(items("only(\"web\", \"a"), ["api\""]);
+        assert_eq!(items("last("), ["\"web\"", "\"api\"", "\"db\""]);
+        assert_eq!(items("notify_to(\"n"), ["ntfy:"]);
+        assert!(
+            items("title(\"").is_empty(),
+            "free text: nothing to suggest"
+        );
+        assert!(items("5").is_empty());
+        let c = complete("slope(\"api\", ", 13, &s);
+        assert_eq!(c.signature.map(|s| s.0), Some(r#"slope("api", "1h")"#));
+    }
+
     use super::*;
     use crate::data::{Series, XKind};
     use crate::units::Dim;

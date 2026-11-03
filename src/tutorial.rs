@@ -153,8 +153,12 @@ graft works the same with a mouse, a keyboard or a phone over ssh: tap where you
             ("Esc", "let go of the cursor"),
         ],
         examples: &[
-            (r#":last("api")"#, "the newest value, in the console"),
-            (r#":max("db")"#, "the biggest value on screen"),
+            (r#":at("api")"#, "the value at the cursor, in the console"),
+            (
+                r#":last("api")"#,
+                "the newest value (not the cursor's: it says which)",
+            ),
+            (r#":max("db")"#, "the biggest value on screen, and when"),
         ],
         task: Some("tap the chart (or press c), then try , and ."),
         check: Check::Cursor,
@@ -168,7 +172,7 @@ graft works the same with a mouse, a keyboard or a phone over ssh: tap where you
             ("+ − / ↑ ↓", "zoom in / out"),
             ("◀ ▶ / ← → / h l", "move along (when zoomed in)"),
             ("H L", "move half a screen"),
-            ("show all / 0 / r", "everything again"),
+            ("show all / 0", "everything again"),
         ],
         examples: &[
             (r#":zoom("5m")"#, "just the last 5 minutes"),
@@ -271,7 +275,7 @@ Each uses the last N points, the window (10% of the data, at least 10). With any
         text: r#"The timeframe is the part of the data that counts: the chart, stats, trends and forecasts all use it. Unlike zooming it's a setting, kept when you save the chart. The rest of the data is still there: all time brings it back."#,
         keys: &[
             (
-                "R / all time ▾",
+                "r / all time ▾",
                 "the timeframe menu: last 5m, 1h, 1d… or custom",
             ),
             ("[ ]", "a narrower / wider timeframe"),
@@ -294,7 +298,7 @@ Each uses the last N points, the window (10% of the data, at least 10). With any
                 "different: only keep 10 minutes in memory (long runs)",
             ),
         ],
-        task: Some("tap all time ▾ (or press R) and pick last 5m"),
+        task: Some("tap all time ▾ (or press r) and pick last 5m"),
         check: Check::Timeframe,
         ..BASE
     },
@@ -366,11 +370,14 @@ api is slowly getting slower here. Give it a target and the stats say when it ge
     },
     Step {
         title: "the console",
-        text: r#"The console runs Rhai, a small scripting language. Series names are variables holding their latest value, units work in numbers (50ms, 2GB, 1h, 5%), and every button has a command. Type help in it for the list."#,
+        text: r#"The console runs Rhai, a small scripting language. Series names are variables holding their latest value, units work in numbers (50ms, 2GB, 1h, 5%), and every button has a command.
+As you type, the row above suggests commands, series names inside quotes, and how the call you're in is used: Tab (or a tap) puts one in. Answers come in the series' unit and say which point they're from. A mistake is explained, with a fix, and the console stays open on it."#,
         keys: &[
             (":", "open the console"),
+            ("Tab  Shift+Tab", "complete: the next / previous suggestion"),
             ("Enter  Esc", "run / close"),
             ("↑ ↓", "earlier commands"),
+            ("help", "every command at once: tap one to use it"),
         ],
         examples: &[
             (":api - web", "the difference of the latest values"),
