@@ -102,6 +102,11 @@ pub struct ChartOpts {
 
     /// Draw explicit target lines.
     pub show_targets: bool,
+
+    /// No box around charts: the title is a header line (and panes get thin dividers).
+    pub frameless: bool,
+    /// Short titles: no [log]/[forecast] tags, panes don't repeat the chart's title.
+    pub tidy: bool,
 }
 
 impl Default for ChartOpts {
@@ -129,6 +134,8 @@ impl Default for ChartOpts {
             panes: None,
             marks: Vec::new(),
             show_targets: true,
+            frameless: false,
+            tidy: false,
         }
     }
 }
@@ -940,14 +947,24 @@ impl<'a> ChartWidget<'a> {
             format!(" {text} "),
             Style::default().add_modifier(Modifier::BOLD),
         )];
-        if self.opts.log {
+        if self.opts.log && !self.opts.tidy {
             title.push(Span::styled("[log] ", Style::default().fg(Color::DarkGray)));
         }
-        if self.opts.forecast.is_some() {
+        if self.opts.forecast.is_some() && !self.opts.tidy {
             title.push(Span::styled(
                 "[forecast] ",
                 Style::default().fg(Color::DarkGray),
             ));
+        }
+        if self.opts.frameless {
+            // Just the title, as a header line over the chart.
+            title[0] = Span::styled(
+                text.to_string(),
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::BOLD),
+            );
+            return Block::new().title(Line::from(title));
         }
         Block::bordered()
             .border_style(Style::default().fg(Color::DarkGray))
@@ -1638,17 +1655,12 @@ impl<'a> ChartWidget<'a> {
         }
         let (lo, hi) = min_max(values.iter().copied()).unwrap_or((0.0, 1.0));
         let title = format!(
-            " {} · distribution of {} · n={} ",
+            "{} · distribution of {} · n={}",
             self.opts.title,
             s.name,
             values.len()
         );
-        let block = Block::bordered()
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(Span::styled(
-                title,
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
+        let block = self.block_titled(&title);
         let inner = block.inner(area);
         block.render(area, buf);
         if inner.height < 3 || inner.width < 10 {
@@ -2257,7 +2269,11 @@ pub fn pane_view(ds: &Dataset, opts: &ChartOpts, pane: &panes::Pane) -> (Dataset
     }
     if !parts.is_empty() {
         // What this pane shows comes first: narrow panes cut the title short.
-        sub.title = format!("{} · {}", parts.join(" · "), opts.title);
+        sub.title = if opts.tidy {
+            parts.join(" · ")
+        } else {
+            format!("{} · {}", parts.join(" · "), opts.title)
+        };
     }
     (data, sub)
 }
@@ -2314,6 +2330,32 @@ impl ChartWidget<'_> {
     fn render_panes(&self, p: &panes::Panes, area: Rect, buf: &mut Buffer) {
         for (id, rect) in p.rects(area) {
             let pane = &p.panes[id];
+            // Without frames, a thin line on the right and bottom keeps panes apart.
+            let rect = if self.opts.frameless && p.count() > 1 {
+                let dim = Style::default().fg(Color::Indexed(238));
+                let right = rect.right() < area.right();
+                let bottom = rect.bottom() < area.bottom();
+                if right {
+                    for y in rect.y..rect.bottom() {
+                        buf.set_string(rect.right() - 1, y, "│", dim);
+                    }
+                }
+                if bottom {
+                    for x in rect.x..rect.right() {
+                        buf.set_string(x, rect.bottom() - 1, "─", dim);
+                    }
+                }
+                if right && bottom {
+                    buf.set_string(rect.right() - 1, rect.bottom() - 1, "┼", dim);
+                }
+                Rect {
+                    width: rect.width - u16::from(right) * 2,
+                    height: rect.height - u16::from(bottom),
+                    ..rect
+                }
+            } else {
+                rect
+            };
             match &pane.source {
                 None => {
                     let (ds, opts) = pane_view(self.ds, self.opts, pane);
@@ -2322,7 +2364,18 @@ impl ChartWidget<'_> {
                 Some(name) => self.render_source_pane(name, pane, rect, buf),
             }
             if p.count() > 1 && self.overlay.pane_focus == Some(id) {
-                outline(rect, buf, Color::Yellow);
+                if self.opts.frameless {
+                    // No frame to colour: the title (the header line) turns yellow.
+                    for x in rect.x..rect.right() {
+                        if let Some(cell) = buf.cell_mut((x, rect.y))
+                            && cell.symbol() != " "
+                        {
+                            cell.set_fg(Color::Yellow);
+                        }
+                    }
+                } else {
+                    outline(rect, buf, Color::Yellow);
+                }
             }
         }
     }
@@ -2363,6 +2416,13 @@ impl ChartWidget<'_> {
             forecast: self.opts.forecast,
             split: self.opts.split,
             log: self.opts.log,
+            frameless: self.opts.frameless,
+            tidy: self.opts.tidy,
+            legend: if self.opts.legend == LegendPos::None {
+                LegendPos::None
+            } else {
+                src.opts.legend
+            },
             ..src.opts.clone()
         };
         let (ds, opts) = pane_view(&src.ds, &base, pane);

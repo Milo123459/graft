@@ -127,6 +127,39 @@ pub fn render_buttons<T: Clone>(
     }
 }
 
+/// Like `render_buttons`, in quieter colours: dark backgrounds, the active ones in
+/// bold cyan rather than inverted (the prototype layouts).
+pub fn render_buttons_quiet<T: Clone>(
+    buttons: &[Button<T>],
+    area: Rect,
+    buf: &mut Buffer,
+    hits: &Hits<T>,
+) {
+    let (rects, _) = flow(buttons, area.width);
+    for (b, r) in buttons.iter().zip(rects) {
+        if r.y >= area.height {
+            break;
+        }
+        let rect = Rect {
+            x: area.x + r.x,
+            y: area.y + r.y,
+            ..r
+        };
+        let style = if b.active {
+            Style::default()
+                .fg(Color::Indexed(81))
+                .bg(Color::Indexed(238))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::Indexed(250))
+                .bg(Color::Indexed(236))
+        };
+        Line::from(Span::styled(format!(" {} ", b.label), style)).render(rect, buf);
+        hits.push(rect, b.action.clone());
+    }
+}
+
 /// A row of labels and buttons for a panel.
 pub enum Item<T> {
     Label(String),

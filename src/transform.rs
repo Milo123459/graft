@@ -297,7 +297,7 @@ pub fn timeframe_presets(ds: &Dataset) -> Vec<Window> {
 }
 
 /// Evaluate a derived series at every x where its inputs line up.
-fn derive(ds: &Dataset, d: &Derived, script: &ScriptHost) -> Series {
+pub(crate) fn derive(ds: &Dataset, d: &Derived, script: &ScriptHost) -> Series {
     let mut rows: BTreeMap<u64, (f64, Vec<(String, f64)>)> = BTreeMap::new();
     for s in &ds.series {
         let var = ident(&s.name);

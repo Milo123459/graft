@@ -95,6 +95,26 @@ fn evaluate(
         return Ok(None);
     }
     host.set_data(ds.clone(), None);
+    // `user + sys`: series used by name are worked out point by point (like --series).
+    if uses_series_by_name(&line.expr, ds) {
+        let unit = line.unit.as_ref().map(|u| {
+            crate::units::lookup_unit(u, binary).map_or_else(
+                || Unit::new(crate::units::Dim::Other(u.clone())),
+                |(dim, _)| Unit::new(dim),
+            )
+        });
+        let d = crate::transform::Derived {
+            name: line.name.clone(),
+            source: line.expr.clone(),
+            ast: host.compile_expr(&line.expr)?,
+            unit,
+        };
+        let s = crate::transform::derive(ds, &d, host);
+        if s.points.is_empty() {
+            bail!("it gave no numbers — e.g. user + sys, or api - mean(\"api\")");
+        }
+        return Ok(Some(s));
+    }
     let result = host.eval(&line.expr)?;
     let base = base_series(line, ds, &result);
     let points = to_points(&result, base)?;
@@ -110,6 +130,22 @@ fn evaluate(
         unit,
         points,
     }))
+}
+
+/// Whether `expr` uses a series as a variable (`user + sys`), outside of text.
+fn uses_series_by_name(expr: &str, ds: &Dataset) -> bool {
+    static TEXT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#""(?:[^"\\]|\\.)*"|`[^`]*`"#).expect("valid")
+    });
+    let code = TEXT.replace_all(expr, "\"\"");
+    ds.series.iter().any(|s| {
+        let id = crate::script::ident(&s.name);
+        regex::Regex::new(&format!(
+            r"(?:^|[^A-Za-z0-9_]){}(?:$|[^A-Za-z0-9_(])",
+            regex::escape(&id)
+        ))
+        .is_ok_and(|re| re.is_match(&code))
+    })
 }
 
 /// The series a line's values belong to: of the series the expression names (those in
@@ -297,5 +333,25 @@ mod tests {
             "ema30:USD = ema(values(\"ETH\"), 30)"
         );
         assert!(CustomLine::parse("no equals").is_err());
+    }
+
+    #[test]
+    fn series_by_name_work_point_by_point() {
+        let host = ScriptHost::new(None, false).unwrap();
+        let mut d = ds();
+        let lines: Vec<CustomLine> = [
+            "double = ETH * 2",
+            "above = ETH - mean(\"ETH\")",
+            "flat = mean(\"ETH\")",
+        ]
+        .iter()
+        .map(|s| CustomLine::parse(s).unwrap())
+        .collect();
+        assert!(apply(&host, &lines, &mut d, false).is_empty());
+        let get = |n: &str| d.series.iter().find(|s| s.name == n).unwrap().clone();
+        assert_eq!(get("double").points.len(), 10);
+        assert_eq!(get("double").points[3], (3.0, 206.0));
+        assert_eq!(get("above").points[0], (0.0, -4.5));
+        assert!(get("flat").points.iter().all(|p| p.1 == 104.5));
     }
 }

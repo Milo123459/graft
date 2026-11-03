@@ -193,7 +193,12 @@ graft -c 'curl -s https://api.coinbase.com/v2/prices/ETH-USD/spot' -n 1s \
   --line 'ema30 = ema(values("ETH"), 30)'
 ```
 
-`--line 'NAME[:UNIT] = EXPR'` (repeatable). The expression returns an array
+Using series by name works point by point, like `--series`:
+`--line 'total = user + sys'` (or `:add_line("total", "user + sys")` in the
+viewer) adds the two at every moment; `--line 'above = api - mean("api")'` mixes in
+whole-series functions.
+
+`--line 'NAME[:UNIT] = EXPR'` (repeatable). Otherwise the expression returns an array
 (one value per point of the series it names; a shorter one lines up with the
 newest points), `[x, y]` pairs, or a number for a flat line. Built in:
 `ema(a, n)`, `sma(a, n)`, `values(name)`, `xs(name)`, `values_at(name, xs)`

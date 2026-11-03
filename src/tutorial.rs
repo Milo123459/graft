@@ -460,6 +460,10 @@ The database spikes now and then: mark it."#,
         )],
         examples: &[
             (
+                "--line 'total = web + api'",
+                "series by name are worked out at each point in time",
+            ),
+            (
                 r#"--line 'smooth = ema(values("api"), 30)'"#,
                 "an exponential moving average",
             ),

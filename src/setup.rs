@@ -241,5 +241,7 @@ pub fn chart_opts(cli: &Cli, spec: &SourceSpec, analysis: Analysis) -> Result<Ch
             .map(Horizon::parse)
             .transpose()
             .context("--forecast")?,
+        frameless: false,
+        tidy: false,
     })
 }

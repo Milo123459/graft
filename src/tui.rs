@@ -216,6 +216,27 @@ enum Hit {
     MenuBackground,
 }
 
+/// Which layout to draw (a prototype setting: `GRAFT_UI=compact`, `minimal`,
+/// `sidebar`; anything else is the classic one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiStyle {
+    Classic,
+    Compact,
+    Minimal,
+    Sidebar,
+}
+
+impl UiStyle {
+    fn from_env() -> Self {
+        match std::env::var("GRAFT_UI").as_deref() {
+            Ok("compact") => Self::Compact,
+            Ok("minimal") => Self::Minimal,
+            Ok("sidebar") => Self::Sidebar,
+            _ => Self::Classic,
+        }
+    }
+}
+
 /// Tab completion in progress.
 #[derive(Debug, Clone)]
 struct TabCycle {
@@ -446,6 +467,8 @@ pub struct App {
     pane_menu: bool,
     /// Text to put on the clipboard (written to the terminal by the event loop).
     clipboard: Option<String>,
+    /// The layout (prototypes).
+    pub ui: UiStyle,
     /// The sources menu is open.
     sources_menu: bool,
     /// The source the builder is to edit: `Some(None)` is a new one.
@@ -573,6 +596,7 @@ impl App {
             tutorial,
             console_note: None,
             sources_menu: false,
+            ui: UiStyle::from_env(),
             source_to_edit: None,
             error_at: None,
             tab_cycle: None,
@@ -3285,6 +3309,383 @@ impl App {
         });
     }
 
+    // ───────────── layout prototypes (GRAFT_UI) ─────────────
+
+    /// The chart options as this layout draws them.
+    fn view_opts(&self) -> ChartOpts {
+        let mut o = self.opts.clone();
+        if self.ui != UiStyle::Classic {
+            o.tidy = true;
+            o.legend = crate::cli::LegendPos::None;
+        }
+        o.frameless = self.ui == UiStyle::Minimal;
+        o
+    }
+
+    /// The short toolbar: what's used most, zoom controls only while zoomed in,
+    /// everything else under ⋯.
+    fn compact_toolbar(&self) -> Vec<Button<Hit>> {
+        let full = self.toolbar_with(true);
+        let pick = |c: Cmd| full.iter().find(|b| b.action == Hit::Cmd(c)).cloned();
+        let mut v: Vec<Button<Hit>> = Vec::new();
+        if self.view.is_some() {
+            v.extend(
+                [Cmd::PanLeft, Cmd::PanRight, Cmd::Reset]
+                    .into_iter()
+                    .filter_map(pick),
+            );
+        }
+        v.extend(
+            [
+                Cmd::Undo,
+                Cmd::Trend,
+                Cmd::RangeMenu,
+                Cmd::Stats,
+                Cmd::Panes,
+                Cmd::Sources,
+            ]
+            .into_iter()
+            .filter_map(pick),
+        );
+        // Markers and alerts, once there are some.
+        if self.mark_rows() > 0 {
+            v.extend(pick(Cmd::Markers));
+        }
+        if !self.alerts.is_empty() {
+            v.extend(pick(Cmd::Alerts));
+        }
+        if self.toolbar_more {
+            for b in &full {
+                if b.action != Hit::Cmd(Cmd::More) && !v.iter().any(|x| x.action == b.action) {
+                    v.push(b.clone());
+                }
+            }
+        }
+        v.push(
+            Button::new(
+                if self.toolbar_more { "less" } else { "⋯" },
+                Hit::Cmd(Cmd::More),
+            )
+            .active(self.toolbar_more),
+        );
+        v
+    }
+
+    /// The series as the legend shows them: (chip index, name, colour, value, shown).
+    fn legend_items(&self) -> Vec<(usize, String, Color, Option<String>, bool)> {
+        let ds = match self.focused_pane().and_then(|p| p.source.as_ref()) {
+            Some(src) => self
+                .sub_views
+                .iter()
+                .find(|v| &v.name == src)
+                .map_or(&self.ds, |v| &v.ds),
+            None => &self.ds,
+        };
+        self.chips()
+            .iter()
+            .enumerate()
+            .map(|(i, chip)| {
+                let name = chip.label.split_once(' ').map_or("", |p| p.1).to_string();
+                let value = ds.series.iter().find(|s| s.name == name).and_then(|s| {
+                    let y = match self.cursor {
+                        Some(c) => value_at(s, &self.opts, c).map(|v| v.0),
+                        None => s.points.last().map(|p| p.1),
+                    }?;
+                    Some(s.unit.format(y))
+                });
+                (i, name, self.opts.color(i), value, chip.active)
+            })
+            .collect()
+    }
+
+    /// The legend row's pieces: groups of (text, style) kept on one line, each with
+    /// what tapping it does.
+    #[allow(clippy::type_complexity)]
+    fn legend_groups(&self) -> Vec<(Vec<(String, Style)>, Option<Hit>)> {
+        let mut g: Vec<(Vec<(String, Style)>, Option<Hit>)> = Vec::new();
+        let (dot, style) = if self.paused {
+            ("⏸", Style::default().fg(Color::Yellow))
+        } else if self.live.spec.is_live() && !self.live.eof {
+            ("●", Style::default().fg(Color::Green))
+        } else {
+            ("■", Style::default().fg(Color::DarkGray))
+        };
+        let mut head = vec![(format!("{dot} "), style)];
+        let time = match self.cursor {
+            Some(c) => Some((
+                self.ds.fmt_x(crate::render::round_x(&self.ds, c), 1.0),
+                Color::Yellow,
+            )),
+            None => self
+                .ds
+                .x_range()
+                .map(|r| (self.ds.fmt_x(r.1, 1.0), Color::Gray)),
+        };
+        if let Some((t, c)) = time {
+            head.push((t, Style::default().fg(c).add_modifier(Modifier::BOLD)));
+        }
+        g.push((head, None));
+        if !self.firing.is_empty() {
+            g.push((
+                vec![(
+                    format!(" ALERT ({}) ", self.firing.len()),
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(Color::Red)
+                        .add_modifier(Modifier::BOLD),
+                )],
+                Some(Hit::Cmd(Cmd::Alerts)),
+            ));
+        }
+        for (i, name, color, value, shown) in self.legend_items() {
+            let mut parts = vec![(
+                if shown { "● " } else { "○ " }.to_string(),
+                Style::default().fg(color),
+            )];
+            parts.push((
+                name,
+                if shown {
+                    Style::default().fg(Color::White)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ));
+            if shown && let Some(v) = value {
+                parts.push((format!(" {v}"), Style::default().fg(color)));
+            }
+            g.push((parts, Some(Hit::Series(i))));
+        }
+        if let Some(m) = self
+            .message
+            .as_ref()
+            .filter(|m| m.at.elapsed() < Duration::from_secs(8) || m.error)
+        {
+            let style = if m.error {
+                Style::default().fg(Color::LightRed)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            g.push((vec![(m.text.clone(), style)], None));
+        }
+        g
+    }
+
+    /// Where each legend group goes: (row, column) per group, and the rows used.
+    fn legend_layout(&self, width: u16, menu: bool) -> (Vec<Option<(u16, u16)>>, u16) {
+        let gap = 3;
+        let mut out = Vec::new();
+        let (mut row, mut x) = (0u16, 0u16);
+        for (k, (parts, _)) in self.legend_groups().iter().enumerate() {
+            let w: u16 = parts
+                .iter()
+                .map(|p| unicode_width::UnicodeWidthStr::width(p.0.as_str()) as u16)
+                .sum();
+            // The first row leaves room for ☰.
+            let room = width.saturating_sub(if menu && row == 0 { 4 } else { 0 });
+            if x > 0 && x + w > room {
+                if row == 2 {
+                    out.push(None);
+                    continue;
+                }
+                row += 1;
+                x = 0;
+            }
+            let _ = k;
+            out.push(Some((row, x)));
+            x += w + gap;
+        }
+        (out, row + 1)
+    }
+
+    fn legend_height(&self, width: u16, menu: bool) -> u16 {
+        self.legend_layout(width, menu).1
+    }
+
+    /// Live/paused, the time (newest, or the cursor's), and each series with its
+    /// value: tap one to hide it. `menu`: a ☰ at the end of the first row.
+    fn draw_legend_row(&self, f: &mut Frame, area: Rect, menu: bool) {
+        let (places, _) = self.legend_layout(area.width, menu);
+        let buf = f.buffer_mut();
+        for ((parts, hit), place) in self.legend_groups().into_iter().zip(places) {
+            let Some((row, col)) = place else { continue };
+            let y = area.y + row;
+            if y >= area.bottom() {
+                continue;
+            }
+            let mut x = area.x + col;
+            let start = x;
+            for (text, style) in parts {
+                let room = area.right().saturating_sub(x) as usize;
+                let text: String = text.chars().take(room).collect();
+                buf.set_string(x, y, &text, style);
+                x += unicode_width::UnicodeWidthStr::width(text.as_str()) as u16;
+            }
+            if let Some(h) = hit {
+                self.hits.push(
+                    Rect {
+                        x: start,
+                        y,
+                        width: x - start,
+                        height: 1,
+                    },
+                    h,
+                );
+            }
+        }
+        if menu {
+            let r = Rect {
+                x: area.right().saturating_sub(3),
+                y: area.y,
+                width: 3,
+                height: 1,
+            };
+            let style = if self.toolbar_more {
+                Style::default()
+                    .fg(Color::Indexed(81))
+                    .bg(Color::Indexed(238))
+            } else {
+                Style::default()
+                    .fg(Color::Indexed(250))
+                    .bg(Color::Indexed(236))
+            };
+            buf.set_string(r.x, r.y, " ☰ ", style);
+            self.hits.push(r, Hit::Cmd(Cmd::More));
+        }
+    }
+
+    /// A column on the right: the time, the series with their values, the buttons.
+    fn draw_sidebar(&self, f: &mut Frame, area: Rect) {
+        let buf = f.buffer_mut();
+        let dim = Style::default().fg(Color::Indexed(238));
+        for y in area.y..area.bottom() {
+            buf.set_string(area.x, y, "│", dim);
+        }
+        let inner = Rect {
+            x: area.x + 2,
+            width: area.width.saturating_sub(3),
+            ..area
+        };
+        let mut y = inner.y;
+        let (dot, style, what) = if self.paused {
+            ("⏸ ", Style::default().fg(Color::Yellow), "paused")
+        } else if self.live.spec.is_live() && !self.live.eof {
+            ("● ", Style::default().fg(Color::Green), "live")
+        } else {
+            ("■ ", Style::default().fg(Color::DarkGray), "")
+        };
+        buf.set_string(inner.x, y, format!("{dot}{what}"), style);
+        y += 1;
+        let time = match self.cursor {
+            Some(c) => Some((
+                format!(
+                    "cursor {}",
+                    self.ds.fmt_x(crate::render::round_x(&self.ds, c), 1.0)
+                ),
+                Color::Yellow,
+            )),
+            None => self
+                .ds
+                .x_range()
+                .map(|r| (self.ds.fmt_x(r.1, 1.0), Color::Gray)),
+        };
+        if let Some((t, c)) = time {
+            buf.set_string(
+                inner.x,
+                y,
+                t,
+                Style::default().fg(c).add_modifier(Modifier::BOLD),
+            );
+        }
+        y += 2;
+        for (i, name, color, value, shown) in self.legend_items() {
+            if y + 1 >= inner.bottom() {
+                break;
+            }
+            let marker = if shown { "●" } else { "○" };
+            buf.set_string(inner.x, y, marker, Style::default().fg(color));
+            let name_style = if shown {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let name: String = name
+                .chars()
+                .take(inner.width.saturating_sub(2) as usize)
+                .collect();
+            buf.set_string(inner.x + 2, y, &name, name_style);
+            if shown && let Some(v) = value {
+                let w = unicode_width::UnicodeWidthStr::width(v.as_str()) as u16;
+                buf.set_string(
+                    inner.right().saturating_sub(w),
+                    y + 1,
+                    &v,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                );
+            }
+            self.hits.push(
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 2,
+                },
+                Hit::Series(i),
+            );
+            y += 2;
+        }
+        y += 1;
+        // The buttons, one per row.
+        let buttons = self.compact_toolbar();
+        let n = buttons.len() as u16;
+        let msg_rows = 3;
+        let start = y.max(inner.bottom().saturating_sub(n + msg_rows));
+        for (k, b) in buttons.iter().enumerate() {
+            let by = start + k as u16;
+            if by >= inner.bottom().saturating_sub(msg_rows) {
+                break;
+            }
+            let r = Rect {
+                x: inner.x,
+                y: by,
+                width: inner.width,
+                height: 1,
+            };
+            let style = if b.active {
+                Style::default()
+                    .fg(Color::Indexed(81))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Indexed(250))
+            };
+            buf.set_string(
+                r.x,
+                r.y,
+                format!("{:<w$}", b.label, w = r.width as usize),
+                style,
+            );
+            self.hits.push(r, b.action);
+        }
+        // Messages at the bottom.
+        if let Some(m) = self
+            .message
+            .as_ref()
+            .filter(|m| m.at.elapsed() < Duration::from_secs(8) || m.error)
+        {
+            let style = if m.error {
+                Style::default().fg(Color::LightRed)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            for (k, l) in wrap(&m.text, inner.width as usize)
+                .into_iter()
+                .take(msg_rows as usize)
+                .enumerate()
+            {
+                buf.set_string(inner.x, inner.bottom() - msg_rows + k as u16, l, style);
+            }
+        }
+    }
+
     // ───────────── sources menu ─────────────
 
     /// The merged sources, as (name, what it reads).
@@ -5132,6 +5533,11 @@ impl App {
     // ───────────── drawing ─────────────
 
     fn toolbar(&self) -> Vec<Button<Hit>> {
+        self.toolbar_with(self.toolbar_more)
+    }
+
+    /// The toolbar, with the buttons under ⋯ (`more`) or without.
+    fn toolbar_with(&self, more: bool) -> Vec<Button<Hit>> {
         let b = |l: &str, c: Cmd| Button::new(l, Hit::Cmd(c));
         let mut v = vec![
             b("◀", Cmd::PanLeft),
@@ -5203,10 +5609,8 @@ impl App {
                     .active(self.range_menu || !self.timeframe.is_all()),
             );
         }
-        v.push(
-            b(if self.toolbar_more { "less" } else { "⋯" }, Cmd::More).active(self.toolbar_more),
-        );
-        if self.toolbar_more {
+        v.push(b(if more { "less" } else { "⋯" }, Cmd::More).active(more));
+        if more {
             // Under ⋯ until there are some (then they're on the toolbar itself).
             if self.mark_rows() == 0 {
                 v.push(b("markers", Cmd::Markers).active(self.marks_menu.is_some()));
@@ -5274,6 +5678,20 @@ impl App {
         if tut_h > 0 {
             self.draw_tutorial(f, tut_area);
         }
+        // Prototype layouts: a sidebar on wide screens (else compact).
+        let sidebar = self.ui == UiStyle::Sidebar && area.width >= 90;
+        let ui = match self.ui {
+            UiStyle::Sidebar if !sidebar => UiStyle::Compact,
+            u => u,
+        };
+        let area = if sidebar {
+            let [main, side] =
+                Layout::horizontal([Constraint::Min(40), Constraint::Length(28)]).areas(area);
+            self.draw_sidebar(f, side);
+            main
+        } else {
+            area
+        };
         let n_stats = self
             .ds
             .series
@@ -5285,14 +5703,31 @@ impl App {
         } else {
             0
         };
-        let (chips, toolbar) = (self.chips(), self.toolbar());
+        let chips = self.chips();
+        let toolbar = match ui {
+            UiStyle::Classic => self.toolbar(),
+            UiStyle::Compact => self.compact_toolbar(),
+            UiStyle::Minimal if self.toolbar_more => self.compact_toolbar(),
+            _ => Vec::new(),
+        };
+        let toolbar: Vec<Button<Hit>> = if sidebar { Vec::new() } else { toolbar };
         let (chips_h, tool_h) = if self.mouse {
             (
-                flow_height(&chips, area.width).min(2),
+                if ui == UiStyle::Classic {
+                    flow_height(&chips, area.width).min(2)
+                } else {
+                    0
+                },
                 flow_height(&toolbar, area.width),
             )
         } else {
             (0, 0)
+        };
+        let status_h = match ui {
+            _ if sidebar => 0,
+            UiStyle::Classic => 1,
+            UiStyle::Minimal => self.legend_height(area.width, self.mouse),
+            _ => self.legend_height(area.width, false),
         };
         let (hint_line, hint_buttons) = self.hint_rows(area.width);
         let console_top = std::cell::Cell::new(area.bottom());
@@ -5318,7 +5753,7 @@ impl App {
             Constraint::Length(chips_h),
             Constraint::Length(tool_h),
             Constraint::Length(note_h),
-            Constraint::Length(1),
+            Constraint::Length(status_h),
             Constraint::Length(console_h),
         ])
         .areas(area);
@@ -5337,7 +5772,8 @@ impl App {
             sources: Some(&self.sub_views),
         };
         self.chart_rect.set(chart);
-        f.render_widget(ChartWidget::new(&self.ds, &self.opts, overlay), chart);
+        let opts = self.view_opts();
+        f.render_widget(ChartWidget::new(&self.ds, &opts, overlay), chart);
         if pane_h > 0 {
             self.draw_pane_panel(f, pane_area);
         }
@@ -5345,13 +5781,22 @@ impl App {
             self.draw_stats(f, stats);
         }
         if self.mouse {
-            self.draw_chips(&chips, chips_area, f);
-            render_buttons(&toolbar, tool_area, f.buffer_mut(), &self.hits);
+            if ui == UiStyle::Classic {
+                self.draw_chips(&chips, chips_area, f);
+                render_buttons(&toolbar, tool_area, f.buffer_mut(), &self.hits);
+            } else {
+                crate::ui::render_buttons_quiet(&toolbar, tool_area, f.buffer_mut(), &self.hits);
+            }
         }
         if note_h > 0 {
             f.render_widget(Paragraph::new(note), note_area);
         }
-        f.render_widget(Paragraph::new(self.status_line()), status);
+        match ui {
+            _ if sidebar => {}
+            UiStyle::Classic => f.render_widget(Paragraph::new(self.status_line()), status),
+            UiStyle::Minimal => self.draw_legend_row(f, status, self.mouse),
+            _ => self.draw_legend_row(f, status, false),
+        }
         if let Some(input) = &self.console {
             console_top.set(console.y);
             // Hints above the input line.
@@ -7922,6 +8367,19 @@ pub(crate) mod tests {
             "the status line says it's the cursor"
         );
         // `5m` is five minutes.
+        // A line from series by name is a real line, not a flat one.
+        run(&mut app, r#"add_line("total", "web + api")"#);
+        let total = app
+            .ds
+            .series
+            .iter()
+            .find(|s| s.name == "total")
+            .expect("total");
+        assert!(total.points.len() > 100);
+        assert!(
+            total.points.windows(2).any(|w| w[0].1 != w[1].1),
+            "it varies"
+        );
         run(&mut app, r#"zoom(5m)"#);
         assert!(app.view.is_some_and(|(a, b)| (b - a - 300.0).abs() < 1.0));
         // Mistakes: plain words, a fix, and the console stays open on the command.
@@ -8036,6 +8494,49 @@ pub(crate) mod tests {
         key(&mut app, KeyCode::Char('S'));
         shot(&app, "sources", 46, 30);
         shot(&app, "sources-wide", 110, 34);
+    }
+
+    #[test]
+    #[ignore]
+    fn write_ui_variants() {
+        let dir = std::env::var("GRAFT_SNAPSHOTS").unwrap();
+        let shot = |app: &App, name: &str, w: u16, h: u16| {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| app.draw(f)).unwrap();
+            let ans = crate::render::ansi::to_ansi(term.backend().buffer(), true);
+            std::fs::write(format!("{dir}/{name}.ans"), ans).unwrap();
+        };
+        for ui in [
+            UiStyle::Classic,
+            UiStyle::Compact,
+            UiStyle::Minimal,
+            UiStyle::Sidebar,
+        ] {
+            let tag = format!("{ui:?}").to_lowercase();
+            let mut app = tutorial_app();
+            app.tutorial = None;
+            app.ui = ui;
+            app.message = None;
+            shot(&app, &format!("{tag}-plain"), 110, 34);
+            shot(&app, &format!("{tag}-phone"), 46, 40);
+            key(&mut app, KeyCode::Char('s'));
+            run(&mut app, r#"lines("live,avg"); forecast("10m")"#);
+            app.console_note = None;
+            key(&mut app, KeyCode::Char('c'));
+            shot(&app, &format!("{tag}-busy"), 110, 34);
+            let mut app = tutorial_app();
+            app.tutorial = None;
+            app.ui = ui;
+            run(&mut app, r#"layout("(1 | 2) / (3 | 4)")"#);
+            run(&mut app, r#"focus_pane(1); pane("web,api kind=bar")"#);
+            run(&mut app, r#"focus_pane(2); pane("api lines=live,avg")"#);
+            run(&mut app, r#"focus_pane(3); pane("db kind=histogram")"#);
+            run(&mut app, r#"focus_pane(4); pane("web,api,db kind=stat")"#);
+            run(&mut app, "focus_pane(2)");
+            app.console_note = None;
+            app.message = None;
+            shot(&app, &format!("{tag}-panes"), 110, 34);
+        }
     }
 
     #[test]
