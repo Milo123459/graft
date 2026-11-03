@@ -138,14 +138,22 @@ fn uses_series_by_name(expr: &str, ds: &Dataset) -> bool {
         regex::Regex::new(r#""(?:[^"\\]|\\.)*"|`[^`]*`"#).expect("valid")
     });
     let code = TEXT.replace_all(expr, "\"\"");
-    ds.series.iter().any(|s| {
-        let id = crate::script::ident(&s.name);
-        regex::Regex::new(&format!(
-            r"(?:^|[^A-Za-z0-9_]){}(?:$|[^A-Za-z0-9_(])",
-            regex::escape(&id)
-        ))
-        .is_ok_and(|re| re.is_match(&code))
-    })
+    // The words used as names: not followed by `(` (a function call).
+    let mut words = std::collections::HashSet::new();
+    let mut rest = code.as_ref();
+    while let Some(start) = rest.find(|c: char| c.is_alphanumeric() || c == '_') {
+        let tail = &rest[start..];
+        let end = tail
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(tail.len());
+        if !tail[end..].starts_with('(') {
+            words.insert(&tail[..end]);
+        }
+        rest = &tail[end..];
+    }
+    ds.series
+        .iter()
+        .any(|s| words.contains(crate::script::ident(&s.name).as_str()))
 }
 
 /// The series a line's values belong to: of the series the expression names (those in
@@ -264,10 +272,64 @@ pub fn sma(values: &[f64], n: usize) -> Vec<f64> {
     out
 }
 
+/// Relative strength index with Wilder's smoothing: 0–100 (above 70 is often read
+/// as overbought, below 30 as oversold). The first n changes warm up as a plain average.
+pub fn rsi(values: &[f64], n: usize) -> Vec<f64> {
+    let n = n.max(1) as f64;
+    let (mut gain, mut loss) = (0.0, 0.0);
+    let mut out = Vec::with_capacity(values.len());
+    for (i, &v) in values.iter().enumerate() {
+        if i == 0 {
+            out.push(50.0);
+            continue;
+        }
+        let d = v - values[i - 1];
+        let (g, l) = (d.max(0.0), (-d).max(0.0));
+        if i as f64 <= n {
+            gain += g / n;
+            loss += l / n;
+        } else {
+            gain = (gain * (n - 1.0) + g) / n;
+            loss = (loss * (n - 1.0) + l) / n;
+        }
+        out.push(if loss == 0.0 {
+            100.0
+        } else {
+            100.0 - 100.0 / (1.0 + gain / loss)
+        });
+    }
+    out
+}
+
+/// MACD line: the 12-point EMA minus the 26-point EMA.
+pub fn macd(values: &[f64]) -> Vec<f64> {
+    let (fast, slow) = (ema(values, 12), ema(values, 26));
+    fast.iter().zip(&slow).map(|(a, b)| a - b).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::data::XKind;
+
+    #[test]
+    fn rsi_and_macd() {
+        let up: Vec<f64> = (0..40).map(f64::from).collect();
+        assert_eq!(rsi(&up, 14)[39], 100.0, "only gains");
+        let zigzag: Vec<f64> = (0..40)
+            .map(|i| if i % 2 == 0 { 1.0 } else { 2.0 })
+            .collect();
+        assert!(
+            (rsi(&zigzag, 14)[39] - 50.0).abs() < 5.0,
+            "even gains and losses"
+        );
+        let m = macd(&up);
+        assert_eq!(m.len(), 40);
+        assert!(
+            m[39] > 0.0,
+            "rising: the fast average is above the slow one"
+        );
+    }
 
     fn ds() -> Dataset {
         Dataset {

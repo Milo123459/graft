@@ -560,6 +560,16 @@ pub const USAGE: &[(&str, &str, &str)] = &[
         "simple moving average of an array",
     ),
     (
+        "rsi",
+        r#"rsi(values("api"), 14)"#,
+        "relative strength index, 0–100 (70 overbought, 30 oversold)",
+    ),
+    (
+        "macd",
+        r#"macd(values("api"))"#,
+        "MACD: 12-point EMA minus 26-point EMA (signal: ema(values(\"macd\"), 9))",
+    ),
+    (
         "mean_of",
         r#"mean_of(["web", "api"])"#,
         "several series averaged at each moment",
@@ -757,6 +767,8 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "series",
             "ema",
             "sma",
+            "rsi",
+            "macd",
             "mean_of",
         ],
     ),
@@ -1633,10 +1645,10 @@ impl ScriptHost {
     }
 
     /// Evaluate a compiled expression with the given variables, expecting a number.
-    pub fn eval_number(&self, ast: &AST, vars: &[(String, f64)]) -> Result<f64> {
+    pub fn eval_number<K: AsRef<str>>(&self, ast: &AST, vars: &[(K, f64)]) -> Result<f64> {
         let mut scope = Scope::new();
         for (k, v) in vars {
-            scope.push(k.as_str(), *v);
+            scope.push(k.as_ref(), *v);
         }
         let d: Dynamic = self
             .engine
@@ -1872,6 +1884,15 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
             return Err("ema(values, n): n must be at least 1".into());
         }
         Ok(to_array(crate::lines::ema(&floats(&a), n as usize)))
+    });
+    engine.register_fn("rsi", move |a: Array, n: i64| -> FnResult<Array> {
+        if n < 1 {
+            return Err("rsi(values, n): n must be at least 1".into());
+        }
+        Ok(to_array(crate::lines::rsi(&floats(&a), n as usize)))
+    });
+    engine.register_fn("macd", move |a: Array| -> FnResult<Array> {
+        Ok(to_array(crate::lines::macd(&floats(&a))))
     });
     engine.register_fn("sma", move |a: Array, n: i64| -> FnResult<Array> {
         if n < 1 {
@@ -2532,8 +2553,7 @@ rebind("a", b)"#;
         let h = ScriptHost::new(None, false).unwrap();
         let ast = h.compile_expr("a - b / 2").unwrap();
         assert_eq!(
-            h.eval_number(&ast, &[("a".into(), 10.0), ("b".into(), 4.0)])
-                .unwrap(),
+            h.eval_number(&ast, &[("a", 10.0), ("b", 4.0)]).unwrap(),
             8.0
         );
     }

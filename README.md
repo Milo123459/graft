@@ -201,7 +201,7 @@ whole-series functions.
 `--line 'NAME[:UNIT] = EXPR'` (repeatable). Otherwise the expression returns an array
 (one value per point of the series it names; a shorter one lines up with the
 newest points), `[x, y]` pairs, or a number for a flat line. Built in:
-`ema(a, n)`, `sma(a, n)`, `values(name)`, `xs(name)`, `values_at(name, xs)`
+`ema(a, n)`, `sma(a, n)`, `rsi(a, n)`, `macd(a)`, `values(name)`, `xs(name)`, `values_at(name, xs)`
 (another series at those times), and every console function (`mean`, `p95`,
 `slope`…). Functions from `--script` work too: `examples/indicators.rhai` has an
 EMA, Bollinger bands and a spread written in Rhai:
@@ -233,15 +233,14 @@ Hyperliquid's candles, polled every 5 s: **coin ▾** and **interval ▾** switc
 (one record per candle, `--json --time-field t`) and the same candles each time,
 so `--replace` updates the newest one instead of adding copies. The top pane is
 `kind=candles`: candlesticks from the open/high/low/close series (green closed up, red
-down; candles that share a column are merged), with the EMAs drawn over them. RSI and MACD come
-from [examples/indicators.rhai](examples/indicators.rhai); `hist = macd - signal`
+down; candles that share a column are merged), with the EMAs drawn over them. RSI and MACD are
+built in (`rsi(values("close"), 14)`, `macd(values("close"))`); `hist = macd - signal`
 would add the histogram (series by name are worked out at each point).
 
 ```sh
 graft -c 'curl -s --json "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"{coin}\",\"interval\":\"{interval}\",\"startTime\":{from_ms:500*{interval}},\"endTime\":{now_ms}}}" https://api.hyperliquid.xyz/info' \
   --param 'coin = ETH | BTC | SOL | HYPE' --param 'interval = 1m | 5m | 15m | 1h | 4h | 1d' \
   -n 5s --json --time-field t --replace \
-  --script examples/indicators.rhai \
   --series 'open:USD = o' --series 'high:USD = h' --series 'low:USD = l' --series 'close:USD = c' \
   --series 'volume:{coin} = v' --select open,high,low,close,volume \
   --line 'ema30 = ema(values("close"), 30)' --line 'ema50 = ema(values("close"), 50)' \

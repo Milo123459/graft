@@ -298,10 +298,50 @@ pub fn timeframe_presets(ds: &Dataset) -> Vec<Window> {
 
 /// Evaluate a derived series at every x where its inputs line up.
 pub(crate) fn derive(ds: &Dataset, d: &Derived, script: &ScriptHost) -> Series {
-    let mut rows: BTreeMap<u64, (f64, Vec<(String, f64)>)> = BTreeMap::new();
-    for s in &ds.series {
-        let var = ident(&s.name);
-        for &(x, y) in &s.points {
+    // The given unit, or a guess from the first series mentioned in the expression.
+    let unit = d.unit.clone().unwrap_or_else(|| {
+        ds.series
+            .iter()
+            .filter_map(|s| d.source.find(&ident(&s.name)).map(|pos| (pos, &s.unit)))
+            .min_by_key(|(pos, _)| *pos)
+            .map(|(_, u)| u.clone())
+            .unwrap_or_default()
+    });
+    let idents: Vec<String> = ds.series.iter().map(|s| ident(&s.name)).collect();
+    // Just another series' name (`open = o`): its points, no need to run anything.
+    let source = d.source.trim();
+    if let Some(k) = idents.iter().position(|id| id == source) {
+        return Series {
+            name: d.name.clone(),
+            unit,
+            points: ds.series[k]
+                .points
+                .iter()
+                .copied()
+                .filter(|p| p.1.is_finite())
+                .collect(),
+        };
+    }
+    // Only the series the expression mentions are lined up (all of them when it
+    // mentions none, e.g. a constant: it's worked out at every x).
+    let words: std::collections::HashSet<&str> = source
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let mentioned: Vec<usize> = (0..ds.series.len())
+        .filter(|&k| words.contains(idents[k].as_str()))
+        .collect();
+    let used: Vec<usize> = if mentioned.is_empty() {
+        (0..ds.series.len()).collect()
+    } else {
+        mentioned
+    };
+    // x (as an ordered key) → x and each series' value there.
+    type Row<'a> = (f64, Vec<(&'a str, f64)>);
+    let mut rows: BTreeMap<u64, Row> = BTreeMap::new();
+    for &k in &used {
+        let var = idents[k].as_str();
+        for &(x, y) in &ds.series[k].points {
             // Order-preserving key for non-negative and negative floats alike.
             let bits = x.to_bits();
             let key = if x.is_sign_negative() {
@@ -312,18 +352,9 @@ pub(crate) fn derive(ds: &Dataset, d: &Derived, script: &ScriptHost) -> Series {
             rows.entry(key)
                 .or_insert_with(|| (x, Vec::new()))
                 .1
-                .push((var.clone(), y));
+                .push((var, y));
         }
     }
-    // The given unit, or a guess from the first series mentioned in the expression.
-    let unit = d.unit.clone().unwrap_or_else(|| {
-        ds.series
-            .iter()
-            .filter_map(|s| d.source.find(&ident(&s.name)).map(|pos| (pos, &s.unit)))
-            .min_by_key(|(pos, _)| *pos)
-            .map(|(_, u)| u.clone())
-            .unwrap_or_default()
-    });
     let points = rows
         .into_values()
         .filter_map(|(x, vars)| {

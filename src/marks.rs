@@ -137,6 +137,18 @@ pub fn evaluate(host: &ScriptHost, rules: &[MarkRule], ds: &Dataset) -> (Vec<Mar
     (marks, errors)
 }
 
+/// The series a rule is limited to when it starts `name == "…" &&` (or is only that).
+fn only_series(expr: &str) -> Option<String> {
+    static ONLY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"^\s*name\s*==\s*"([^"\\]*)"\s*(&&|$)"#).expect("valid")
+    });
+    ONLY.captures(expr).map(|c| c[1].to_string())
+}
+
+/// A series as a rule's variables: its name, points, whether the rule uses its value
+/// now and before (and that one's name).
+type Var<'a> = (String, &'a [(f64, f64)], bool, bool, String);
+
 fn evaluate_rule(
     host: &ScriptHost,
     n: usize,
@@ -169,8 +181,37 @@ fn evaluate_rule(
         .collect();
     // `x_prev` is x at the previous point — unless a series is itself called `x_prev`.
     let idents: Vec<String> = named.iter().map(|(id, _)| id.clone()).collect();
+    // Only the series the rule mentions become variables (each is a lookup per point).
+    let words: std::collections::HashSet<&str> = rule
+        .expr
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let named: Vec<Var> = named
+        .into_iter()
+        .map(|(id, pts)| {
+            let prev_name = format!("{id}_prev");
+            let prev = words.contains(prev_name.as_str()) && !idents.contains(&prev_name);
+            (
+                id.clone(),
+                pts,
+                words.contains(id.as_str()),
+                prev,
+                prev_name,
+            )
+        })
+        .filter(|n| n.2 || n.3)
+        .collect();
+    // `name == "ema30" && …` only ever holds for that series: skip the others.
+    let only = only_series(&rule.expr);
     let mut placed = 0;
-    for s in &ds.series {
+    for s in ds
+        .series
+        .iter()
+        .filter(|s| only.as_ref().is_none_or(|n| *n == s.name))
+    {
+        let mut scope = Scope::new();
+        scope.push("name", s.name.clone());
         for (i, &(x, value)) in s.points.iter().enumerate() {
             let (px, prev) = if i > 0 { s.points[i - 1] } else { (x, value) };
             let delta = value - prev;
@@ -180,25 +221,25 @@ fn evaluate_rule(
                 0.0
             };
             let rate = if x > px { delta / (x - px) } else { 0.0 };
-            let mut scope = Scope::new();
-            scope.push("value", value);
-            scope.push("prev", prev);
-            scope.push("delta", delta);
-            scope.push("pct", pct);
-            scope.push("rate", rate);
-            scope.push("x", x);
-            scope.push("time", x);
-            scope.push("i", i as i64);
-            scope.push("name", s.name.clone());
-            scope.push("prev_time", px);
-            for (id, pts) in &named {
+            // One scope per series, its values updated in place for each point.
+            scope.set_or_push("value", value);
+            scope.set_or_push("prev", prev);
+            scope.set_or_push("delta", delta);
+            scope.set_or_push("pct", pct);
+            scope.set_or_push("rate", rate);
+            scope.set_or_push("x", x);
+            scope.set_or_push("time", x);
+            scope.set_or_push("i", i as i64);
+            scope.set_or_push("prev_time", px);
+            for (id, pts, now, before, prev_id) in &named {
                 let at = |x: f64| {
                     crate::render::interpolate(pts, x).map_or(Dynamic::UNIT, Dynamic::from_float)
                 };
-                scope.push_dynamic(id.as_str(), at(x));
-                let prev_name = format!("{id}_prev");
-                if !idents.contains(&prev_name) {
-                    scope.push_dynamic(prev_name, at(px));
+                if *now {
+                    scope.set_or_push(id.as_str(), at(x));
+                }
+                if *before {
+                    scope.set_or_push(prev_id.as_str(), at(px));
                 }
             }
             let hit: Dynamic = host

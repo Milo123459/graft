@@ -510,6 +510,8 @@ pub struct App {
     mark_rules: Vec<crate::marks::MarkRule>,
     /// The source settings the chart was built with (lines and markers saw these).
     built_params: Vec<crate::params::Param>,
+    /// The legend's rows so far, for the width they were for.
+    legend_rows: std::cell::Cell<(u16, u16)>,
     /// Markers placed by hand with `mark("…")`.
     manual_marks: Vec<crate::render::Mark>,
     /// The markers menu is open, with this row picked.
@@ -581,6 +583,7 @@ impl App {
         let mut app = Self {
             alerts: cli.with_params().alert,
             built_params: crate::params::parse_all(&cli.param),
+            legend_rows: std::cell::Cell::new((0, 0)),
             show_stats: cli.stats,
             mouse: !cli.no_mouse,
             cli,
@@ -3698,19 +3701,40 @@ impl App {
                 None,
             ));
         }
-        if let Some(m) = self
+        g
+    }
+
+    /// The latest message, on the chart's bottom edge (right-aligned) so it never
+    /// moves anything: errors stay until the next one, others for 8 seconds.
+    fn draw_message(&self, f: &mut Frame, chart: Rect) {
+        let Some(m) = self
             .message
             .as_ref()
             .filter(|m| m.at.elapsed() < Duration::from_secs(8) || m.error)
-        {
-            let style = if m.error {
-                Style::default().fg(Color::LightRed)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            g.push((vec![(m.text.clone(), style)], None));
+        else {
+            return;
+        };
+        if chart.height == 0 || chart.width < 6 {
+            return;
         }
-        g
+        let style = if m.error {
+            Style::default().fg(Color::LightRed)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let room = chart.width.saturating_sub(4) as usize;
+        let mut text: String = format!(" {} ", m.text);
+        if unicode_width::UnicodeWidthStr::width(text.as_str()) > room {
+            text = text
+                .chars()
+                .take(room.saturating_sub(2))
+                .collect::<String>()
+                + "… ";
+        }
+        let w = unicode_width::UnicodeWidthStr::width(text.as_str()) as u16;
+        let x = chart.right().saturating_sub(w + 2);
+        f.buffer_mut()
+            .set_string(x, chart.bottom() - 1, &text, style);
     }
 
     /// Where each legend group goes: (row, column) per group, and the rows used.
@@ -3739,8 +3763,14 @@ impl App {
         (out, row + 1)
     }
 
+    /// The legend's rows: only grows (for a width), so values changing length don't
+    /// make the chart jump by a row.
     fn legend_height(&self, width: u16) -> u16 {
-        self.legend_layout(width).1
+        let rows = self.legend_layout(width).1;
+        let (w, before) = self.legend_rows.get();
+        let rows = if w == width { rows.max(before) } else { rows };
+        self.legend_rows.set((width, rows));
+        rows
     }
 
     /// Live/paused, the time (newest, or the cursor's), and each series with its
@@ -6748,6 +6778,7 @@ impl App {
             f.render_widget(Paragraph::new(note), note_area);
         }
         self.draw_legend_row(f, status);
+        self.draw_message(f, chart);
         if let Some(input) = &self.console {
             console_top.set(console.y);
             // Hints above the input line.
@@ -8388,7 +8419,7 @@ pub(crate) mod tests {
         type_str(&mut app, r#"load("examples/indicators.rhai")"#);
         key(&mut app, KeyCode::Enter);
         assert!(
-            app.message.as_ref().unwrap().text.contains("5 functions"),
+            app.message.as_ref().unwrap().text.contains("3 functions"),
             "{:?}",
             app.message.as_ref().map(|m| &m.text)
         );
@@ -9357,6 +9388,20 @@ pub(crate) mod tests {
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
         assert!(app.source_menu.is_some() && !app.sources_menu);
         assert_eq!(app.opts.panes.as_ref().unwrap().focus, 1);
+    }
+
+    #[test]
+    fn messages_dont_move_the_chart() {
+        let mut app = app(&["graft", LOG]);
+        screen_sized(&app, 46, 30);
+        let before = app.chart_rect.get();
+        app.say(
+            "older data loaded — a long message that would wrap the legend row",
+            false,
+        );
+        let s = screen_sized(&app, 46, 30);
+        assert_eq!(app.chart_rect.get(), before);
+        assert!(s.contains("older data loaded"), "{s}");
     }
 
     #[test]
