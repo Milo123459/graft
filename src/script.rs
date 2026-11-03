@@ -1146,7 +1146,7 @@ fn complete_in(
         // The last argument (of the shortest form): close the call too.
         let last =
             min_args(&func).is_some_and(|n| arg + 1 >= n) && !SERIES_ANY.contains(&func.as_str());
-        let paren = if last && !chars[cursor..].iter().any(|c| *c == ')') {
+        let paren = if last && !chars[cursor..].contains(&')') {
             ")"
         } else {
             ""
@@ -1192,7 +1192,7 @@ fn complete_in(
             };
             let last = min_args(func).is_some_and(|n| *arg + 1 >= n)
                 && !SERIES_ANY.contains(&func.as_str());
-            let paren = if last && !chars[cursor..].iter().any(|c| *c == ')') {
+            let paren = if last && !chars[cursor..].contains(&')') {
                 ")"
             } else {
                 ""
