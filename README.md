@@ -482,7 +482,7 @@ including over SSH from a phone.
 | **measure**, then tap start and end (or drag across, or click then **shift+click**) | stats for just that stretch, including how much each series *changed*; tap again to clear |
 | scroll | zoom around the pointer (sideways or shift + scroll moves); never past your data |
 | toolbar | **lines ▾** **all time ▾** **stats** **panes** **sources**, plus ↶ undo, **markers** and **alerts** once there are some, and ◀ ▶ **show all** while zoomed in; `⋯` shows the rest: + − cursor measure side by side forecast split targets, chart type, log, follow, pause, format, save, copy, console, export, mouse, help, quit |
-| legend row | under the chart: live or paused, the time of the newest data (or **cursor** and its time), each series with its value (at the cursor, if there is one), target lines and a firing alert. Tap a series to hide or show it |
+| legend row | under the chart (with several panes, each pane also keeps its own legend box): live or paused, the time of the newest data (or **cursor** and its time), each series with its value (at the cursor, if there is one), target lines and a firing alert. Tap a series to hide or show it |
 
 **Timeframe** (anything on a time axis — log timestamps, or arrival times for
 live commands like `ping`): tap **all time ▾** (or press `r`) for a dropdown

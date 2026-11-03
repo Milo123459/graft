@@ -3039,8 +3039,14 @@ impl App {
             }
             None => Some(self.horizon),
         };
-        if self.opts.forecast.is_some() && self.view.is_none() {
-            self.say("forecast on: dotted lines project each trend (set targets with :target(\"name\", 50GB))", false);
+        match self.opts.forecast {
+            Some(_) if self.view.is_none() => self.say(
+                "forecast on: dotted lines project each trend (set targets with :target(\"name\", 50GB))",
+                false,
+            ),
+            Some(_) => self.say("forecast on", false),
+            // Say so: the "on" message would otherwise still be showing.
+            None => self.say("forecast off", false),
         }
     }
 
@@ -3306,7 +3312,11 @@ impl App {
     fn view_opts(&self) -> ChartOpts {
         let mut o = self.opts.clone();
         o.tidy = true;
-        o.legend = crate::cli::LegendPos::None;
+        // With several panes the legend row only covers the picked one: each pane
+        // keeps its own legend box.
+        if self.opts.panes.as_ref().is_none_or(|p| p.count() <= 1) {
+            o.legend = crate::cli::LegendPos::None;
+        }
         o
     }
 
@@ -8491,5 +8501,31 @@ pub(crate) mod tests {
         }
         key(&mut app, KeyCode::Enter);
         assert!(!app.sources_menu);
+    }
+
+    #[test]
+    fn toggles_say_when_they_go_off() {
+        let mut app = app(&["graft", LOG]);
+        key(&mut app, KeyCode::Char('f'));
+        assert!(
+            app.message
+                .as_ref()
+                .unwrap()
+                .text
+                .starts_with("forecast on")
+        );
+        key(&mut app, KeyCode::Char('f'));
+        assert_eq!(app.message.as_ref().unwrap().text, "forecast off");
+    }
+
+    #[test]
+    fn dashboard_panes_keep_their_legends() {
+        let mut app = app(&["graft", LOG, "--pane", "*", "--pane", "node2"]);
+        let s = screen_sized(&app, 160, 40);
+        // A pane with several series keeps its box (the row lists the picked pane's).
+        assert!(s.contains("│node1 58.8 GB "), "{s}");
+        // One chart: the legend row does it, no box.
+        run(&mut app, "single()");
+        assert!(!screen_sized(&app, 160, 40).contains("│node1 58.8 GB "));
     }
 }
