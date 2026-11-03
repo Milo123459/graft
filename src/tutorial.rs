@@ -138,7 +138,7 @@ graft works the same with a mouse, a keyboard or a phone over ssh: tap where you
             ("i / legend", "legends on/off (more room for the data)"),
             (
                 "right-click / ⚙",
-                "a pane's (or the chart's) settings: source, chart type, lines, series",
+                "a pane's (or the chart's) settings: source, its settings (coin, interval…), chart type, lines, series. other source… swaps the data the pane shows",
             ),
             (
                 "↑ ↓ ← →  Enter",
@@ -556,7 +556,7 @@ The expression can go in quotes or be written as code: add_line("total", user + 
     Step {
         title: "getting data in",
         text: r#"Three kinds of source: a file (read once, or followed as it grows), a command (run every few seconds, like watch) or stdin (a pipe). Any of them can run on another machine with --ssh, and more sources can share one chart: their series are named after them (cb, or cb.price when there are several).
-The sources menu lists them all: the main one, merged ones (edit in the builder with a live preview, add, remove), and in a dashboard each pane's own source (edit it, or change picks another). An edited pane source is kept with the chart as a named source.
+The sources menu lists them all: the main one, merged ones (edit in the builder with a live preview, add, remove), and in a dashboard each pane's own source (edit changes what it runs; other source… shows different data in that pane, like cpu or a recent chart). An edited pane source is kept with the chart as a named source.
 From here on the steps are a reference: read what's useful, skip the rest with Enter."#,
         keys: &[
             (
@@ -607,7 +607,7 @@ From here on the steps are a reference: read what's useful, skip the rest with E
             ),
             (
                 "graft -c 'curl -s \"https://…?start={from_ms:6h}&end={now_ms}\"' --json",
-                "the window it asks for: scroll back to the oldest data and older is fetched",
+                "the window it asks for: scroll back to the oldest data (or press ← with everything in view) and older is fetched",
             ),
             (
                 r#"--source 'mem = -c "cat /proc/meminfo" --kv' --pane 'source=mem'"#,
@@ -975,7 +975,7 @@ The next pages are recipes for real use: copy puts one on your clipboard."#,
     },
     Step {
         title: "recipe: a trading dashboard",
-        text: "Hyperliquid candles (500 of them, polled every 5 s; --replace keeps the newest up to date instead of piling up copies) drawn as candlesticks (kind=candles, from the open/high/low/close series), with EMA30/EMA50 over them and crossover markers, RSI, MACD and volume in panes. coin ▾ and interval ▾ switch asset and candle size; scroll back to the oldest candle and older ones load. RSI and MACD come from examples/indicators.rhai",
+        text: "Hyperliquid candles (500 of them, polled every 5 s; --replace keeps the newest up to date instead of piling up copies) drawn as candlesticks (kind=candles, from the open/high/low/close series), with EMA30/EMA50 over them and crossover markers, RSI, MACD and volume in panes. coin ▾ and interval ▾ switch asset and candle size; press ← (or scroll back to the oldest candle) and older ones load. RSI and MACD come from examples/indicators.rhai",
         command: Some(
             r#"graft -c 'curl -s --json "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"{coin}\",\"interval\":\"{interval}\",\"startTime\":{from_ms:500*{interval}},\"endTime\":{now_ms}}}" https://api.hyperliquid.xyz/info' --param 'coin = ETH | BTC | SOL | HYPE' --param 'interval = 1m | 5m | 15m | 1h | 4h | 1d' -n 5s --json --time-field t --replace --script examples/indicators.rhai --series 'open:USD = o' --series 'high:USD = h' --series 'low:USD = l' --series 'close:USD = c' --series 'volume = v' --select open,high,low,close,volume --line 'ema30 = ema(values("close"), 30)' --line 'ema50 = ema(values("close"), 50)' --line 'rsi14:% = rsi(values("close"), 14)' --line 'overbought:% = 70' --line 'oversold:% = 30' --line 'macd = macd(values("close"))' --line 'signal = ema(values("macd"), 9)' --mark 'name == "ema30" && prev < ema50_prev && value >= ema50 => golden cross | ▲ green' --mark 'name == "ema30" && prev > ema50_prev && value <= ema50 => death cross | ▼ red' --pane 'open,high,low,close,ema30,ema50 kind=candles title={coin} {interval}' --pane 'rsi14,overbought,oversold' --pane 'macd,signal' --pane volume --layout '1 /60% ((2 | 3) / 4)' --title '{coin} {interval}'"#,
         ),

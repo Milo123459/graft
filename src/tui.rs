@@ -1678,6 +1678,15 @@ impl App {
 
     fn pan(&mut self, frac: f64) {
         if self.view.is_none() {
+            // Everything's in view: going back means loading older data, if the
+            // source can be asked for it.
+            if frac < 0.0 && self.start_backfill() {
+                return;
+            }
+            if frac < 0.0 && self.backfill_done {
+                self.say("no older data from the source", false);
+                return;
+            }
             self.say(
                 "everything is already in view: zoom in (↑, + or scroll) to move around",
                 false,
@@ -2327,7 +2336,8 @@ impl App {
     }
 
     fn open_source_menu(&mut self) {
-        let mut items = vec![(format!("this chart · {}", self.opts.title), None)];
+        let title = crate::params::fill(&self.opts.title, &self.params_of(ParamTarget::Main));
+        let mut items = vec![(format!("this chart's data · {title}"), None)];
         for p in crate::profile::presets() {
             if p.available() && !items.iter().any(|i| i.1.as_deref() == Some(p.name)) {
                 items.push((
@@ -3896,25 +3906,39 @@ impl App {
             }
             return;
         }
-        if self.backfill_done || self.paused {
-            return;
-        }
-        let crate::source::SourceSpec::Command {
-            cmd, every, ssh, ..
-        } = &self.live.spec
-        else {
-            return;
-        };
-        if !crate::params::has_window(cmd) {
+        if self.paused {
             return;
         }
         let (Some((a, b)), Some(oldest)) = (self.view, self.oldest_x()) else {
             return;
         };
         // At (or very near) the start of what's loaded.
-        if a > oldest + (b - a) * 0.02 {
-            return;
+        if a <= oldest + (b - a) * 0.02 {
+            self.start_backfill();
         }
+    }
+
+    /// Ask the source for the window before the oldest data, if its command has one
+    /// (`{from…}` … `{now…}`). False when it can't (or has nothing older).
+    fn start_backfill(&mut self) -> bool {
+        if self.backfill.is_some() {
+            return true;
+        }
+        if self.backfill_done {
+            return false;
+        }
+        let crate::source::SourceSpec::Command {
+            cmd, every, ssh, ..
+        } = &self.live.spec
+        else {
+            return false;
+        };
+        if !crate::params::has_window(cmd) {
+            return false;
+        }
+        let Some(oldest) = self.oldest_x() else {
+            return false;
+        };
         let spec = crate::source::SourceSpec::Command {
             cmd: crate::params::fill_times(cmd, oldest),
             every: *every,
@@ -3923,6 +3947,7 @@ impl App {
         };
         self.backfill = Some((Live::new(spec), oldest));
         self.say("loading older data…", false);
+        true
     }
 
     // ───────────── pane settings menu ─────────────
@@ -3987,13 +4012,13 @@ impl App {
                 format!("{name} "),
                 vec![
                     Button::new("edit", Hit::SourcePaneEdit(id)),
-                    Button::new("change", Hit::SourcePane(id)),
+                    Button::new("other source…", Hit::SourcePane(id)),
                 ],
             )),
             (Some(id), None) => rows.push((
                 "source".into(),
                 "this chart's data ".into(),
-                vec![Button::new("change", Hit::SourcePane(id))],
+                vec![Button::new("other source…", Hit::SourcePane(id))],
             )),
             (None, _) => rows.push((
                 "source".into(),
@@ -4709,7 +4734,7 @@ impl App {
                 what,
                 vec![
                     Button::new("edit", Hit::SourcePaneEdit(*id)),
-                    Button::new("change", Hit::SourcePane(*id)),
+                    Button::new("other source…", Hit::SourcePane(*id)),
                 ],
             );
             y += 2;
@@ -6113,8 +6138,10 @@ impl App {
                             Transition::EditSource
                         }
                         Hit::SourcePane(id) => {
-                            // Pick that pane, then choose its source as the pane panel does.
+                            // Pick that pane, then choose its source as the pane panel does
+                            // (in place of the menu it came from, not on top of it).
                             self.sources_menu = false;
+                            self.settings_menu = false;
                             if let Some(p) = self.opts.panes.as_mut() {
                                 p.focus = id.min(p.count().saturating_sub(1));
                             }
@@ -7910,7 +7937,7 @@ pub(crate) mod tests {
             s.contains("data for this pane") && s.contains("Load average"),
             "{s}"
         );
-        let (x, y) = find(&app, "this chart · reclaimable.log");
+        let (x, y) = find(&app, "this chart's data · reclaimable.log");
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
         assert!(app.opts.panes.as_ref().unwrap().panes[1].source.is_none());
         assert!(
@@ -9293,8 +9320,8 @@ pub(crate) mod tests {
             s.contains("pane 2 · load") && s.contains("cat /proc/loadavg"),
             "{s}"
         );
-        // change: pick that pane and choose its source.
-        let (x, y) = find(&app, " change ");
+        // other source…: pick that pane and choose its source.
+        let (x, y) = find(&app, " other source… ");
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
         assert!(app.source_menu.is_some() && !app.sources_menu);
         assert_eq!(app.opts.panes.as_ref().unwrap().focus, 1);
@@ -9527,6 +9554,18 @@ pub(crate) mod tests {
             m >= n + 9 && m <= n + 11,
             "{n} → {m}: added, no duplicates at the seam"
         );
+        // With everything in view, ← (going back) asks for older data too.
+        while app.backfill.is_some() {
+            app.tick();
+        }
+        app.view = None;
+        key(&mut app, KeyCode::Left);
+        assert!(app.backfill.is_some());
+        let t0 = Instant::now();
+        while app.oldest_x() == Some(older) && t0.elapsed() < Duration::from_secs(5) {
+            app.tick();
+        }
+        assert!(older - app.oldest_x().unwrap() >= 9.0 * 60.0);
     }
 
     #[test]

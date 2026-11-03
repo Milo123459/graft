@@ -2129,7 +2129,7 @@ mod tests {
         )));
         let s = crate::tui::tests::screen_of(&app, 100, 40);
         assert!(
-            s.contains("pane 2 · load") && s.contains(" edit ") && s.contains(" change "),
+            s.contains("pane 2 · load") && s.contains(" edit ") && s.contains(" other source… "),
             "{s}"
         );
         // edit: the builder gets the pane's source, and puts it back in the pane.

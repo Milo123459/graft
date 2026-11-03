@@ -228,7 +228,7 @@ shows `$3,456.78`; `:unit("USD")` and `:title("ETH")` change it while running.
 
 Hyperliquid's candles, polled every 5 s: **coin ▾** and **interval ▾** switch the asset and candle size
 (`--param`), and the window is 500 candles of it (`{from_ms:500*{interval}}` …
-`{now_ms}`). Scroll back to the oldest candle and graft asks for the 500 before it
+`{now_ms}`). Press ← (or scroll back to the oldest candle) and graft asks for the 500 before it
 (see below). The API returns a JSON array
 (one record per candle, `--json --time-field t`) and the same candles each time,
 so `--replace` updates the newest one instead of adding copies. The top pane is
@@ -257,8 +257,8 @@ graft -c 'curl -s --json "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"{coin
 
 A command can say which time window it wants with placeholders, filled in each time
 it runs: `{now}` / `{now_ms}` (the end: now) and `{from:6h}` / `{from_ms:6h}` (that
-long before; `{from_ms:500*1m}` is 500 one-minute steps). Scroll or zoom back to the
-oldest data and graft runs it once more for the window before that, adding what comes
+long before; `{from_ms:500*1m}` is 500 one-minute steps). Press ← while everything is in
+view, or zoom in and scroll back to the oldest data, and graft runs it once more for the window before that, adding what comes
 back (`--replace` takes care of the overlap), until the source has nothing older.
 
 ### Source settings (`--param`)
@@ -284,7 +284,7 @@ first becomes the main source. In the viewer, the **sources** button (`S`)
 lists them: **edit** opens one in the builder (source, format, live preview) and
 puts it back with **merge into the chart**; **+ add source** makes a new one;
 **✕** removes one. In a dashboard it also lists each pane's own source
-(`--pane source=memory`), with **change** to pick another and **edit** to change
+(`--pane source=memory`), with **other source…** to show different data there and **edit** to change
 what it runs in the builder. An edited pane source is kept with the chart as a
 named source, `--source 'memory = -c "…" --kv'`, which a pane shows with
 `source=memory` and which takes the place of a preset or profile of that name
@@ -588,7 +588,7 @@ mouse capture off, so your terminal's own text selection works.
 | `e` | export the current view to SVG |
 | `m` | mouse capture on/off (off: your terminal can select text; the legend row says how to turn it back on) |
 | `:` | Rhai console |
-| right-click / **⚙** | a pane's (or the chart's) settings in one place: its source (edit, change) and that source's settings (`--param`), chart type, lines, series, split or close |
+| right-click / **⚙** | a pane's (or the chart's) settings in one place: its source (**edit** what it runs, **other source…** for different data) and that source's settings (`--param`), chart type, lines, series, split or close |
 | `i` | legends on/off (also `legend()`, and under ⋯) |
 | `↑ ↓ ← →` / `Tab`, `Enter` | in a menu (timeframe, lines, sources, alerts): move the highlight between its buttons; Enter presses it, like a tap |
 | `q` | quit |
