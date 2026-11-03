@@ -249,6 +249,11 @@ pub struct Sub {
 }
 
 impl Sub {
+    /// The lines it has read, with when each came in (for the builder).
+    pub fn history(&self) -> &[(String, crate::data::LineMeta)] {
+        &self.live.raw
+    }
+
     /// Start a source (`interactive`: commands keep sampling).
     pub fn open(name: &str, interactive: bool, ssh: Option<&str>, defs: &[String]) -> Self {
         match Self::try_open(name, interactive, ssh, defs) {

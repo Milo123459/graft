@@ -3849,6 +3849,16 @@ impl App {
         Transition::EditSource
     }
 
+    /// What a pane's or merged source has read so far, by name.
+    pub fn source_history(&self, name: &str) -> Vec<(String, crate::data::LineMeta)> {
+        self.subs
+            .iter()
+            .chain(&self.merge_subs)
+            .find(|s| s.name == name)
+            .map(|s| s.history().to_vec())
+            .unwrap_or_default()
+    }
+
     pub fn take_pane_to_edit(&mut self) -> Option<usize> {
         self.pane_to_edit.take()
     }

@@ -367,7 +367,19 @@ impl Builder {
                 .merge
                 .iter()
                 .any(|s| crate::sources::Merge::parse(s).is_ok_and(|m| m.name == name));
+        // What it has read already: the preview shows those lines (each run at its own
+        // time) instead of running the command once.
+        let history = chart.source_history(&name);
         let mut b = Builder::new(cli, None, Some(chart));
+        if !history.is_empty() {
+            let kept = &history[history.len().saturating_sub(SAMPLE_LINES)..];
+            b.loading = None;
+            b.message = None;
+            b.sample = kept.iter().map(|r| r.0.clone()).collect();
+            b.sample_meta = kept.iter().map(|r| r.1).collect();
+            b.from_command = b.src == Src::Command;
+            b.sample_loaded();
+        }
         b.merge_pane = pane;
         b.merge_old = (!new).then(|| name.clone());
         b.merge_name = Some(TextInput::new(name));
@@ -2145,6 +2157,39 @@ mod tests {
             c.input.as_ref().map(|p| p.display().to_string()),
             Some(log.to_string())
         );
+    }
+
+    #[test]
+    fn a_panes_source_previews_what_it_has_read() {
+        let mut app = crate::tui::tests::app(&[
+            "graft",
+            "examples/reclaimable.log",
+            "--kv",
+            "--source",
+            "fast = -c 'echo n=1' -n 0.1s --kv",
+            "--pane",
+            "*",
+            "--pane",
+            "source=fast",
+        ]);
+        let start = Instant::now();
+        while app.source_history("fast").len() < 5 && start.elapsed() < Duration::from_secs(5) {
+            app.tick();
+            thread::sleep(Duration::from_millis(20));
+        }
+        app.edit_pane_source_for_test(1);
+        let (name, cli) = app.take_source_edit();
+        let b = Builder::for_source(name, cli, Box::new(app), Some(1));
+        assert!(b.loading.is_none(), "no need to run the command again");
+        assert!(b.preview.lines.len() >= 5, "{:?}", b.preview.lines);
+        let times: std::collections::BTreeSet<String> = b
+            .preview
+            .lines
+            .iter()
+            .filter_map(|l| l.result.as_ref().ok())
+            .map(|r| r.split("  ").next().unwrap_or("").to_string())
+            .collect();
+        assert!(times.len() >= 5, "{times:?}");
     }
 
     #[test]
