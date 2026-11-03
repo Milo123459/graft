@@ -154,6 +154,8 @@ pub struct Builder {
     merge_old: Option<String>,
     focus: Option<Field>,
     sample: Vec<String>,
+    /// When each sample line arrived, if it came from a running viewer (else empty).
+    sample_meta: Vec<crate::data::LineMeta>,
     from_command: bool,
     loading: Option<Receiver<Result<Vec<String>, String>>>,
     loaded_at: Option<Instant>,
@@ -312,6 +314,7 @@ impl Builder {
             merge_old: None,
             focus: None,
             sample: Vec::new(),
+            sample_meta: Vec::new(),
             from_command: false,
             loading: None,
             loaded_at: None,
@@ -435,6 +438,7 @@ impl Builder {
                             .map_while(std::result::Result::ok)
                             .take(SAMPLE_LINES)
                             .collect();
+                        self.sample_meta.clear();
                         self.from_command = false;
                         self.sample_loaded();
                     }
@@ -452,17 +456,11 @@ impl Builder {
                     && !app.live().raw.is_empty()
                     && matches!(&app.live().spec, crate::source::SourceSpec::Command { cmd: c, .. } if *c == cmd)
                 {
-                    self.sample = app
-                        .live()
-                        .raw
-                        .iter()
-                        .rev()
-                        .take(SAMPLE_LINES)
-                        .map(|r| r.0.clone())
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect();
+                    // With when each line came in: each run has its own time.
+                    let raw = &app.live().raw;
+                    let kept = &raw[raw.len().saturating_sub(SAMPLE_LINES)..];
+                    self.sample = kept.iter().map(|r| r.0.clone()).collect();
+                    self.sample_meta = kept.iter().map(|r| r.1).collect();
                     self.from_command = true;
                     return self.sample_loaded();
                 }
@@ -481,6 +479,7 @@ impl Builder {
                     }
                 };
                 self.sample = raw.iter().take(SAMPLE_LINES).map(|r| r.0.clone()).collect();
+                self.sample_meta = raw.iter().take(SAMPLE_LINES).map(|r| r.1).collect();
                 self.from_command = false;
                 self.sample_loaded();
             }
@@ -639,6 +638,7 @@ impl Builder {
             suggest::preview(
                 &self.cli,
                 &self.sample,
+                &self.sample_meta,
                 self.from_command,
                 &self.script,
                 300,
@@ -723,6 +723,7 @@ impl Builder {
                 Ok(Ok(lines)) => {
                     self.loading = None;
                     self.sample = lines;
+                    self.sample_meta.clear();
                     self.from_command = true;
                     self.message = None;
                     self.sample_loaded();
@@ -2086,6 +2087,38 @@ mod tests {
             },
         ));
         assert_eq!(app.current_cli().merge.len(), 1);
+    }
+
+    #[test]
+    fn preview_keeps_each_runs_time() {
+        // A command chart that ran three times: the builder's preview shows three times,
+        // not the moment it was opened.
+        let app = crate::tui::tests::app(&[
+            "graft",
+            "-c",
+            "echo load=1",
+            "-n",
+            "0.3s",
+            "--count",
+            "3",
+            "--kv",
+        ]);
+        let cli = app.current_cli();
+        let mut b = Builder::new(cli, None, Some(Box::new(app)));
+        let start = Instant::now();
+        while b.loading.is_some() && start.elapsed() < Duration::from_secs(5) {
+            b.tick();
+            thread::sleep(Duration::from_millis(10));
+        }
+        let times: std::collections::BTreeSet<String> = b
+            .preview
+            .lines
+            .iter()
+            .filter_map(|l| l.result.as_ref().ok())
+            .map(|r| r.split("  ").next().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(b.preview.lines.len(), 3, "{:?}", b.preview.lines);
+        assert_eq!(times.len(), 3, "{times:?}");
     }
 
     #[test]

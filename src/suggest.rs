@@ -31,10 +31,12 @@ pub struct Preview {
     pub error: Option<String>,
 }
 
-/// Parse `sample` with `cli`'s parser settings.
+/// Parse `sample` with `cli`'s parser settings. `metas` (when known: lines kept by
+/// a running viewer) say when each line arrived; others are "now".
 pub fn preview(
     cli: &Cli,
     sample: &[String],
+    metas: &[LineMeta],
     from_command: bool,
     script: &Rc<ScriptHost>,
     max_lines: usize,
@@ -59,7 +61,8 @@ pub fn preview(
             time: now,
         }),
     };
-    for line in sample {
+    for (i, line) in sample.iter().enumerate() {
+        let meta = metas.get(i).copied().unwrap_or(meta);
         let before: HashMap<String, usize> = store
             .series
             .iter()
@@ -206,7 +209,7 @@ pub fn suggest(
     let mut out: Vec<Suggestion> = Vec::new();
     let mut seen: HashSet<(Kind, Vec<String>)> = HashSet::new();
     for (kind, label, cli) in candidates {
-        let p = preview(&cli, &lines, from_command, script, 0);
+        let p = preview(&cli, &lines, &[], from_command, script, 0);
         if p.error.is_some() || p.series.is_empty() || p.series.len() > 200 {
             continue;
         }
@@ -481,6 +484,7 @@ mod tests {
         let p = preview(
             &cli,
             &lines("2026-11-01 04:00 node1: 5 GB\ngarbage"),
+            &[],
             false,
             &script,
             10,
@@ -489,6 +493,6 @@ mod tests {
         assert_eq!(p.lines[0].result, Ok("2026-11-01 04:00  node1=5 GB".into()));
         assert!(p.lines[1].result.is_err());
         cli.format = Some("{oops".into());
-        assert!(preview(&cli, &[], false, &script, 10).error.is_some());
+        assert!(preview(&cli, &[], &[], false, &script, 10).error.is_some());
     }
 }
