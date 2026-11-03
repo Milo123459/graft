@@ -187,7 +187,10 @@ graft works the same with a mouse, a keyboard or a phone over ssh: tap where you
         keys: &[
             ("scroll", "zoom in/out around the pointer (Shift: move)"),
             ("+ − / ↑ ↓", "zoom in / out"),
-            ("◀ ▶ / ← → / h l", "move along (when zoomed in)"),
+            (
+                "◀ ▶ / ← → / h l",
+                "move along when zoomed in; on a timeframe like 1h, ← moves that 1h window back through the data (older data loads if the source can fetch it)",
+            ),
             ("H L", "move half a screen"),
             (
                 "show all / 0",
@@ -345,7 +348,7 @@ api is slowly getting slower here. Give it a target and the stats say when it ge
     },
     Step {
         title: "chart types",
-        text: r#"line and scatter show change over time. bar shows the latest value of each series, for comparing; histogram how the values are spread (a latency distribution); sparkline a small chart per series; stat big-number tiles with change and a sparkline, for dashboards. candles draws candlesticks for prices: it takes the series called open, high, low and close (or o/h/l/c, also at the end of a name like eth.o; else the first four), one candle per time, green when it closed up and red when down, merged when there are more than columns. Any other series (an EMA) is a line over them. With fewer than four series it's a line chart."#,
+        text: r#"line and scatter show change over time. bar shows the latest value of each series, for comparing; histogram how the values are spread (a latency distribution); sparkline a small chart per series; stat big-number tiles with change and a sparkline, for dashboards. candles draws candlesticks for prices: it takes the series called open, high, low and close (or o/h/l/c, also at the end of a name like eth.o; else the first four), one candle per time, green when it closed up and red when down, merged when there are more than columns. A candles pane brings those four along by itself, so list just what goes over them (an EMA, drawn as a line); the legend row and series chips show them as one, candles, with the close. With no such series it's a line chart."#,
         keys: &[
             (
                 "t / chart type",
@@ -362,7 +365,7 @@ api is slowly getting slower here. Give it a target and the stats say when it ge
             ("--kind histogram", "start as a histogram"),
             ("--kind stat --select api", "one big number"),
             (
-                "--pane 'open,high,low,close,ema30 kind=candles'",
+                "--pane 'ema30 kind=candles'",
                 "candlesticks with an EMA over them (see the trading recipe)",
             ),
             (r#":chart("bar")"#, "in the console"),
@@ -985,7 +988,7 @@ The next pages are recipes for real use: copy puts one on your clipboard."#,
         title: "recipe: a trading dashboard",
         text: "Hyperliquid candles (500 of them, polled every 5 s; --replace keeps the newest up to date instead of piling up copies) drawn as candlesticks (kind=candles, from the open/high/low/close series), with EMA30/EMA50 over them and crossover markers, RSI, MACD and volume in panes. coin ▾ and interval ▾ switch asset and candle size; press ← (or scroll back to the oldest candle) and older ones load. RSI and MACD are built in (rsi(values, 14), macd(values)).",
         command: Some(
-            r#"graft -c 'curl -s --json "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"{coin}\",\"interval\":\"{interval}\",\"startTime\":{from_ms:500*{interval}},\"endTime\":{now_ms}}}" https://api.hyperliquid.xyz/info' --param 'coin = ETH | BTC | SOL | HYPE' --param 'interval = 1m | 5m | 15m | 1h | 4h | 1d' -n 5s --json --time-field t --replace --series 'open:USD = o' --series 'high:USD = h' --series 'low:USD = l' --series 'close:USD = c' --series 'volume:{coin} = v' --select open,high,low,close,volume --line 'ema30 = ema(values("close"), 30)' --line 'ema50 = ema(values("close"), 50)' --line 'rsi14:% = rsi(values("close"), 14)' --line 'overbought:% = 70' --line 'oversold:% = 30' --line 'macd = macd(values("close"))' --line 'signal = ema(values("macd"), 9)' --mark 'name == "ema30" && prev < ema50_prev && value >= ema50 => golden cross | ▲ cyan badge' --mark 'name == "ema30" && prev > ema50_prev && value <= ema50 => death cross | ▼ magenta badge' --pane 'open,high,low,close,ema30,ema50 kind=candles title={coin} {interval}' --pane 'rsi14,overbought,oversold front=rsi14' --pane 'macd,signal front=macd' --pane volume --layout '1 /60% ((2 | 3) / 4)' --title '{coin} {interval}'"#,
+            r#"graft -c 'curl -s --json "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"{coin}\",\"interval\":\"{interval}\",\"startTime\":{from_ms:500*{interval}},\"endTime\":{now_ms}}}" https://api.hyperliquid.xyz/info' --param 'coin = ETH | BTC | SOL | HYPE' --param 'interval = 1m | 5m | 15m | 1h | 4h | 1d' -n 5s --json --time-field t --replace --series 'open:USD = o' --series 'high:USD = h' --series 'low:USD = l' --series 'close:USD = c' --series 'volume:{coin} = v' --select open,high,low,close,volume --line 'ema30 = ema(values("close"), 30)' --line 'ema50 = ema(values("close"), 50)' --line 'rsi14:% = rsi(values("close"), 14)' --line 'overbought:% = 70' --line 'oversold:% = 30' --line 'macd = macd(values("close"))' --line 'signal = ema(values("macd"), 9)' --mark 'name == "ema30" && prev < ema50_prev && value >= ema50 => golden cross | ▲ cyan badge' --mark 'name == "ema30" && prev > ema50_prev && value <= ema50 => death cross | ▼ magenta badge' --pane 'ema30,ema50 kind=candles title={coin} {interval}' --pane 'rsi14,overbought,oversold front=rsi14' --pane 'macd,signal front=macd' --pane volume --layout '1 /60% ((2 | 3) / 4)' --title '{coin} {interval}'"#,
         ),
         ..BASE
     },

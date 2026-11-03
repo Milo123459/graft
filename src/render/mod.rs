@@ -902,12 +902,21 @@ fn draw_axis_labels(
     }
 }
 
-/// The open, high, low and close series of a candlestick chart: by name (`open`
+/// Which of `names` are a candlestick's open, high, low and close: by name (`open`
 /// or `o`, also as the end of a name like `eth.open`), else the first four.
-fn candle_roles<'a>(visible: &[(usize, &'a Series)]) -> Option<[(usize, &'a Series); 4]> {
+pub fn candle_roles_of(names: &[&str]) -> Option<[usize; 4]> {
+    let found = candle_roles_named(names);
+    if let [Some(o), Some(h), Some(l), Some(c)] = found {
+        return Some([o, h, l, c]);
+    }
+    (names.len() >= 4).then_some([0, 1, 2, 3])
+}
+
+/// Only those found by name (open/o, high/h, low/l, close/c).
+pub fn candle_roles_named(names: &[&str]) -> [Option<usize>; 4] {
     const NAMES: [[&str; 2]; 4] = [["open", "o"], ["high", "h"], ["low", "l"], ["close", "c"]];
-    let role = |s: &Series| {
-        let name = s.name.to_lowercase();
+    let role = |name: &str| {
+        let name = name.to_lowercase();
         let tail = name
             .rsplit(['.', '_', ' ', '-'])
             .next()
@@ -917,21 +926,45 @@ fn candle_roles<'a>(visible: &[(usize, &'a Series)]) -> Option<[(usize, &'a Seri
             .iter()
             .position(|n| n.contains(&name.as_str()) || n.contains(&tail.as_str()))
     };
-    let mut found: [Option<(usize, &Series)>; 4] = [None; 4];
-    for &(i, s) in visible {
-        if let Some(r) = role(s)
+    let mut found: [Option<usize>; 4] = [None; 4];
+    for (k, name) in names.iter().enumerate() {
+        if let Some(r) = role(name)
             && found[r].is_none()
         {
-            found[r] = Some((i, s));
+            found[r] = Some(k);
         }
     }
-    if let [Some(o), Some(h), Some(l), Some(c)] = found {
-        return Some([o, h, l, c]);
+    found
+}
+
+/// The open, high, low and close series of a candlestick chart (see `candle_roles_of`).
+fn candle_roles<'a>(visible: &[(usize, &'a Series)]) -> Option<[(usize, &'a Series); 4]> {
+    let names: Vec<&str> = visible.iter().map(|v| v.1.name.as_str()).collect();
+    candle_roles_of(&names).map(|r| r.map(|k| visible[k]))
+}
+
+/// `O $1 H $2 L $0.5 C $1.5` for the candle at `x` (or the one before it), green
+/// when it closed up, red when down.
+pub fn candle_text([open, high, low, close]: [&Series; 4], x: f64) -> Option<Line<'static>> {
+    let at = |s: &Series| {
+        let i = s.points.partition_point(|p| p.0 <= x);
+        s.points.get(i.checked_sub(1)?).map(|p| p.1)
+    };
+    let (o, h, l, c) = (at(open)?, at(high)?, at(low)?, at(close)?);
+    let color = if c >= o { Color::Green } else { Color::Red };
+    let u = &close.unit;
+    let mut spans = Vec::new();
+    for (k, v) in [("O", o), ("H", h), ("L", l), ("C", c)] {
+        spans.push(Span::styled(
+            format!("{k} "),
+            Style::default().fg(Color::Gray),
+        ));
+        spans.push(Span::styled(
+            format!("{} ", u.format(v)),
+            Style::default().fg(color),
+        ));
     }
-    match visible {
-        [o, h, l, c, ..] => Some([*o, *h, *l, *c]),
-        _ => None,
-    }
+    Some(Line::from(spans))
 }
 
 /// Paint candlesticks into a plot: one per column (several candles sharing a
@@ -1511,6 +1544,7 @@ impl<'a> ChartWidget<'a> {
                 &plot,
                 c,
                 &lines.iter().map(|l| (l.0, l.1)).collect::<Vec<_>>(),
+                ohlc.map(|r| r.map(|v| v.1)),
             );
         }
     }
@@ -1648,12 +1682,20 @@ impl<'a> ChartWidget<'a> {
         plot: &PlotArea,
         x: f64,
         series: &[(usize, &Series)],
+        ohlc: Option<[&Series; 4]>,
     ) {
         let mut lines = vec![Line::styled(
             self.ds.fmt_x_full(round_x(self.ds, x)),
             Style::default().add_modifier(Modifier::BOLD),
         )];
-        for &(i, s) in series {
+        // A candle: one line, O H L C, green if it closed up.
+        if let Some(c) = ohlc
+            && let Some(text) = candle_text(c, x)
+        {
+            lines.push(text);
+        }
+        let in_candle = |s: &Series| ohlc.is_some_and(|c| c.iter().any(|o| std::ptr::eq(*o, s)));
+        for &(i, s) in series.iter().filter(|(_, s)| !in_candle(s)) {
             if let Some((v, projected)) = value_at(s, self.opts, x) {
                 // Live value (unless hidden), then each trend layer's value here.
                 let mut parts: Vec<String> = Vec::new();
@@ -2381,7 +2423,7 @@ pub fn pane_view(ds: &Dataset, opts: &ChartOpts, pane: &panes::Pane) -> (Dataset
     if !pane.front.is_empty() {
         sub.front = pane.front.clone();
     }
-    let picked: Vec<usize> = if pane.series.is_empty() {
+    let mut picked: Vec<usize> = if pane.series.is_empty() {
         (0..ds.series.len()).collect()
     } else {
         pane.series
@@ -2389,6 +2431,18 @@ pub fn pane_view(ds: &Dataset, opts: &ChartOpts, pane: &panes::Pane) -> (Dataset
             .filter_map(|n| ds.series.iter().position(|s| &s.name == n))
             .collect()
     };
+    // Candles bring their open, high, low and close along (found by name).
+    if sub.kind == ChartKind::Candles && !pane.series.is_empty() {
+        let names: Vec<&str> = ds.series.iter().map(|s| s.name.as_str()).collect();
+        if let [Some(o), Some(h), Some(l), Some(c)] = candle_roles_named(&names) {
+            for k in [o, h, l, c] {
+                if !picked.contains(&k) {
+                    picked.push(k);
+                }
+            }
+            picked.sort_unstable();
+        }
+    }
     sub.palette = picked.iter().map(|&i| opts.color(i)).collect();
     if !pane.series.is_empty() {
         sub.marks

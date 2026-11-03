@@ -190,6 +190,8 @@ enum Hit {
     CycleMarkSymbol(usize),
     CycleMarkColor(usize),
     CycleMarkEffect(usize),
+    /// The candles chip: a candlestick chart's four series together.
+    Candles,
     /// Alerts menu.
     EditAlert(Option<usize>),
     DeleteAlert(usize),
@@ -1711,6 +1713,22 @@ impl App {
     }
 
     fn pan(&mut self, frac: f64) {
+        // On "last 30d", going back moves a 30-day window back through all the data
+        // (the timeframe becomes everything, seen through that window).
+        if self.view.is_none() && frac < 0.0 && self.timeframe.last.is_some() {
+            let (a, b) = self.bounds();
+            self.set_timeframe(Timeframe {
+                last: None,
+                ..self.timeframe
+            });
+            let d = (b - a) * frac;
+            self.set_view(a + d, b + d);
+            // Nothing older loaded yet: ask the source for it.
+            if self.view.is_none() {
+                self.start_backfill();
+            }
+            return;
+        }
         if self.view.is_none() {
             // Everything's in view: going back means loading older data, if the
             // source can be asked for it.
@@ -3584,7 +3602,8 @@ impl App {
     }
 
     /// The series as the legend shows them: (chip index, name, colour, value, shown).
-    fn legend_items(&self) -> Vec<(usize, String, Color, Option<String>, bool)> {
+    #[allow(clippy::type_complexity)]
+    fn legend_items(&self) -> Vec<(Hit, String, Color, Option<String>, bool)> {
         let ds = match self.focused_pane().and_then(|p| p.source.as_ref()) {
             Some(src) => self
                 .sub_views
@@ -3593,19 +3612,41 @@ impl App {
                 .map_or(&self.ds, |v| &v.ds),
             None => &self.ds,
         };
+        let value_of = |name: &str| {
+            ds.series.iter().find(|s| s.name == name).and_then(|s| {
+                let y = match self.cursor {
+                    Some(c) => value_at(s, &self.opts, c).map(|v| v.0),
+                    None => s.points.last().map(|p| p.1),
+                }?;
+                Some((y, s.unit.format(y)))
+            })
+        };
         self.chips()
-            .iter()
-            .enumerate()
-            .map(|(i, chip)| {
+            .into_iter()
+            .map(|chip| {
                 let name = chip.label.split_once(' ').map_or("", |p| p.1).to_string();
-                let value = ds.series.iter().find(|s| s.name == name).and_then(|s| {
-                    let y = match self.cursor {
-                        Some(c) => value_at(s, &self.opts, c).map(|v| v.0),
-                        None => s.points.last().map(|p| p.1),
-                    }?;
-                    Some(s.unit.format(y))
-                });
-                (i, name, self.opts.color(i), value, chip.active)
+                match chip.action {
+                    // The candle: its close, green or red against its open.
+                    Hit::Candles => {
+                        let c = self.candle_series();
+                        let (open, close) = c
+                            .as_ref()
+                            .map_or((None, None), |c| (value_of(&c[0]), value_of(&c[3])));
+                        let color = match (&open, &close) {
+                            (Some(o), Some(c)) if c.0 < o.0 => Color::Red,
+                            _ => Color::Green,
+                        };
+                        (Hit::Candles, name, color, close.map(|c| c.1), chip.active)
+                    }
+                    Hit::Series(i) => (
+                        Hit::Series(i),
+                        name.clone(),
+                        self.opts.color(i),
+                        value_of(&name).map(|v| v.1),
+                        chip.active,
+                    ),
+                    other => (other, name, Color::Gray, None, chip.active),
+                }
             })
             .collect()
     }
@@ -3675,7 +3716,7 @@ impl App {
                 Some(Hit::Cmd(Cmd::Alerts)),
             ));
         }
-        for (i, name, color, value, shown) in
+        for (hit, name, color, value, shown) in
             self.legend_items().into_iter().filter(|_| self.show_legend)
         {
             let mut parts = vec![(
@@ -3693,7 +3734,7 @@ impl App {
             if shown && let Some(v) = value {
                 parts.push((format!(" {v}"), Style::default().fg(color)));
             }
-            g.push((parts, Some(Hit::Series(i))));
+            g.push((parts, Some(hit)));
         }
         // Target lines, with what they're at.
         if self.opts.show_targets {
@@ -4065,6 +4106,43 @@ impl App {
                 p.panes[f].kind = Some(k);
             }
             None => self.opts.kind = k,
+        }
+        if k == ChartKind::Candles {
+            self.bring_in_ohlc();
+        }
+    }
+
+    /// Candles need open, high, low and close: put them in the pane (or show them) if
+    /// the data has them by name, else say what's missing.
+    fn bring_in_ohlc(&mut self) {
+        let names = self.chip_names();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let found = crate::render::candle_roles_named(&refs);
+        let [Some(o), Some(h), Some(l), Some(c)] = found else {
+            if self.candle_series().is_none() {
+                self.say(
+                    "candles need open, high, low and close series (named open/high/low/close or o/h/l/c)",
+                    true,
+                );
+            }
+            return;
+        };
+        let ohlc = [o, h, l, c].map(|k| names[k].clone());
+        for n in &ohlc {
+            self.hidden.remove(n);
+        }
+        if let Some(p) = self.opts.panes.as_mut() {
+            let f = p.focus;
+            let pane = &mut p.panes[f];
+            if !pane.series.is_empty() {
+                for n in &ohlc {
+                    if !pane.series.contains(n) {
+                        pane.series.push(n.clone());
+                    }
+                }
+                pane.series
+                    .sort_by_key(|s| names.iter().position(|n| n == s));
+            }
         }
     }
 
@@ -5263,13 +5341,7 @@ impl App {
                 self.hidden.insert(n);
             }
             Action::Chart(k) => match ChartKind::from_str(&k, true) {
-                Ok(kind) => match self.opts.panes.as_mut() {
-                    Some(p) => {
-                        let f = p.focus;
-                        p.panes[f].kind = Some(kind);
-                    }
-                    None => self.opts.kind = kind,
-                },
+                Ok(kind) => self.set_kind(kind),
                 Err(_) => self.say(format!("chart: there's no chart type '{k}' — line, scatter, bar, histogram, sparkline, stat or candles"), true),
             },
             Action::Front(names) => match self.opts.panes.as_mut() {
@@ -6320,6 +6392,10 @@ impl App {
                             self.toggle_series(i);
                             Transition::None
                         }
+                        Hit::Candles => {
+                            self.toggle_candles();
+                            Transition::None
+                        }
                         Hit::Layer(l, right) => {
                             if right {
                                 self.toggle_right(l);
@@ -6738,24 +6814,82 @@ impl App {
     fn chips(&self) -> Vec<Button<Hit>> {
         // With panes, the picked pane's series (it may have a source of its own): a
         // chip's index is what toggle_series gets.
-        let names: Vec<String> = if self.opts.panes.is_some() {
+        let names = self.chip_names();
+        let shown = |name: &String| {
+            !self.hidden.contains(name) && self.focused_pane().is_none_or(|p| p.shows(name))
+        };
+        // A candlestick chart's open/high/low/close are one chip.
+        let candles = self.candle_series();
+        let mut out = Vec::new();
+        for (i, name) in names.iter().enumerate() {
+            if let Some(c) = &candles
+                && c.contains(name)
+            {
+                if *name == c[0] {
+                    // (A candles pane draws them whether it lists them or not.)
+                    let on = c.iter().all(|n| !self.hidden.contains(n));
+                    out.push(
+                        Button::new(
+                            format!("{} candles", if on { "●" } else { "○" }),
+                            Hit::Candles,
+                        )
+                        .active(on),
+                    );
+                }
+                continue;
+            }
+            let on = shown(name);
+            out.push(
+                Button::new(
+                    format!("{} {name}", if on { "●" } else { "○" }),
+                    Hit::Series(i),
+                )
+                .active(on),
+            );
+        }
+        out
+    }
+
+    /// The series the chips are for: the picked pane's, or the chart's.
+    fn chip_names(&self) -> Vec<String> {
+        if self.opts.panes.is_some() {
             self.pane_series_names()
         } else {
             self.ds.series.iter().map(|s| s.name.clone()).collect()
-        };
-        names
+        }
+    }
+
+    /// When the picked pane (or the chart) draws candles: its open, high, low and close
+    /// series — found by name, else the first four it shows.
+    fn candle_series(&self) -> Option<[String; 4]> {
+        if self.current_kind() != ChartKind::Candles {
+            return None;
+        }
+        let names = self.chip_names();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        if let [Some(o), Some(h), Some(l), Some(c)] = crate::render::candle_roles_named(&refs) {
+            return Some([o, h, l, c].map(|k| names[k].clone()));
+        }
+        let shown: Vec<&String> = names
             .iter()
-            .enumerate()
-            .map(|(i, name)| {
-                let shown = !self.hidden.contains(name)
-                    && self.focused_pane().is_none_or(|p| p.shows(name));
-                Button::new(
-                    format!("{} {name}", if shown { "●" } else { "○" }),
-                    Hit::Series(i),
-                )
-                .active(shown)
-            })
-            .collect()
+            .filter(|n| self.focused_pane().is_none_or(|p| p.shows(n)))
+            .collect();
+        (shown.len() >= 4).then(|| [0, 1, 2, 3].map(|k| shown[k].clone()))
+    }
+
+    /// The candles chip: show or hide all four series together.
+    fn toggle_candles(&mut self) {
+        let Some(c) = self.candle_series() else {
+            return;
+        };
+        let on = c.iter().all(|n| !self.hidden.contains(n));
+        for n in c {
+            if on {
+                self.hidden.insert(n);
+            } else {
+                self.hidden.remove(&n);
+            }
+        }
     }
 
     pub fn draw(&self, f: &mut Frame) {
@@ -9481,6 +9615,76 @@ pub(crate) mod tests {
         assert_eq!(single.opts.front, ["node1"]);
         run(&mut single, "front(node2)");
         assert_eq!(single.current_cli().front, ["node2"]);
+    }
+
+    #[test]
+    fn candles_are_one_chip_and_bring_their_series() {
+        let candles = r#"echo '[{"t":60000,"o":1,"h":3,"l":0.5,"c":2,"v":7},{"t":120000,"o":2,"h":2.5,"l":1,"c":1.5,"v":9}]'"#;
+        let mut app = app(&[
+            "graft",
+            "-c",
+            candles,
+            "--count",
+            "1",
+            "--json",
+            "--time-field",
+            "t",
+            "--pane",
+            "v kind=candles",
+            "--pane",
+            "v",
+        ]);
+        let t0 = Instant::now();
+        while !app.live.eof && t0.elapsed() < Duration::from_secs(5) {
+            app.tick();
+        }
+        app.rebuild(true);
+        // The candles pane lists only v: its o/h/l/c come along, as one chip.
+        let p = &app.opts.panes.as_ref().unwrap().panes[0];
+        let (ds, _) = crate::render::pane_view(&app.ds, &app.opts, p);
+        assert_eq!(ds.series.len(), 5);
+        let labels: Vec<String> = app.chips().into_iter().map(|b| b.label).collect();
+        assert!(labels.contains(&"● candles".to_string()), "{labels:?}");
+        assert!(
+            !labels.iter().any(|l| l == "● o" || l == "● c"),
+            "{labels:?}"
+        );
+        let s = screen_sized(&app, 46, 30);
+        assert!(
+            s.contains("candles 1.5"),
+            "the close, in the legend row: {s}"
+        );
+        // Tapping it hides (and shows) all four.
+        app.toggle_candles();
+        assert!(["o", "h", "l", "c"].iter().all(|n| app.hidden.contains(*n)));
+        app.toggle_candles();
+        assert!(app.hidden.is_empty());
+        // Picking candles in a pane without them puts them in.
+        run(&mut app, "focus_pane(\"down\")");
+        if app.opts.panes.as_ref().unwrap().focus == 0 {
+            run(&mut app, "focus_pane(\"right\")");
+        }
+        run(&mut app, "chart(\"candles\")");
+        let p = app.opts.panes.as_ref().unwrap();
+        let pane = &p.panes[p.focus];
+        assert!(
+            p.focus == 1 && ["o", "h", "l", "c"].iter().all(|n| pane.shows(n)),
+            "{pane:?}"
+        );
+    }
+
+    #[test]
+    fn going_back_from_a_last_window_keeps_its_width() {
+        let mut app = app(&["graft", LOG]);
+        run(&mut app, "timeframe(6h)");
+        let (a, b) = app.bounds();
+        key(&mut app, KeyCode::Left);
+        let (c, d) = app.view.expect("a window to move");
+        assert!(app.timeframe.last.is_none());
+        assert!((d - c - (b - a)).abs() < 1.0, "still 6 hours wide");
+        assert!(d < b && c < a, "earlier than before");
+        key(&mut app, KeyCode::Left);
+        assert!(app.view.unwrap().1 < d, "and on back");
     }
 
     #[test]

@@ -233,7 +233,9 @@ Hyperliquid's candles, polled every 5 s: **coin ▾** and **interval ▾** switc
 (one record per candle, `--json --time-field t`) and the same candles each time,
 so `--replace` updates the newest one instead of adding copies. The top pane is
 `kind=candles`: candlesticks from the open/high/low/close series (green closed up, red
-down; candles that share a column are merged), with the EMAs drawn over them. RSI and MACD are
+down; candles that share a column are merged), with the EMAs drawn over them. A
+candles pane brings those four series along by itself (so the pane lists only the
+EMAs), and they're one **candles** chip in the legend and series lists. RSI and MACD are
 built in (`rsi(values("close"), 14)`, `macd(values("close"))`); `hist = macd - signal`
 would add the histogram (series by name are worked out at each point).
 
@@ -248,7 +250,7 @@ graft -c 'curl -s --json "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"{coin
   --line 'macd = macd(values("close"))' --line 'signal = ema(values("macd"), 9)' \
   --mark 'name == "ema30" && prev < ema50_prev && value >= ema50 => golden cross | ▲ cyan badge' \
   --mark 'name == "ema30" && prev > ema50_prev && value <= ema50 => death cross | ▼ magenta badge' \
-  --pane 'open,high,low,close,ema30,ema50 kind=candles title={coin} {interval}' --pane 'rsi14,overbought,oversold front=rsi14' --pane 'macd,signal front=macd' --pane volume \
+  --pane 'ema30,ema50 kind=candles title={coin} {interval}' --pane 'rsi14,overbought,oversold front=rsi14' --pane 'macd,signal front=macd' --pane volume \
   --layout '1 /60% ((2 | 3) / 4)' --title '{coin} {interval}'
 ```
 
@@ -569,7 +571,7 @@ mouse capture off, so your terminal's own text selection works.
 
 | Key | Action |
 |---|---|
-| `← →` / `h l` | move left / right (when zoomed in) |
+| `← →` / `h l` | move left / right when zoomed in; on a timeframe like `30d`, `←` moves that 30-day window back (loading older data if the source can) |
 | `↑ ↓` / `+ -` | zoom in / out |
 | `,` `.` / shift `← →` | step the cursor point by point |
 | `H L` | move by half a screen |
