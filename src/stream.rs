@@ -57,6 +57,12 @@ pub fn run(url: &str, send: &[String], tx: &Sender<Event>) -> Result<(), String>
     }
 }
 
+/// The longest line (or WebSocket message) read, and the most an event may gather:
+/// a server can't make graft hold more than this in memory.
+pub const MAX_LINE: usize = 1 << 20;
+pub const MAX_EVENT: usize = 4 << 20;
+const MAX_MESSAGE: usize = 8 << 20;
+
 pub fn is_websocket(url: &str) -> bool {
     let u = url.trim_start().to_ascii_lowercase();
     u.starts_with("ws://") || u.starts_with("wss://")
@@ -91,6 +97,8 @@ fn emit(text: &str, tx: &Sender<Event>) -> bool {
 pub struct SseReader {
     sse: bool,
     data: Vec<String>,
+    /// Bytes gathered for the event so far; past `MAX_EVENT` it's skipped.
+    size: usize,
 }
 
 impl SseReader {
@@ -98,6 +106,7 @@ impl SseReader {
         Self {
             sse,
             data: Vec::new(),
+            size: 0,
         }
     }
 
@@ -107,13 +116,21 @@ impl SseReader {
             return Some(line.to_string());
         }
         if line.is_empty() {
-            return (!self.data.is_empty()).then(|| std::mem::take(&mut self.data).join("\n"));
+            let too_big = std::mem::take(&mut self.size) > MAX_EVENT;
+            let data = std::mem::take(&mut self.data);
+            return (!data.is_empty() && !too_big).then(|| data.join("\n"));
         }
         // `field: value` (one space after the colon is dropped); `:` starts a comment.
         let (field, value) = line.split_once(':').unwrap_or((line, ""));
         if field == "data" {
-            self.data
-                .push(value.strip_prefix(' ').unwrap_or(value).to_string());
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            self.size += value.len() + 1;
+            // An event too big to keep: dropped (what's gathered goes) when it ends.
+            if self.size > MAX_EVENT {
+                self.data.clear();
+            } else {
+                self.data.push(value.to_string());
+            }
         }
         None
     }
@@ -156,8 +173,15 @@ fn http(url: &str, send: &[String], tx: &Sender<Event>) -> Result<Flow, String> 
     let mut buf = Vec::new();
     loop {
         buf.clear();
-        match body.read_until(b'\n', &mut buf) {
+        // At most MAX_LINE bytes, whether or not a newline came.
+        match (&mut body)
+            .take(MAX_LINE as u64 + 1)
+            .read_until(b'\n', &mut buf)
+        {
             Ok(0) => return Ok(Flow::Ended),
+            Ok(_) if buf.len() > MAX_LINE && !buf.ends_with(b"\n") => {
+                return Err(format!("a line longer than {} MB", MAX_LINE >> 20));
+            }
             Ok(_) => {
                 let line = String::from_utf8_lossy(&buf);
                 let line = line.trim_end_matches(['\n', '\r']);
@@ -253,10 +277,14 @@ fn websocket(url: &str, send: &[String], tx: &Sender<Event>) -> Result<Flow, Str
     } else {
         Conn::Plain(tcp)
     };
-    let (mut socket, _) = tungstenite::client(request, conn).map_err(|e| match e {
-        tungstenite::HandshakeError::Failure(e) => e.to_string(),
-        tungstenite::HandshakeError::Interrupted(_) => "the handshake timed out".into(),
-    })?;
+    let config = tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE))
+        .max_frame_size(Some(MAX_MESSAGE));
+    let (mut socket, _) = tungstenite::client::client_with_config(request, conn, Some(config))
+        .map_err(|e| match e {
+            tungstenite::HandshakeError::Failure(e) => e.to_string(),
+            tungstenite::HandshakeError::Interrupted(_) => "the handshake timed out".into(),
+        })?;
     for m in send {
         socket
             .send(Message::text(m.clone()))
@@ -329,6 +357,15 @@ mod tests {
         ];
         let out: Vec<String> = lines.iter().filter_map(|l| r.push(l)).collect();
         assert_eq!(out, ["{\"a\":1}", "{\"a\":\n2}"]);
+        // An event too big is dropped; the next one is read as usual.
+        let mut r = SseReader::new(true);
+        let big = format!("data: {}", "x".repeat(MAX_LINE));
+        for _ in 0..5 {
+            assert_eq!(r.push(&big), None);
+        }
+        assert_eq!(r.push(""), None);
+        assert_eq!(r.push("data: 1"), None);
+        assert_eq!(r.push("").as_deref(), Some("1"));
         // Not event-stream: every line is a record.
         let mut plain = SseReader::new(false);
         assert_eq!(plain.push("x=1").as_deref(), Some("x=1"));
@@ -359,6 +396,33 @@ mod tests {
             }
         });
         format!("http://{addr}/stream")
+    }
+
+    #[test]
+    fn a_line_without_end_is_cut_off() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let _ = write!(s, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+                let chunk = vec![b'x'; 64 * 1024];
+                // Far more than MAX_LINE, never a newline.
+                for _ in 0..40 {
+                    if s.write_all(&chunk).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        let (tx, _rx) = mpsc::channel();
+        let result = http(&format!("http://{addr}/"), &[], &tx);
+        assert!(
+            matches!(&result, Err(e) if e.contains("longer than")),
+            "{:?}",
+            result.err()
+        );
     }
 
     #[test]
