@@ -1275,7 +1275,7 @@ pub struct Resample {
     pub agg: Agg,
 }
 
-fn parse_resample(s: &str) -> Result<Resample, String> {
+pub fn parse_resample(s: &str) -> Result<Resample, String> {
     let (w, agg) = s.split_once(':').unwrap_or((s, "mean"));
     let width = crate::time::parse_duration_secs(w).map_err(|e| e.to_string())?;
     if width <= 0.0 {

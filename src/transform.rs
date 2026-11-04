@@ -110,6 +110,11 @@ impl Pipeline {
         })
     }
 
+    /// Change --resample (applied when the data is next built).
+    pub fn set_resample(&mut self, r: Option<Resample>) {
+        self.resample = r;
+    }
+
     /// Add derived series and apply transforms to every series.
     /// Rate/delta, then derived series (so `busy = user / total` works on rates),
     /// then resampling and smoothing.

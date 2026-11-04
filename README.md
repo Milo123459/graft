@@ -86,7 +86,7 @@ graft -p cpu                           # a preset: cpu, memory, load, network, d
 | Follow a file | `-f, --follow` (handles truncation/rotation) |
 | Run a command repeatedly | `-c, --cmd 'COMMAND'`, `-n, --every 2s`, `--count N` |
 | A stream a server pushes | `--stream URL` (or `--ws`, `--sse`): a WebSocket (`wss://…`; `--send MSG` goes out once connected, e.g. a subscription) or a streaming HTTP response (`https://…`: server-sent events, each event's `data:` is a record, or plain lines; with `--send` it's a POST). Reconnects when dropped. With `--once`, `--count N` records |
-| Older data for a stream | `--history 'ARGS'`: another source with its own format (like `--source`), whose series go in before the source's own under the same names; with `{from_ms:…}` / `{now_ms}` in its command it pages back to `--history-depth 6h` (default 1h), and scrolling to the oldest data fetches more |
+| Older data for a stream | `--history 'ARGS'`: another source with its own format (like `--source`), whose series go in before the source's own under the same names; with `{from_ms:…}` / `{now_ms}` in its command it pages back to `--history-depth 6h` (default 1h), saying how far it's got, and scrolling to the oldest data fetches more. In the viewer: `history_depth("24h")` (or **history depth** in **⋯**, which cycles) goes further back at once, `history("…")` / **history…** changes the source, `history(false)` drops it. History is resampled like the chart |
 | Keep only recent data | `-w, --window 6h` or `--window 500` (points); older data is dropped from memory |
 | Timeframe | `-L, --last 7d` (or `--last 500` points), `--since 2026-10-15`, `--until "2026-10-20 12:00"`: what's shown **and** analysed. The viewer can change it |
 
@@ -429,7 +429,10 @@ button.
 
 `:discover(0.045)` (or `--discover 0.045`, or `E`, or the **discover** button) hunts
 for edges in a price as data streams in, without being told which indicators to use.
-It searches every 20 s in the background (3 s each time), on what's on the chart: the
+It searches every 20 s in the background (3 s each time) — on as many of the newest
+points as leave time to try about 2,000 formulas, measured on each search (on a fast
+machine, everything loaded; paper trading always uses everything) — on what's on the
+chart, after the timeframe (so `last 1h` searches that hour): the
 price (`close`, `price` or `mid`, else the first series, or `discover(fees, "name")`),
 bid and ask if there are series named …bid… and …ask…, and every other series as a
 possible signal.
@@ -593,7 +596,7 @@ time. `{sum}` in `--stats-template` gives the total.
 | `--series 'used = MemTotal - MemAvailable'` | derived series (Rhai expression, unit literals allowed); `--series 'busy:% = …'` sets its unit. Computed after `--rate`/`--delta`, so ratios of rates work |
 | `--rate` | counter → per-second rate |
 | `--delta` | change between points |
-| `--resample 1h:max` | bucket (mean, min, max, sum, last, count) |
+| `--resample 1h:max` | bucket (mean, min, max, sum, last, count); in the viewer `resample("5s")`, `resample(false)`, or **resample** in **⋯** (cycles 1s, 5s, 15s, 1m, 5m, off) — applied at once, since the raw points are kept |
 | `--smooth 5` | moving average |
 
 ### Charts

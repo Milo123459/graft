@@ -191,7 +191,8 @@ pub struct Settings {
     pub fees: Fees,
     /// The price series (`None`: close, price or mid, else the first).
     pub series: Option<String>,
-    /// Only the newest this many points are searched.
+    /// Only the newest this many points are searched (the lab sizes it from how fast
+    /// its searches go; everything by default).
     pub max_points: usize,
 }
 
@@ -200,7 +201,7 @@ impl Default for Settings {
         Settings {
             fees: Fees::Flat(0.0),
             series: None,
-            max_points: 20_000,
+            max_points: usize::MAX,
         }
     }
 }

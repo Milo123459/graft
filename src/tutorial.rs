@@ -656,7 +656,11 @@ From here on the steps are a reference: read what's useful, skip the rest with E
             ),
             (
                 "F",
-                "the builder for the main source: source and format, with suggestions and a preview",
+                "the builder for the main source: source and format, with suggestions and a preview — a stream's newest messages keep coming into it",
+            ),
+            (
+                "⋯ resample · history… · history depth",
+                "resample cycles a point every 1s, 5s, 15s, 1m, 5m or off (applied at once); history… opens the history source in the console to change; history depth cycles how far back it goes (1h, 6h, 24h, 3d, 7d), loading the rest at once",
             ),
         ],
         examples: &[
@@ -710,7 +714,15 @@ From here on the steps are a reference: read what's useful, skip the rest with E
             ),
             (
                 r#"--history '-c "curl -s \"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1s&limit=1000&startTime={from_ms:1000s}&endTime={now_ms}\"" --json --time-field 0 --series "price = c4" --select price' --history-depth 6h"#,
-                "older data for a source that only sends what's new (a stream): another source with its own format, whose series go in before the source's own under the same names. With a window in its command it pages back to --history-depth (1h unless you say), and scrolling to the oldest data fetches more",
+                "older data for a source that only sends what's new (a stream): another source with its own format, whose series go in before the source's own under the same names. With a window in its command it pages back to --history-depth (1h unless you say), saying how far it's got, and scrolling to the oldest data fetches more",
+            ),
+            (
+                r#":history_depth("24h")"#,
+                "in the viewer: further back — deeper than it has, the rest loads now (history(\"…\") sets the history source, history(false) drops it)",
+            ),
+            (
+                r#":resample("5s")"#,
+                "a point every 5 seconds (the last value; \"1m:mean\", :max, :min, :sum, :first), applied at once — the raw points are kept, and history follows; resample(false) for every point",
             ),
             (
                 r#"--source 'mem = -c "cat /proc/meminfo" --kv' --pane 'source=mem'"#,

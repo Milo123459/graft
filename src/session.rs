@@ -81,6 +81,11 @@ impl Session {
 
     /// The parsed data after transforms, before custom lines (so other sources can be
     /// merged in first).
+    /// Change --resample: the raw points are kept, so it applies at once.
+    pub fn set_resample(&mut self, r: Option<crate::cli::Resample>) {
+        self.pipeline.set_resample(r);
+    }
+
     pub fn base_dataset(&self) -> Dataset {
         self.pipeline.apply(self.store.dataset(), &self.script)
     }

@@ -171,6 +171,10 @@ enum Cmd {
     Undo,
     Discover,
     MarksBelow,
+    /// Cycle the resample width / history depth; edit the history source.
+    Resample,
+    HistoryDepth,
+    History,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -809,14 +813,7 @@ impl App {
         };
         app.start_merges();
         if let Some(args) = app.cli.history.clone() {
-            let depth = app.cli.history_depth.as_secs_f64();
-            match crate::history::History::open(&args, &app.cli, depth) {
-                Ok(h) => {
-                    app.older = Some(h);
-                    app.say("history: loading…", false);
-                }
-                Err(e) => app.say(format!("{e:#}"), true),
-            }
+            app.set_history(Some(args));
         }
         app.hidden.extend(app.cli.hide.iter().cloned());
         for spec in app.cli.bind.clone() {
@@ -912,6 +909,66 @@ impl App {
 
     pub fn live(&self) -> &Live {
         &self.live
+    }
+
+    /// `--resample` (`resample("5s")`): one point per stretch of time. The raw points
+    /// are kept, so it applies at once — the history too.
+    fn set_resample(&mut self, r: Option<crate::cli::Resample>) {
+        self.cli.resample = r;
+        self.session.set_resample(r);
+        if let Some(h) = &mut self.older {
+            h.set_resample(r);
+        }
+        self.rebuild(true);
+        self.say(
+            match r {
+                Some(r) => format!(
+                    "a point every {} ({:?}) — resample(false) for every point",
+                    crate::time::fmt_duration(r.width),
+                    r.agg
+                )
+                .to_lowercase(),
+                None => "every point (not resampled)".into(),
+            },
+            false,
+        );
+    }
+
+    /// `--history` (`history("…")`): older data for the source, joined before it.
+    fn set_history(&mut self, args: Option<String>) {
+        self.cli.history = args.clone();
+        self.older = None;
+        let Some(args) = args else {
+            self.rebuild(true);
+            return self.say("no history", false);
+        };
+        let depth = self.cli.history_depth.as_secs_f64();
+        match crate::history::History::open(&args, &self.cli, depth) {
+            Ok(h) => {
+                self.older = Some(h);
+                self.say("history: loading…", false);
+            }
+            Err(e) => {
+                self.cli.history = None;
+                self.say(format!("{e:#}"), true)
+            }
+        }
+    }
+
+    /// `--history-depth` (`history_depth("24h")`): deeper than it has, the rest loads
+    /// now.
+    fn set_history_depth(&mut self, secs: f64) {
+        self.cli.history_depth = Duration::from_secs_f64(secs);
+        let what = crate::time::fmt_duration(secs);
+        let loading = self.older.as_mut().map(|h| h.set_depth(secs));
+        match loading {
+            Some(true) => self.say(format!("history: loading back to {what}…"), false),
+            Some(false) => self.say(format!("history: {what} back"), false),
+            None => self.say(
+                format!("history depth {what} — give the chart a history source: history(\"…\")"),
+                false,
+            ),
+        }
     }
 
     fn say(&mut self, text: impl Into<String>, error: bool) {
@@ -4006,6 +4063,38 @@ impl App {
                     false,
                 );
             }
+            Cmd::Resample => {
+                // off → 1s → 5s → 15s → 1m → 5m → off, keeping how points are combined.
+                const STEPS: [f64; 5] = [1.0, 5.0, 15.0, 60.0, 300.0];
+                let agg = self.cli.resample.map_or(crate::cli::Agg::Last, |r| r.agg);
+                let next = match self.cli.resample {
+                    None => Some(STEPS[0]),
+                    Some(r) => STEPS.iter().copied().find(|w| *w > r.width + 1e-9),
+                };
+                self.set_resample(next.map(|width| crate::cli::Resample { width, agg }));
+            }
+            Cmd::HistoryDepth => {
+                const STEPS: [f64; 5] = [
+                    3600.0,
+                    6.0 * 3600.0,
+                    86_400.0,
+                    3.0 * 86_400.0,
+                    7.0 * 86_400.0,
+                ];
+                let now = self.cli.history_depth.as_secs_f64();
+                let next = STEPS
+                    .iter()
+                    .copied()
+                    .find(|d| *d > now + 1e-9)
+                    .unwrap_or(STEPS[0]);
+                self.set_history_depth(next);
+            }
+            Cmd::History => {
+                // Its arguments in the console, to change (or history(false) to drop).
+                let args = self.cli.history.clone().unwrap_or_default();
+                let code = format!("history({args:?})");
+                self.console = Some(TextInput::new(&code));
+            }
             Cmd::MarksBelow => {
                 self.opts.marks_below = !self.opts.marks_below;
                 self.say(
@@ -6330,6 +6419,15 @@ impl App {
             }
             Action::Quit => self.pending = Some(Transition::Quit),
             Action::Format => self.pending = Some(Transition::OpenBuilder),
+            Action::Resample(r) => match r.map(|r| crate::cli::parse_resample(&r)).transpose() {
+                Ok(r) => self.set_resample(r),
+                Err(e) => self.say(format!("resample: {e} (e.g. \"5s\" or \"1m:mean\")"), true),
+            },
+            Action::History(args) => self.set_history(args),
+            Action::HistoryDepth(d) => match crate::time::parse_duration_secs(&d) {
+                Ok(s) if s > 0.0 => self.set_history_depth(s),
+                _ => self.say(format!("history_depth: '{d}' isn't a length of time, e.g. 24h"), true),
+            },
             Action::Range(r) => match r.map(|r| parse_window(&r)).transpose() {
                 Ok(w) => self.set_timeframe(w.map_or_else(Timeframe::default, Timeframe::last)),
                 Err(e) => self.say(format!("range: {e}"), true),
@@ -7552,6 +7650,22 @@ impl App {
                 b("mouse", Cmd::Mouse).active(self.mouse),
                 b("legend", Cmd::Legend).active(self.show_legend),
                 b("marks below", Cmd::MarksBelow).active(self.opts.marks_below),
+                b(
+                    &match self.cli.resample {
+                        Some(r) => format!("resample: {}", crate::time::fmt_duration(r.width)),
+                        None => "resample: off".into(),
+                    },
+                    Cmd::Resample,
+                )
+                .active(self.cli.resample.is_some()),
+                b("history…", Cmd::History).active(self.older.is_some()),
+                b(
+                    &format!(
+                        "history depth: {}",
+                        crate::time::fmt_duration(self.cli.history_depth.as_secs_f64())
+                    ),
+                    Cmd::HistoryDepth,
+                ),
                 b("?", Cmd::Help),
                 b("quit", Cmd::Quit),
             ]);
@@ -10174,6 +10288,69 @@ pub(crate) mod tests {
                 .any(|m| m.rule.is_none() && m.symbol == "•")
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn resample_and_history_from_the_console_and_buttons() {
+        let mut app = app(&[
+            "graft",
+            "-c",
+            r#"echo "{\"t\":{now},\"price\":2}""#,
+            "--json",
+            "--time-field",
+            "t",
+            "--count",
+            "1",
+            "--history",
+            r#"-c 'start={from:10m}; for i in 0 1 2 3 4 5 6 7 8 9; do echo "{\"t\":$((start + i * 60 - 60)),\"price\":1}"; done; test {now} -gt $start' --json --time-field t"#,
+            "--history-depth",
+            "1h",
+        ]);
+        let load = |app: &mut App| {
+            let end = Instant::now() + Duration::from_secs(20);
+            while app.older.as_ref().is_some_and(|h| h.loading()) && Instant::now() < end {
+                app.tick();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            app.tick();
+        };
+        load(&mut app);
+        let span = |app: &App| {
+            let p = &app.ds.get("price").unwrap().points;
+            (p.len(), p.last().unwrap().0 - p[0].0)
+        };
+        let (points, an_hour) = span(&app);
+        assert!((3600.0..7200.0).contains(&an_hour), "{an_hour}");
+        // Deeper: it loads the rest now.
+        run(&mut app, r#"history_depth("2h")"#);
+        load(&mut app);
+        assert!(span(&app).1 >= 7200.0, "{:?}", span(&app));
+        assert_eq!(app.current_cli().history_depth, Duration::from_secs(7200));
+        // Resampled: fewer points, the history too; off again: all of them.
+        let before = span(&app).0;
+        run(&mut app, r#"resample("5m")"#);
+        assert!(span(&app).0 * 3 < before, "{} of {before}", span(&app).0);
+        assert_eq!(app.current_cli().resample.map(|r| r.width), Some(300.0));
+        run(&mut app, "resample(false)");
+        assert_eq!(span(&app).0, before);
+        assert!(points < before);
+        // The buttons: resample cycles (off → 1s → 5s …), history depth too, and
+        // "history…" opens its source in the console.
+        app.run_cmd(Cmd::Resample);
+        assert_eq!(app.cli.resample.map(|r| r.width), Some(1.0));
+        app.run_cmd(Cmd::Resample);
+        assert_eq!(app.cli.resample.map(|r| r.width), Some(5.0));
+        app.run_cmd(Cmd::HistoryDepth);
+        assert_eq!(app.cli.history_depth, Duration::from_secs(6 * 3600));
+        app.run_cmd(Cmd::History);
+        let code = app.console.as_ref().unwrap().value.clone();
+        assert!(
+            code.starts_with("history(\"-c ") && code.ends_with("\")"),
+            "{code}"
+        );
+        key(&mut app, KeyCode::Esc);
+        run(&mut app, "history(false)");
+        assert!(app.older.is_none() && app.current_cli().history.is_none());
     }
 
     #[test]

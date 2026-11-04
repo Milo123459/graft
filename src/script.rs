@@ -78,6 +78,11 @@ pub enum Action {
     Sweep(f64),
     /// Start (or restart) discovering strategies: the costs, the price series.
     Discover(crate::discover::Fees, Option<String>),
+    /// `resample("5s")` (`None`: off).
+    Resample(Option<String>),
+    /// `history("-c …")` (`None`: none), `history_depth("24h")`.
+    History(Option<String>),
+    HistoryDepth(String),
     Undiscover,
     /// Keep discovered strategy n (`None`: the one on the chart) as lines and a rule.
     DiscoverKeep(Option<usize>),
@@ -765,6 +770,21 @@ pub const USAGE: &[(&str, &str, &str)] = &[
     ("measure", "measure()", "start measuring a stretch"),
     ("legend", "legend()  ·  legend(false)", "the legends on/off"),
     (
+        "resample",
+        r#"resample("5s")  ·  resample("1m:mean")  ·  resample(false)"#,
+        "one point per stretch of time (the last value, or :mean :max :min :sum :first) — the data is kept, so it applies at once; history follows",
+    ),
+    (
+        "history",
+        r#"history("-c \"curl -s …{from_ms:1000s}…{now_ms}\" --json …")  ·  history(false)"#,
+        "older data for a stream, from another source (as --history): joined before the live data",
+    ),
+    (
+        "history_depth",
+        r#"history_depth("24h")"#,
+        "how far back history goes: deeper than it has, it loads the rest now",
+    ),
+    (
         "marks_below",
         "marks_below()  ·  marks_below(false)",
         "markers in a strip below the chart, a row per rule, instead of on the lines",
@@ -1058,7 +1078,19 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "layout",
         ],
     ),
-    ("sources", &["merge", "unmerge", "param", "load", "format"]),
+    (
+        "sources",
+        &[
+            "merge",
+            "unmerge",
+            "param",
+            "load",
+            "format",
+            "resample",
+            "history",
+            "history_depth",
+        ],
+    ),
     (
         "keep",
         &["undo", "redo", "copy", "save", "svg", "bind", "quit"],
@@ -1246,6 +1278,8 @@ fn arg_choices_first(func: &str) -> &'static [&'static str] {
         "timeframe" | "range" | "zoom" => &["5m", "15m", "1h", "6h", "1d", "7d", "all"],
         "pan" | "focus_pane" | "move_pane" | "resize_pane" => &["left", "right", "up", "down"],
         "forecast" => &["auto", "1h", "1d", "7d", "off"],
+        "resample" => &["1s", "5s", "15s", "1m", "5m", "off"],
+        "history_depth" => &["1h", "6h", "24h", "3d", "7d"],
         _ => &[],
     }
 }
@@ -2540,6 +2574,35 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
         };
         push(&st, Action::TrendWindow(n));
         Ok(())
+    });
+    let st = state.clone();
+    engine.register_fn("resample", move |r: Dynamic| -> FnResult<()> {
+        let off = r.as_bool().is_ok_and(|b| !b)
+            || r.clone()
+                .into_immutable_string()
+                .is_ok_and(|s| matches!(s.as_str(), "off" | "none" | ""));
+        let text = match r.clone().into_immutable_string() {
+            Ok(s) => s.to_string(),
+            Err(_) if off => String::new(),
+            Err(_) => return Err("resample needs e.g. \"5s\", \"1m:mean\" or false".into()),
+        };
+        push(&st, Action::Resample((!off).then_some(text)));
+        Ok(())
+    });
+    let st = state.clone();
+    engine.register_fn("history", move |r: Dynamic| -> FnResult<()> {
+        let args = match r.clone().into_immutable_string() {
+            Ok(s) if !s.trim().is_empty() && s != "off" => Some(s.to_string()),
+            Ok(_) => None,
+            Err(_) if r.as_bool().is_ok_and(|b| !b) => None,
+            Err(_) => return Err("history needs a source's arguments, or false".into()),
+        };
+        push(&st, Action::History(args));
+        Ok(())
+    });
+    let st = state.clone();
+    engine.register_fn("history_depth", move |d: &str| {
+        push(&st, Action::HistoryDepth(d.to_string()))
     });
     // `timeframe` is the toolbar button's name; `range` the original one.
     for name in ["range", "timeframe"] {

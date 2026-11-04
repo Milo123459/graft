@@ -15,6 +15,12 @@ use crate::formula::Expr;
 
 /// How long each search may evolve formulas.
 const SEARCH_TIME: Duration = Duration::from_secs(3);
+/// Formulas a search should get through in its time: it searches as many of the
+/// newest points as leave time for that (measured on the last search), so a fast
+/// machine searches all the data and a slow one the newest part.
+const ENOUGH_FORMULAS: f64 = 2000.0;
+/// What the first search tries, before it knows how fast searches go.
+const FIRST_POINTS: usize = 50_000;
 /// Strategies paper-traded at once.
 const TRACKED: usize = 8;
 /// Live trades before a losing strategy is retired.
@@ -91,6 +97,8 @@ pub struct Lab {
     failed: Vec<String>,
     /// What it learned retiring them, newest first.
     pub lessons: Vec<String>,
+    /// How many of the newest points the next search takes.
+    pub points: usize,
 }
 
 impl Lab {
@@ -109,6 +117,7 @@ impl Lab {
             refreshed: None,
             failed: Vec::new(),
             lessons: Vec::new(),
+            points: FIRST_POINTS,
         }
     }
 
@@ -130,6 +139,10 @@ impl Lab {
     /// Start a search when one is due, take in a finished one, and bring the paper
     /// trades up to date. Returns news to tell (a new live trade of the best strategy).
     pub fn tick(&mut self, ds: &Dataset) -> Option<String> {
+        let settings = Settings {
+            max_points: self.points.min(self.settings.max_points),
+            ..self.settings.clone()
+        };
         if let Some(rx) = &self.worker {
             match rx.try_recv() {
                 Ok(result) => {
@@ -143,7 +156,7 @@ impl Lab {
         let due = self.last_run.is_none_or(|t| t.elapsed() >= self.every);
         if self.worker.is_none() && due {
             self.last_run = Some(Instant::now());
-            match Input::from_dataset(ds, &self.settings) {
+            match Input::from_dataset(ds, &settings) {
                 Ok(input) if input.len() >= discover::MIN_POINTS => {
                     let (tx, rx) = std::sync::mpsc::channel();
                     let fees = self.settings.fees;
@@ -192,6 +205,12 @@ impl Lab {
         };
         self.waiting = None;
         self.pool = report.pool.iter().map(|s| s.expr.clone()).collect();
+        // How many points the next search can take: formula evaluations go through the
+        // points at this rate.
+        let secs = report.took.as_secs_f64().max(1e-3);
+        let rate = report.formulas as f64 * report.input.len() as f64 / secs;
+        self.points = ((rate * SEARCH_TIME.as_secs_f64() / ENOUGH_FORMULAS) as usize)
+            .max(discover::MIN_POINTS * 10);
         let since = report.input.x.last().copied().unwrap_or(f64::NEG_INFINITY);
         let selected_key = self
             .tracked
@@ -234,12 +253,12 @@ impl Lab {
             }
         }
         for f in report.strategies.iter().take(4) {
-            // Found again (the same rules and exit, the thresholds maybe re-fitted): its
-            // record on the newest data. It keeps trading with the thresholds it had,
-            // so its live record stays what it really did.
+            // Found again (the same rules and holding time; the thresholds, stop and
+            // take-profit maybe re-fitted to newer data): its record on the newest data.
+            // It keeps trading as it was, so its live record stays what it did.
             if let Some(t) = self.tracked.iter_mut().find(|t| {
                 t.found.strategy.key() == f.strategy.key()
-                    && t.found.strategy.exit == f.strategy.exit
+                    && t.found.strategy.exit.hold == f.strategy.exit.hold
             }) {
                 t.found.picked = f.picked;
                 t.found.checked = f.checked;
@@ -265,8 +284,12 @@ impl Lab {
             let entries = |t: &Tracked| t.trades.iter().map(|p| p.entry).collect::<Vec<_>>();
             let mine = entries(&self.tracked[k]);
             let same = (0..k).any(|j| overlap_x(&entries(&self.tracked[j]), &mine) > 0.7);
-            if same && Some(self.tracked[k].found.strategy.key()) != selected_key {
+            // (Never the one on the chart — others with the same rules can go.)
+            if same && k != self.selected {
                 self.tracked.remove(k);
+                if self.selected > k {
+                    self.selected -= 1;
+                }
             } else {
                 k += 1;
             }
@@ -342,7 +365,12 @@ impl Lab {
         if self.tracked.is_empty() {
             return None;
         }
-        let input = Input::from_dataset(ds, &self.settings).ok()?;
+        // Paper trades over everything loaded (whatever the searches take).
+        let all = Settings {
+            max_points: usize::MAX,
+            ..self.settings.clone()
+        };
+        let input = Input::from_dataset(ds, &all).ok()?;
         let newest = (input.x.last().copied().unwrap_or(0.0), input.len());
         if let Some((at, x, len)) = self.refreshed
             && ((x, len) == newest || at.elapsed() < Duration::from_secs(1))

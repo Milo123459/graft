@@ -35,6 +35,8 @@ pub struct History {
     pub done: bool,
     /// What it has read, as series (kept until it reads more).
     cache: Option<(u64, Dataset)>,
+    /// Its own --resample (else it follows the chart's).
+    own_resample: bool,
 }
 
 impl History {
@@ -76,8 +78,15 @@ impl History {
             },
             other => other.clone(),
         };
-        let setup = crate::setup::build(cli, first.clone(), true)?;
+        // Points as far apart as the chart's (unless it says otherwise itself), so the
+        // two join up.
+        let own_resample = cli.resample.is_some();
+        let mut setup = crate::setup::build(cli, first.clone(), true)?;
+        if !own_resample {
+            setup.session.set_resample(chart.resample);
+        }
         Ok(History {
+            own_resample,
             session: setup.session,
             cmd,
             page: Some((Live::new(first), crate::time::now_secs())),
@@ -87,6 +96,29 @@ impl History {
             done: false,
             cache: None,
         })
+    }
+
+    /// The chart's points changed spacing: its own follow (unless it set its own).
+    pub fn set_resample(&mut self, r: Option<crate::cli::Resample>) {
+        if !self.own_resample {
+            self.session.set_resample(r);
+            self.cache = None;
+        }
+    }
+
+    /// Go back this far (seconds). Further than it has: it pages back for the rest now.
+    /// Returns whether it's loading more.
+    pub fn set_depth(&mut self, depth: f64) -> bool {
+        self.depth = depth;
+        let covered = match (self.oldest(), self.newest()) {
+            (Some(a), Some(b)) => b - a,
+            _ => 0.0,
+        };
+        if covered >= depth || self.done {
+            return false;
+        }
+        self.filling = true;
+        self.more()
     }
 
     /// Whether its command asks for a window (so it can page back).
