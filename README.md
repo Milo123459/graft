@@ -431,7 +431,7 @@ button.
 
 `:discover(0.045)` (or `--discover 0.045`, or `E`, or the **discover** button) hunts
 for edges in a price as data streams in, without being told which indicators to use.
-It searches nonstop in the background (3 s each time, on every core but one) — on as many of the newest
+It searches nonstop in the background (3 s inventing formulas on every core but one, then as long again building strategies) — on as many of the newest
 points as leave time to try about 2,000 formulas, measured on each search (on a fast
 machine, everything loaded; paper trading always uses everything) — on what's on the
 chart, after the timeframe (so `last 1h` searches that hour): the
@@ -687,7 +687,12 @@ graft --stream 'wss://mainnet.zklighter.elliot.ai/stream?readonly=true' --send '
 but one, scoring new formulas in parallel — hundreds of thousands a minute on a laptop;
 the panel counts them (formulas a second, and in all). How many it keeps for the next
 search isn't fixed: as many as it has time to score again in a third of a search, so it
-grows with the machine. **Retired strategies are still watched**: paper-traded from
+grows with the machine. Nor is how many strategies it builds: from the strongest
+theories down, with lessons and walking-forward checks for the best, until it's spent as
+long as inventing took (120 theories, 15 lessons and 40 checks at least) — the panel
+counts them. (The one limit is memory: the formulas turned into theories hold at most 4
+million values between them, so every formula on a short stretch, about 80 over 50,000
+points.) **Retired strategies are still watched**: paper-traded from
 when they were retired, and one that pays again (8 trades, t ≥ 1) comes back — a
 strategy that only works in some markets isn't lost after one bad patch.
 

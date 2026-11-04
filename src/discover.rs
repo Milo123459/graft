@@ -1192,8 +1192,17 @@ const SIZE_COST: f64 = 0.04;
 /// Formulas kept from one search to the next, at least (the lab keeps as many as a
 /// search has time to score again, `Budget::pool`).
 const MIN_POOL: usize = 150;
-/// The best of them, tried as entries and filters for strategies.
-const FEATURES: usize = 40;
+/// The most formulas' values held at once for theories and strategies (32 MB, and
+/// sorted copies for re-fitting): every formula kept on a short stretch, the best 80 or
+/// so over 50,000 points.
+const MAX_VALUES: usize = 4_000_000;
+/// Building strategies goes on, best first, for as long as inventing the formulas took
+/// — but always does at least this much: the 120 strongest theories as seeds, lessons
+/// for the 15 best, the 40 best checked walking forward, from the 40 best formulas.
+const MIN_SEEDS: usize = 120;
+const MIN_LESSONS: usize = 15;
+const MIN_WALKED: usize = 40;
+const MIN_FEATURES: usize = 40;
 
 // ───────────── how a search lays out the data ─────────────
 
@@ -1670,11 +1679,16 @@ pub fn search(
         fwd,
     };
     let (evolved, formulas) = evolve(&lab, pool, budget);
+    // Then as long again to build strategies from them (a faster machine builds more).
+    let deadline =
+        std::time::Instant::now() + started.elapsed().max(std::time::Duration::from_millis(500));
+    let in_time = |done: usize, least: usize| done < least || std::time::Instant::now() < deadline;
     let fwd = &lab.fwd;
-    // The fittest formulas, and the usual ones (as filters: volatility, trend…).
+    // The fittest formulas — as many as their values fit in memory — and the usual
+    // ones (as filters: volatility, trend…).
     let mut features: Vec<Expr> = evolved
         .iter()
-        .take(FEATURES)
+        .take((MAX_VALUES / n.max(1)).max(MIN_FEATURES))
         .map(|s| s.expr.clone())
         .collect();
     for c in input.classics() {
@@ -1825,7 +1839,6 @@ pub fn search(
     };
     let mut seeds: Vec<&Theory> = theories.iter().filter(|t| t.found.t.abs() >= 2.0).collect();
     seeds.sort_by(|a, b| b.found.t.abs().total_cmp(&a.found.t.abs()));
-    seeds.truncate(120);
     let mut tried = 0;
     let mut candidates: Vec<Found> = Vec::new();
     // Exits sized from the typical move over the horizon.
@@ -1895,7 +1908,10 @@ pub fn search(
         }
         best
     };
-    for th in &seeds {
+    for (done, th) in seeds.iter().enumerate() {
+        if !in_time(done, MIN_SEEDS) {
+            break;
+        }
         let side = if th.found.mean > 0.0 {
             Side::Long
         } else {
@@ -1940,7 +1956,10 @@ pub fn search(
     // their winners on the learning half (anything the formulas measure), left out.
     candidates.sort_by(|a, b| b.picked.t.total_cmp(&a.picked.t));
     let mut lessons = Vec::new();
-    for base in candidates.iter().take(15) {
+    for (done, base) in candidates.iter().enumerate() {
+        if !in_time(done, MIN_LESSONS) {
+            break;
+        }
         tried += 1;
         let t = trades_of(&base.strategy, 0, learn);
         let base_edge = beat(&t, 0, learn);
@@ -1966,10 +1985,16 @@ pub fn search(
     candidates.retain(|c| !feedback.failed.contains(&c.strategy.key()));
     // Check the most promising walking forward, and rank by that too.
     candidates.sort_by(|a, b| b.picked.t.total_cmp(&a.picked.t));
-    candidates.truncate(40);
+    let mut walked = 0;
     for c in &mut candidates {
+        if !in_time(walked, MIN_WALKED) {
+            break;
+        }
         (c.checked, c.steps, c.edge) = walk(&c.strategy);
+        walked += 1;
     }
+    // (Those it had no time to check walking forward aren't ranked.)
+    candidates.truncate(walked);
     let rank = |c: &Found| {
         if c.checked.n == 0 {
             return f64::MIN;
