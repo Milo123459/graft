@@ -349,13 +349,18 @@ api is slowly getting slower here. Give it a target and the stats say when it ge
     },
     Step {
         title: "chart types",
-        text: r#"line and scatter show change over time. bar shows the latest value of each series, for comparing; histogram how the values are spread (a latency distribution); sparkline a small chart per series; stat big-number tiles with change and a sparkline, for dashboards. candles draws candlesticks for prices: it takes the series called open, high, low and close (or o/h/l/c, also at the end of a name like eth.o; else the first four), one candle per time, green when it closed up and red when down, merged when there are more than columns. A candles pane brings those four along by itself, so list just what goes over them (an EMA, drawn as a line); the legend row and series chips show them as one, candles, with the close. With no such series it's a line chart. book draws an order book from its levels: for each level a price and a size field with the same name up to the last part (Hyperliquid's levels.0.3.px and levels.0.3.sz, Binance's bids.3.0 and bids.3.1), found among everything the source reads, even fields --select leaves out. On the left, the size resting at each price over time: green bids, red asks, brighter for more, with the mid price as a white line; on the right, a ladder of the book at the newest moment — tap the left side and it shows the book back then. The line above says the best bid and ask, the spread and the imbalance (buyers' size against sellers', -1 to 1)."#,
+        text: r#"line and scatter show change over time. bar shows the latest value of each series, for comparing; histogram how the values are spread (a latency distribution); sparkline a small chart per series; stat big-number tiles with change and a sparkline, for dashboards. candles draws candlesticks for prices: it takes the series called open, high, low and close (or o/h/l/c, also at the end of a name like eth.o; else the first four), one candle per time, green when it closed up and red when down, merged when there are more than columns. A candles pane brings those four along by itself, so list just what goes over them (an EMA, drawn as a line); the legend row and series chips show them as one, candles, with the close. With no such series it's a line chart. book draws an order book from its levels: for each level a price and a size field with the same name up to the last part (Hyperliquid's levels.0.3.px and levels.0.3.sz, Binance's bids.3.0 and bids.3.1), found among everything the source reads, even fields --select leaves out. On the left, the size resting at each price over time: green bids, red asks, brighter for more, with the mid price as a white line; on the right, a ladder of the book at the newest moment — tap the left side and it shows the book back then. The line above says the best bid and ask, the spread and the imbalance (buyers' size against sellers', -1 to 1).
+Pixels: in a terminal with the kitty graphics protocol (kitty, Ghostty, WezTerm) the lines of line, scatter and candles charts are drawn as a real image, smooth and a pixel thin, instead of braille dots. The image sits under the text, so the axes, markers, the cursor and its readout stay text on top (the picture is left clear under them and under popups); it's sent again only when what it shows changes. graft uses pixels where the terminal says it has them, and not inside tmux (the image doesn't get through); I or ⋯ → pixels switches between pixels and text, e.g. over ssh from a phone app that can't show images."#,
         keys: &[
             (
                 "t / chart type",
                 "the next chart type (the button under ⋯ shows the current one)",
             ),
             ("b", "point style: braille, dots, blocks, bars"),
+            (
+                "I / ⋯ → pixels",
+                "lines as pixels (kitty graphics) or as text",
+            ),
             ("y / log", "log scale, for values spanning 10× or more"),
             (
                 "x / ⋯ → split",
@@ -376,6 +381,14 @@ api is slowly getting slower here. Give it a target and the stats say when it ge
             (
                 r#":chart("bar")"#,
                 "in the console (chart(\"book\") for the order book)",
+            ),
+            (
+                "--pixels on",
+                "lines as pixels even where the terminal doesn't say it can (off: always text; auto, the default: where it can)",
+            ),
+            (
+                r#":pixels(false)"#,
+                "lines as text, in the console (pixels() back, pixels(\"auto\") as it starts)",
             ),
         ],
         task: Some("press t a few times; t again comes back to line"),

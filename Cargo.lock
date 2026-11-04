@@ -876,6 +876,7 @@ dependencies = [
  "clap_mangen",
  "csv",
  "indexmap",
+ "miniz_oxide 0.9.1",
  "ratatui",
  "regex",
  "resvg",

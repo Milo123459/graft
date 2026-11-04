@@ -92,6 +92,8 @@ pub enum Action {
     Latency(Option<f64>),
     /// Show discovered strategy n's trades on the chart.
     DiscoverPick(usize),
+    /// `pixels("auto")`: lines as pixels (kitty graphics), as `--pixels`.
+    Pixels(crate::cli::PixelMode),
     /// `discover_view("compare")`: the discover panel's tab.
     DiscoverView(crate::cli::LabView),
     /// `discover_sort("drawdown")`: what its compare tab sorts by.
@@ -179,6 +181,7 @@ pub enum Flag {
     Measure,
     Legend,
     MarksBelow,
+    Pixels,
 }
 
 /// Script names of the on/off buttons. Each takes an optional bool (none = toggle).
@@ -197,6 +200,7 @@ pub const FLAGS: &[(&str, Flag)] = &[
     ("measure", Flag::Measure),
     ("legend", Flag::Legend),
     ("marks_below", Flag::MarksBelow),
+    ("pixels", Flag::Pixels),
 ];
 
 /// State shared between the host and registered functions.
@@ -802,6 +806,11 @@ pub const USAGE: &[(&str, &str, &str)] = &[
         "marks_below()  ·  marks_below(false)",
         "markers in a strip below the chart, a row per rule, instead of on the lines",
     ),
+    (
+        "pixels",
+        r#"pixels()  ·  pixels(false)  ·  pixels("auto")"#,
+        "lines drawn as pixels, an image under the text (kitty graphics: kitty, Ghostty, WezTerm); auto where the terminal has it",
+    ),
     // panes
     ("split_right", "split_right()", "a new pane to the right"),
     ("split_down", "split_down()", "a new pane below"),
@@ -1056,6 +1065,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "measure",
             "legend",
             "marks_below",
+            "pixels",
         ],
     ),
     (
@@ -2920,6 +2930,14 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
     let st = state.clone();
     engine.register_fn("discover_pick", move |n: i64| {
         push(&st, Action::DiscoverPick(n.max(0) as usize))
+    });
+    let st = state.clone();
+    engine.register_fn("pixels", move |v: &str| -> FnResult<()> {
+        use clap::ValueEnum;
+        let mode = crate::cli::PixelMode::from_str(v, true)
+            .map_err(|_| format!("pixels: '{v}' isn't one of auto, on, off"))?;
+        push(&st, Action::Pixels(mode));
+        Ok(())
     });
     let st = state.clone();
     engine.register_fn("discover_view", move |v: &str| -> FnResult<()> {

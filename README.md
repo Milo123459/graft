@@ -747,6 +747,7 @@ time. `{sum}` in `--stats-template` gives the total.
 | `--pane 'node1 kind=bar lines=live,avg'` | panes: several charts in one view (repeat `--pane`); each picks series (`*` = all), `kind=`, `lines=`, `front=` (series drawn on top of the others, e.g. an RSI over its 70/30 lines; `--front` without panes, `front("rsi14")` in the console), `source=` (another preset, saved profile or recent chart, with its own command and format) and `title=` (last: the rest of the spec; `{name}` fills in a source setting) |
 | `--layout '(1 \| 2) / 3'` | how panes are arranged: `\|` side by side, `/` stacked, `\|60%` sizes (default: two side by side, more in a grid) |
 | `-m braille\|dot\|block\|half-block\|bar` | marker |
+| `--pixels auto\|on\|off` | lines as pixels: in terminals with the kitty graphics protocol (kitty, Ghostty, WezTerm) line, scatter and candles charts draw their lines as a real image under the text, so the axes, markers and cursor stay text on top. `auto` (the default) uses them where the terminal says it can, not inside tmux; `I`, **pixels** in **⋯** or `pixels(false)` switch |
 | `--log`, `--ymin 0`, `--ymax 500GB` | y axis |
 | `--hline 50GB:red:low` | reference lines (repeatable) |
 | `--colors cyan,#ff8800,203`, `--title`, `--legend top-left\|none` | styling |
@@ -922,6 +923,7 @@ mouse capture off, so your terminal's own text selection works.
 | `space` | pause the chart: the source keeps running and its data is kept, so resuming jumps to the latest |
 | `e` | export the current view to SVG |
 | `m` | mouse capture on/off (off: your terminal can select text; the legend row says how to turn it back on) |
+| `I` | lines as pixels (kitty graphics) or text |
 | `:` | Rhai console |
 | right-click / **⚙** | a pane's (or the chart's) settings in one place: its source (**edit** what it runs, **other source…** for different data) and that source's settings (`--param`), chart type, lines, series, split or close |
 | `i` | legends on/off (also `legend()`, and under ⋯) |

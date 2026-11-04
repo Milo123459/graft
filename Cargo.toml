@@ -21,6 +21,7 @@ clap_complete = "4.6.11"
 clap_mangen = "0.3.3"
 csv = "1.4.0"
 indexmap = "2.14.2"
+miniz_oxide = "0.9.1"
 ratatui = "0.30.2"
 regex = "1.13.1"
 resvg = { version = "0.49", optional = true }

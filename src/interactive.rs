@@ -130,6 +130,14 @@ pub fn run(start: Start) -> Result<ExitCode> {
     }
 
     let mut terminal = ratatui::init();
+    // From a blank screen: cells not drawn yet would otherwise keep what was there
+    // (or the terminal's own background), until something is drawn over them.
+    // (Not `terminal.clear()`: that asks where the cursor is, which can time out.)
+    execute!(
+        stdout(),
+        ratatui::crossterm::terminal::Clear(ratatui::crossterm::terminal::ClearType::All)
+    )?;
+    let mut kitty = crate::kitty::Kitty::default();
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = execute!(stdout(), DisableMouseCapture);
@@ -143,12 +151,28 @@ pub fn run(start: Start) -> Result<ExitCode> {
         loop {
             match &mut screen {
                 Screen::Builder(b) => b.tick(),
-                Screen::Viewer(a) => a.tick(),
+                Screen::Viewer(a) => {
+                    a.tick();
+                    a.set_cell_size(crate::kitty::cell_size());
+                }
             }
             terminal.draw(|f| match &screen {
                 Screen::Builder(b) => b.draw(f),
                 Screen::Viewer(a) => a.draw(f),
             })?;
+            // Lines as pixels: the pictures go out after the text they sit under.
+            let images = match &screen {
+                Screen::Viewer(a) => {
+                    let (pictures, cell) = a.pictures();
+                    kitty.update(&pictures, cell)
+                }
+                Screen::Builder(_) => kitty.clear(),
+            };
+            if !images.is_empty() {
+                let mut out = stdout();
+                out.write_all(images.as_bytes())?;
+                out.flush()?;
+            }
             if !event::poll(Duration::from_millis(80))? {
                 continue;
             }
@@ -157,6 +181,11 @@ pub fn run(start: Start) -> Result<ExitCode> {
             let drain = std::time::Instant::now();
             loop {
                 let ev = event::read()?;
+                if matches!(ev, event::Event::Resize(..)) {
+                    // The screen is cleared and laid out again: so are the pictures.
+                    let _ = stdout().write_all(kitty.clear().as_bytes());
+                    kitty.forget();
+                }
                 let t = match &mut screen {
                     Screen::Builder(b) => b.on_event(&ev),
                     Screen::Viewer(a) => a.on_event(&ev),
@@ -225,6 +254,7 @@ pub fn run(start: Start) -> Result<ExitCode> {
         }
     })();
 
+    let _ = stdout().write_all(kitty.clear().as_bytes());
     let _ = execute!(stdout(), DisableMouseCapture);
     ratatui::restore();
     if let Some(cli) = result? {

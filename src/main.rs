@@ -11,6 +11,7 @@ mod export;
 mod formula;
 mod history;
 mod interactive;
+mod kitty;
 mod lab;
 mod lines;
 mod marks;

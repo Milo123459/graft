@@ -515,6 +515,12 @@ pub struct Cli {
     #[arg(long, help_heading = "Chart")]
     pub marks_below: bool,
 
+    /// Draw lines as pixels, an image under the text, in terminals with the kitty
+    /// graphics protocol (kitty, Ghostty, WezTerm). `auto` uses them where the terminal
+    /// says it has them (not inside tmux). `I` in the viewer.
+    #[arg(long, value_enum, default_value_t = PixelMode::Auto, help_heading = "Chart")]
+    pub pixels: PixelMode,
+
     /// Exit with status 3 if a Rhai condition holds, e.g. `node1 < 50GB` or `slope("node2") < 0`.
     #[arg(long, value_name = "EXPR", action = ArgAction::Append, help_heading = "Analysis")]
     pub alert: Vec<String>,
@@ -785,6 +791,10 @@ impl Cli {
         opt(
             "--marker",
             (self.marker != d.marker).then(|| value_name(self.marker)),
+        );
+        opt(
+            "--pixels",
+            (self.pixels != d.pixels).then(|| value_name(self.pixels)),
         );
         opt("--title", self.title.clone());
         opt(
@@ -1201,6 +1211,16 @@ impl MarkerKind {
     }
 }
 
+/// Lines as pixels (kitty graphics) or as text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum PixelMode {
+    /// Where the terminal has the kitty graphics protocol.
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum LegendPos {
     TopRight,
@@ -1503,6 +1523,8 @@ mod tests {
                 "10m",
                 "--kind",
                 "bar",
+                "--pixels",
+                "off",
             ],
             &[
                 "graft",

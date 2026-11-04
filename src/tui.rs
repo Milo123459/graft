@@ -125,6 +125,10 @@ const HELP: &[(&str, &str)] = &[
         "export to SVG / pause the chart (data keeps being read)",
     ),
     ("m", "mouse on/off (off = select text in your terminal)"),
+    (
+        "I",
+        "lines as pixels on/off (kitty graphics: kitty, Ghostty, WezTerm)",
+    ),
     (":", "Rhai console, e.g. :slope(\"node1\", \"1d\")"),
     ("q", "quit (Esc only clears a measurement or the cursor)"),
 ];
@@ -171,6 +175,7 @@ enum Cmd {
     Undo,
     Discover,
     MarksBelow,
+    Pixels,
     /// Cycle the resample width / history depth; edit the history source.
     Resample,
     HistoryDepth,
@@ -804,6 +809,13 @@ pub struct App {
     settings_menu: bool,
     /// Legends shown (the boxes in panes, the series in the legend row).
     show_legend: bool,
+    /// Lines as pixels (kitty graphics): the setting, whether the terminal has them,
+    /// and this frame's pictures.
+    pixel_mode: crate::cli::PixelMode,
+    pixels_supported: bool,
+    pixels: crate::render::pixels::Pixels,
+    /// Popups drawn this frame (no pixels under them).
+    covers: RefCell<Vec<Rect>>,
     /// A parameter's dropdown is open: whose, which.
     param_menu: Option<(ParamTarget, usize)>,
     /// Fetching older data (scrolled back to the oldest): that run of the command,
@@ -937,6 +949,7 @@ impl App {
             lab_scroll_max: std::cell::Cell::new(0),
             lab_rect: std::cell::Cell::new(Rect::default()),
             mouse: !cli.no_mouse,
+            pixel_mode: cli.pixels,
             cli,
             session,
             live,
@@ -976,6 +989,9 @@ impl App {
             param_menu: None,
             settings_menu: false,
             show_legend: true,
+            pixels_supported: !cfg!(test) && crate::kitty::supported(),
+            pixels: crate::render::pixels::Pixels::default(),
+            covers: RefCell::new(Vec::new()),
             backfill: None,
             older: Vec::new(),
             recorded: None,
@@ -1044,6 +1060,7 @@ impl App {
         let mut c = self.cli.clone();
         c.kind = self.opts.kind;
         c.marker = self.opts.marker;
+        c.pixels = self.pixel_mode;
         c.split = self.opts.split;
         c.log = self.opts.log;
         c.stats = self.show_stats;
@@ -2047,7 +2064,7 @@ impl App {
             self.hits.push(area, Hit::Tutorial(TutorialHit::Fold));
             return;
         }
-        Clear.render(area, f.buffer_mut());
+        self.cover(area, f);
         let c = self.tutorial_content(area.width);
         let mut block = Block::bordered()
             .border_style(Style::default().fg(Color::Yellow))
@@ -2205,7 +2222,7 @@ impl App {
             width: w,
             height: h,
         };
-        Clear.render(rect, f.buffer_mut());
+        self.cover(rect, f);
         self.popup_rect.set(Some(rect));
         let block = Block::bordered()
             .title(" alerts & notifications ")
@@ -2953,7 +2970,7 @@ impl App {
             width: w,
             height: h,
         };
-        Clear.render(rect, f.buffer_mut());
+        self.cover(rect, f);
         let block = Block::bordered()
             .title(" markers · tap a rule to edit it, its buttons to change its look ")
             .border_style(Style::default().fg(Color::Yellow));
@@ -3443,7 +3460,7 @@ impl App {
             width: w,
             height: h,
         };
-        Clear.render(rect, f.buffer_mut());
+        self.cover(rect, f);
         let block = Block::bordered()
             .title(" data for this pane · tap one ")
             .border_style(Style::default().fg(Color::Yellow));
@@ -3833,7 +3850,7 @@ impl App {
             width: w,
             height: h,
         };
-        Clear.render(rect, f.buffer_mut());
+        self.cover(rect, f);
         self.popup_rect.set(Some(rect));
         let block = Block::bordered()
             .title(" timeframe ")
@@ -3960,7 +3977,7 @@ impl App {
             width: w,
             height: h,
         };
-        Clear.render(rect, f.buffer_mut());
+        self.cover(rect, f);
         self.popup_rect.set(Some(rect));
         let block = Block::bordered()
             .title(match &self.opts.panes {
@@ -4426,6 +4443,11 @@ impl App {
                 };
                 self.console = Some(TextInput::new(&code));
             }
+            Cmd::Pixels => self.set_pixels(if self.pixels_on() {
+                crate::cli::PixelMode::Off
+            } else {
+                crate::cli::PixelMode::On
+            }),
             Cmd::MarksBelow => {
                 self.opts.marks_below = !self.opts.marks_below;
                 self.say(
@@ -5370,7 +5392,7 @@ impl App {
             width: w,
             height: h,
         };
-        Clear.render(rect, f.buffer_mut());
+        self.cover(rect, f);
         self.popup_rect.set(Some(rect));
         let title = match pane_id {
             Some(id) => format!(" pane {} settings ", id + 1),
@@ -5626,7 +5648,7 @@ impl App {
             width: w,
             height: h,
         };
-        Clear.render(rect, f.buffer_mut());
+        self.cover(rect, f);
         self.popup_rect.set(Some(rect));
         let block = Block::bordered()
             .title(format!(" {} ", p.name))
@@ -5879,7 +5901,7 @@ impl App {
             width: w,
             height: h,
         };
-        Clear.render(rect, f.buffer_mut());
+        self.cover(rect, f);
         self.popup_rect.set(Some(rect));
         let block = Block::bordered()
             .title(" sources ")
@@ -6687,6 +6709,7 @@ impl App {
             Action::Discover(fee, series) => self.start_discover(fee, series),
             Action::Latency(secs) => self.set_latency(secs),
             Action::DiscoverView(v) => self.set_discover_view(v),
+            Action::Pixels(mode) => self.set_pixels(mode),
             Action::DiscoverSort(k) => self.set_discover_sort(k),
             Action::Undiscover => self.stop_discover(),
             Action::DiscoverPick(n) => match self.lab.as_mut() {
@@ -7194,6 +7217,7 @@ impl App {
             Flag::Mouse => self.mouse,
             Flag::Legend => self.show_legend,
             Flag::MarksBelow => self.opts.marks_below,
+            Flag::Pixels => self.pixels_on(),
             Flag::Measure => self.measuring || self.anchor.is_some() || self.selection.is_some(),
         }
     }
@@ -7216,6 +7240,7 @@ impl App {
             Flag::Mouse => Cmd::Mouse,
             Flag::Legend => Cmd::Legend,
             Flag::MarksBelow => Cmd::MarksBelow,
+            Flag::Pixels => Cmd::Pixels,
             Flag::Measure => Cmd::Select,
         };
         let t = self.run_cmd(cmd);
@@ -7446,6 +7471,7 @@ impl App {
             KeyCode::Char('S') => Cmd::Sources,
             KeyCode::Char('i') => Cmd::Legend,
             KeyCode::Char('B') => Cmd::MarksBelow,
+            KeyCode::Char('I') => Cmd::Pixels,
             KeyCode::Char('[') => Cmd::RangeStep(-1),
             KeyCode::Char(']') => Cmd::RangeStep(1),
             KeyCode::Char(' ' | 'p') => Cmd::Pause,
@@ -8054,6 +8080,7 @@ impl App {
                 b("mouse", Cmd::Mouse).active(self.mouse),
                 b("legend", Cmd::Legend).active(self.show_legend),
                 b("marks below", Cmd::MarksBelow).active(self.opts.marks_below),
+                b("pixels", Cmd::Pixels).active(self.pixels_on()),
                 b(
                     &match self.cli.resample {
                         Some(r) => format!("resample: {}", crate::time::fmt_duration(r.width)),
@@ -8160,9 +8187,112 @@ impl App {
     }
 
     pub fn draw(&self, f: &mut Frame) {
+        self.draw_frame(f);
+        if self.pixels_on() {
+            self.mark_covered(f.buffer_mut());
+        }
+    }
+
+    /// Lines as pixels now (the setting, and for `auto` whether the terminal has them).
+    fn pixels_on(&self) -> bool {
+        match self.pixel_mode {
+            crate::cli::PixelMode::On => true,
+            crate::cli::PixelMode::Off => false,
+            crate::cli::PixelMode::Auto => self.pixels_supported,
+        }
+    }
+
+    fn set_pixels(&mut self, mode: crate::cli::PixelMode) {
+        self.pixel_mode = mode;
+        let msg = match (self.pixels_on(), mode) {
+            (true, _) if !self.pixels_supported => {
+                "lines as pixels (kitty graphics) — this terminal doesn't say it has them; \
+                 if the lines vanish, I puts them back as text"
+            }
+            (true, _) => "lines as pixels: an image under the text (I for text lines)",
+            (false, crate::cli::PixelMode::Auto) => {
+                "lines as text (pixels only where the terminal has kitty graphics)"
+            }
+            (false, _) => "lines as text (I for pixels)",
+        };
+        self.say(msg, false);
+    }
+
+    /// Pixels per cell, as the terminal reports them (before drawing a frame).
+    pub fn set_cell_size(&mut self, cell: (f64, f64)) {
+        self.pixels.cell = cell;
+    }
+
+    /// This frame's pictures (to send to the terminal) and the cell size they're for.
+    pub fn pictures(
+        &self,
+    ) -> (
+        std::cell::Ref<'_, Vec<crate::render::pixels::Picture>>,
+        (f64, f64),
+    ) {
+        (self.pixels.pictures.borrow(), self.pixels.cell)
+    }
+
+    /// A popup's area: cleared, and kept clear of pixels.
+    fn cover(&self, rect: Rect, f: &mut Frame) {
+        Clear.render(rect, f.buffer_mut());
+        self.covers.borrow_mut().push(rect);
+    }
+
+    /// Where each picture must stay clear: under text, coloured cells, boxes inside
+    /// the plot (the legend, the cursor's readout) and popups.
+    fn mark_covered(&self, buf: &ratatui::buffer::Buffer) {
+        let covers = self.covers.borrow();
+        for p in self.pixels.pictures.borrow_mut().iter_mut() {
+            let r = p.rect.intersection(buf.area);
+            p.rect = r;
+            let at =
+                |x: u16, y: u16| usize::from(y - r.y) * usize::from(r.width) + usize::from(x - r.x);
+            let mut covered = vec![false; usize::from(r.width) * usize::from(r.height)];
+            let fill = |covered: &mut Vec<bool>, b: Rect| {
+                let b = b.intersection(r);
+                for y in b.top()..b.bottom() {
+                    for x in b.left()..b.right() {
+                        covered[at(x, y)] = true;
+                    }
+                }
+            };
+            for c in covers.iter() {
+                fill(&mut covered, *c);
+            }
+            for y in r.top()..r.bottom() {
+                for x in r.left()..r.right() {
+                    let cell = &buf[(x, y)];
+                    let sym = cell.symbol();
+                    let braille = sym
+                        .chars()
+                        .next()
+                        .is_some_and(|c| ('\u{2800}'..='\u{28FF}').contains(&c));
+                    if (sym != " " && !braille) || cell.bg != Color::Reset {
+                        covered[at(x, y)] = true;
+                    }
+                    // A box's top left corner: the whole box.
+                    if matches!(sym, "┌" | "╭") {
+                        let right = (x + 1..buf.area.right())
+                            .find(|&c| matches!(buf[(c, y)].symbol(), "┐" | "╮"));
+                        let bottom = (y + 1..buf.area.bottom())
+                            .find(|&c| matches!(buf[(x, c)].symbol(), "└" | "╰"));
+                        if let (Some(rx), Some(by)) = (right, bottom) {
+                            fill(&mut covered, Rect::new(x, y, rx - x + 1, by - y + 1));
+                        }
+                    }
+                }
+            }
+            p.covered = covered;
+        }
+    }
+
+    fn draw_frame(&self, f: &mut Frame) {
         self.hits.clear();
         self.popup_rect.set(None);
         self.plots.borrow_mut().clear();
+        self.pixels.pictures.borrow_mut().clear();
+        self.covers.borrow_mut().clear();
         let area = f.area();
         // The tutorial sits above everything else.
         let tut_h = self.tutorial_height(area.width, area.height);
@@ -8240,6 +8370,7 @@ impl App {
             pane_focus: self.opts.panes.as_ref().map(|p| p.focus),
             sources: Some(&self.sub_views),
             full: Some(&self.full),
+            pixels: self.pixels_on().then_some(&self.pixels),
         };
         self.chart_rect.set(chart);
         let opts = self.view_opts();
@@ -8419,7 +8550,7 @@ impl App {
             width: area.width,
             height: h,
         };
-        Clear.render(rect, f.buffer_mut());
+        self.cover(rect, f);
         let block = Block::bordered()
             .title(" console commands ")
             .border_style(Style::default().fg(Color::Cyan));
@@ -9583,7 +9714,7 @@ impl App {
             height: h,
         };
         let max_scroll = (lines.len() as u16 + 2).saturating_sub(h);
-        Clear.render(rect, f.buffer_mut());
+        self.cover(rect, f);
         f.render_widget(
             Paragraph::new(lines)
                 .scroll((self.help_scroll.min(max_scroll), 0))
@@ -10560,6 +10691,110 @@ pub(crate) mod tests {
         run(&mut app, "marks_below(false)");
         assert!(!app.opts.marks_below);
         assert_eq!(count(&screen(&app)), on_chart);
+    }
+
+    #[test]
+    fn lines_as_pixels_go_in_a_picture_under_the_text() {
+        let braille = |s: &str| {
+            s.chars()
+                .filter(|c| ('\u{2801}'..='\u{28FF}').contains(c))
+                .count()
+        };
+        let mut app = app(&[
+            "graft",
+            LOG,
+            "--pixels",
+            "on",
+            "--mark",
+            "delta < -1.5GB => fell",
+        ]);
+        assert!(app.pixels_on());
+        let s = screen_sized(&app, 110, 34);
+        // The lines aren't text any more, but the axes and markers are.
+        assert_eq!(braille(&s), 0, "{s}");
+        assert!(s.contains("GB") && s.contains('▼'), "{s}");
+        let covered_at = |app: &App, text: char| {
+            let s = screen_sized(app, 110, 34);
+            let (pictures, _) = app.pictures();
+            let p = &pictures[0];
+            assert_eq!(p.covered.len(), usize::from(p.rect.width * p.rect.height));
+            let mut hits = (0, 0);
+            for (y, line) in s.lines().enumerate() {
+                for (x, c) in line.chars().enumerate() {
+                    let (x, y) = (x as u16, y as u16);
+                    if c == text && p.rect.contains(ratatui::layout::Position { x, y }) {
+                        let i = usize::from((y - p.rect.y) * p.rect.width + x - p.rect.x);
+                        hits.0 += 1;
+                        hits.1 += usize::from(p.covered[i]);
+                    }
+                }
+            }
+            hits
+        };
+        {
+            let (pictures, _) = app.pictures();
+            assert_eq!(pictures.len(), 1);
+            let p = &pictures[0];
+            assert!(!p.strokes.is_empty() && p.strokes.iter().all(|s| s.points.len() > 1));
+            assert!(!p.covered[usize::from(p.rect.height / 2 * p.rect.width + p.rect.width / 3)]);
+        }
+        // Under each marker the picture is clear, so it reads.
+        let (marks, clear) = covered_at(&app, '▼');
+        assert!(marks > 0 && clear == marks, "{marks} {clear}");
+        // The cursor stays text (it moves with the mouse).
+        key(&mut app, KeyCode::Char('c'));
+        assert!(app.cursor.is_some());
+        let s = screen_sized(&app, 110, 34);
+        assert!(braille(&s) > 0, "{s}");
+        // Its readout (the time and values beside it) is clear too.
+        let (digits, clear) = covered_at(&app, '8');
+        assert!(digits > 0 && clear == digits, "{s}");
+        key(&mut app, KeyCode::Esc);
+        // A popup over the chart is kept clear too.
+        key(&mut app, KeyCode::Char('?'));
+        screen_sized(&app, 110, 34);
+        let covered = app.pictures().0[0].covered.iter().filter(|c| **c).count();
+        assert!(covered > 300, "{covered}");
+        key(&mut app, KeyCode::Esc);
+
+        // I, the console and the button all switch it; copy cmd keeps it.
+        key(&mut app, KeyCode::Char('I'));
+        assert!(!app.pixels_on());
+        assert!(
+            app.current_cli()
+                .to_args()
+                .join(" ")
+                .contains("--pixels off")
+        );
+        run(&mut app, "pixels()");
+        assert!(app.pixels_on());
+        run(&mut app, "pixels(false)");
+        screen(&app);
+        assert!(!app.pixels_on() && app.pictures().0.is_empty());
+        run(&mut app, r#"pixels("auto")"#);
+        // Tests never claim kitty graphics, so auto means text here.
+        assert!(!app.pixels_on() && app.pixel_mode == crate::cli::PixelMode::Auto);
+        run(&mut app, r#"pixels("bogus")"#);
+        assert!(app.console_note.as_ref().is_some_and(|m| m.error));
+        // At 46 columns, by tapping: ⋯, then the pixels button.
+        let find46 = |app: &App, text: &str| {
+            let s = screen_sized(app, 46, 40);
+            assert!(s.lines().all(|l| l.chars().count() <= 46));
+            s.lines()
+                .enumerate()
+                .find_map(|(y, l)| {
+                    l.find(text)
+                        .map(|b| (l[..b].chars().count() as u16, y as u16))
+                })
+                .unwrap_or_else(|| panic!("'{text}' not on screen:\n{s}"))
+        };
+        assert!(braille(&screen_sized(&app, 46, 40)) > 0, "text lines");
+        let (x, y) = find46(&app, " ⋯ ");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        let (x, y) = find46(&app, " pixels ");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert!(app.pixels_on());
+        assert_eq!(braille(&screen_sized(&app, 46, 40)), 0, "pixels again");
     }
 
     #[test]

@@ -4,6 +4,7 @@
 pub mod ansi;
 pub mod book;
 pub mod panes;
+pub mod pixels;
 pub mod svg;
 
 use std::cell::RefCell;
@@ -268,6 +269,8 @@ pub struct Overlay<'a> {
     pub sources: Option<&'a [SourceView]>,
     /// Every series read, before `--select` (the `book` chart finds its levels here).
     pub full: Option<&'a Dataset>,
+    /// Draw lines as pixels (kitty graphics): the pictures go here instead of text.
+    pub pixels: Option<&'a pixels::Pixels>,
 }
 
 /// Most rows the markers strip takes (the rest share the last one).
@@ -1200,6 +1203,16 @@ impl<'a> ChartWidget<'a> {
             (area, None)
         };
         let buckets = area.width.saturating_sub(14).max(10) as usize * 2;
+        // Lines as pixels: a point pair per pixel column instead of per half cell.
+        let px = self.overlay.pixels.filter(|_| {
+            matches!(
+                self.opts.kind,
+                ChartKind::Line | ChartKind::Scatter | ChartKind::Candles
+            )
+        });
+        let line_buckets = px.map_or(buckets, |p| {
+            ((f64::from(area.width) * p.cell.0) as usize).clamp(buckets, 4000)
+        });
         let log = self.opts.log;
         let ty = |v: f64| if log { v.log10() } else { v };
         let to_log = |pts: &mut Vec<(f64, f64)>| {
@@ -1212,7 +1225,7 @@ impl<'a> ChartWidget<'a> {
         let mut lines: Vec<Prepared> = visible
             .iter()
             .map(|&(i, s)| {
-                let mut pts = visible_points(s, x0, x1, buckets);
+                let mut pts = visible_points(s, x0, x1, line_buckets);
                 to_log(&mut pts);
                 (i, s, pts)
             })
@@ -1330,6 +1343,9 @@ impl<'a> ChartWidget<'a> {
 
         // Overlay lines first so data is drawn on top.
         let mut overlays: Vec<OverlayLine> = Vec::new();
+        // Overlays that stay text with pixels (the cursor and a selection's edges move
+        // with the mouse; as text they don't make the picture be sent again).
+        let mut as_text: Vec<bool> = Vec::new();
         for h in &self.opts.hlines {
             if log && h.value <= 0.0 {
                 continue;
@@ -1341,6 +1357,7 @@ impl<'a> ChartWidget<'a> {
                 Marker::Braille,
                 h.label.clone(),
             ));
+            as_text.push(false);
         }
         for &(i, name, t) in &targets {
             let label = format!(
@@ -1365,6 +1382,7 @@ impl<'a> ChartWidget<'a> {
                     Marker::Braille,
                     (k == 0).then(|| label.clone()),
                 ));
+                as_text.push(false);
             }
         }
         if let Some((a, b)) = self.overlay.selection {
@@ -1375,6 +1393,7 @@ impl<'a> ChartWidget<'a> {
                     Marker::Braille,
                     None,
                 ));
+                as_text.push(true);
             }
         }
         for (i, dashes) in &projections {
@@ -1385,6 +1404,7 @@ impl<'a> ChartWidget<'a> {
                     Marker::Braille,
                     None,
                 ));
+                as_text.push(false);
             }
         }
         if let Some(c) = self.overlay.cursor {
@@ -1394,6 +1414,7 @@ impl<'a> ChartWidget<'a> {
                 Marker::Braille,
                 None,
             ));
+            as_text.push(true);
         }
 
         let graph = if self.opts.kind == ChartKind::Scatter {
@@ -1402,9 +1423,30 @@ impl<'a> ChartWidget<'a> {
             GraphType::Line
         };
         let mk = marker(self.opts.marker);
+        // With pixels, lines become strokes of the picture and their datasets stay
+        // empty (still named, for the legend).
+        let mut strokes: Vec<pixels::Stroke> = Vec::new();
+        // `false`: it's in the picture instead.
+        let mut as_chars = |pts: &[(f64, f64)], style: &Style, dots: bool| {
+            if px.is_some() {
+                strokes.push(pixels::Stroke {
+                    points: pts.to_vec(),
+                    color: style.fg.unwrap_or(Color::White),
+                    dots,
+                });
+            }
+            px.is_none()
+        };
+        let none: &[(f64, f64)] = &[];
         let mut datasets: Vec<RDataset> = overlays
             .iter()
-            .map(|(pts, style, m, label)| {
+            .zip(&as_text)
+            .map(|((pts, style, m, label), &text)| {
+                let pts = if text || as_chars(pts, style, false) {
+                    pts
+                } else {
+                    none
+                };
                 let d = RDataset::default()
                     .data(pts)
                     .graph_type(GraphType::Line)
@@ -1450,7 +1492,11 @@ impl<'a> ChartWidget<'a> {
                     dim_color(color)
                 });
                 let d = RDataset::default()
-                    .data(pts)
+                    .data(if as_chars(pts, &style, graph == GraphType::Scatter) {
+                        pts
+                    } else {
+                        none
+                    })
                     .graph_type(graph)
                     .marker(mk)
                     .style(style);
@@ -1510,7 +1556,11 @@ impl<'a> ChartWidget<'a> {
         }
         for (pts, style, label) in &trend_lines {
             let d = RDataset::default()
-                .data(pts)
+                .data(if as_chars(pts, style, false) {
+                    pts
+                } else {
+                    none
+                })
                 .graph_type(GraphType::Line)
                 .marker(Marker::Braille)
                 .style(*style);
@@ -1549,10 +1599,21 @@ impl<'a> ChartWidget<'a> {
             .hidden_legend_constraints((Constraint::Ratio(2, 3), Constraint::Ratio(2, 3)))
             .render(area, buf);
         let plot = PlotArea { rect: plot, x0, x1 };
-        // Shade a measured stretch.
+        if let Some(px) = px {
+            px.pictures.borrow_mut().push(pixels::Picture {
+                rect: plot.rect,
+                x: (x0, x1),
+                y: (y0, y1),
+                strokes,
+                shade: self.overlay.selection.into_iter().collect(),
+                covered: Vec::new(),
+            });
+        }
+        // Shade a measured stretch (in the picture, with pixels).
         if let Some((a, b)) = self.overlay.selection
             && b > x0
             && a < x1
+            && px.is_none()
         {
             for col in plot.col_of(a.max(x0))..=plot.col_of(b.min(x1)) {
                 for row in plot.rect.y..plot.rect.bottom() {
