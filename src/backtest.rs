@@ -400,54 +400,111 @@ pub const STOPS: [Option<f64>; 6] = [None, Some(0.5), Some(1.0), Some(2.0), Some
 pub const TAKES: [Option<f64>; 6] = [None, Some(1.0), Some(2.0), Some(3.0), Some(5.0), Some(8.0)];
 
 /// The best way to trade a strategy: each side with each stop and take-profit, picked
-/// on the first `train` share of the time and then run on the rest (which it wasn't
-/// picked on) — a stop that only fits the past shows up there.
+/// on the first half of the time, then checked walking forward over the second — in
+/// stretches, each traded the way that was best on everything before it — so a stop
+/// that only fits the past shows up there.
 #[derive(Debug, Clone)]
 pub struct Best {
+    /// Picked on the first half…
     pub rules: Rules,
-    /// On the part it was picked on.
+    /// …where it did this.
     pub picked_on: Trades,
-    /// On the rest.
+    /// Walking forward over the second half (each stretch re-picked).
     pub after: Trades,
-    /// Every way's result on the part it was picked on (for the median).
+    /// How many stretches, and how many of them were traded the way `rules` says.
+    pub stretches: usize,
+    pub same: usize,
+    /// The best way on all of it: how to trade it from now on.
+    pub now: Rules,
+    /// Every way's result on the first half (for the median).
     pub all: Vec<f64>,
 }
 
-pub fn best(entries: &[f64], exits: &[f64], p: &Prices, fee: f64, train: f64) -> Option<Best> {
-    let (first, last) = (p.close.points.first()?.0, p.close.points.last()?.0);
-    let split = first + (last - first) * train;
-    let mut found: Option<Best> = None;
+/// Every way to trade (side × stop × take-profit).
+fn ways(fee: f64) -> impl Iterator<Item = Rules> {
+    [Side::Long, Side::Short].into_iter().flat_map(move |side| {
+        STOPS.into_iter().flat_map(move |stop| {
+            TAKES.into_iter().map(move |take| Rules {
+                side,
+                stop,
+                take,
+                fee,
+            })
+        })
+    })
+}
+
+/// The way that made the most in `window`, its trades, and every way's result.
+fn pick(
+    entries: &[f64],
+    exits: &[f64],
+    p: &Prices,
+    fee: f64,
+    window: (f64, f64),
+) -> (Rules, Trades, Vec<f64>) {
+    let mut found: Option<(Rules, Trades)> = None;
     let mut all = Vec::new();
-    for side in [Side::Long, Side::Short] {
-        for stop in STOPS {
-            for take in TAKES {
-                let r = Rules {
-                    side,
-                    stop,
-                    take,
-                    fee,
-                };
-                let t = simulate(entries, exits, p, &r, (first, split));
-                all.push(t.total());
-                if found
-                    .as_ref()
-                    .is_none_or(|b| t.total() > b.picked_on.total())
-                {
-                    let after = simulate(entries, exits, p, &r, (split, f64::INFINITY));
-                    found = Some(Best {
-                        rules: r,
-                        picked_on: t,
-                        after,
-                        all: Vec::new(),
-                    });
-                }
-            }
+    for r in ways(fee) {
+        let t = simulate(entries, exits, p, &r, window);
+        all.push(t.total());
+        if found.as_ref().is_none_or(|b| t.total() > b.1.total()) {
+            found = Some((r, t));
         }
     }
-    found.map(|mut b| {
-        b.all = all;
-        b
+    let (r, t) = found.expect("there are ways to trade");
+    (r, t, all)
+}
+
+pub fn best(entries: &[f64], exits: &[f64], p: &Prices, fee: f64) -> Option<Best> {
+    let (first, last) = (p.close.points.first()?.0, p.close.points.last()?.0);
+    let split = learned_until(first, last);
+    let (rules, picked_on, all) = pick(entries, exits, p, fee, (first, split));
+    // As many stretches (up to 5) as leave each about 5 signals to trade.
+    let signals = entries
+        .iter()
+        .filter(|x| **x >= split)
+        .count()
+        .max(exits.iter().filter(|x| **x >= split).count());
+    let stretches = (signals / 5).clamp(1, 5);
+    let cut = |k: usize| split + (last - split) * k as f64 / stretches as f64;
+    let (mut closed, mut open, mut time_in, mut same) = (Vec::new(), None, 0.0, 0);
+    for k in 0..stretches {
+        let (from, to) = (cut(k), cut(k + 1));
+        let (r, ..) = pick(entries, exits, p, fee, (first, from));
+        same += usize::from(r == rules);
+        // The last runs to the end of the data (a trade there may still be open).
+        let to = if k + 1 == stretches {
+            f64::INFINITY
+        } else {
+            to
+        };
+        let t = simulate(entries, exits, p, &r, (from, to));
+        let at = closed.len();
+        closed.extend(
+            t.closed
+                .iter()
+                .enumerate()
+                .map(|(i, c)| ((at + i) as f64, *c)),
+        );
+        time_in += t.in_market / stretches as f64;
+        open = t.open;
+    }
+    let (now, ..) = pick(entries, exits, p, fee, (first, f64::INFINITY));
+    Some(Best {
+        rules,
+        picked_on,
+        after: Trades::from_closed(closed, open, time_in),
+        stretches,
+        same,
+        now,
+        all,
     })
+}
+
+/// Where the first half ends: for an edge that's really there, the weaker of the two
+/// halves' results is clearest when they're the same size.
+pub fn learned_until(first: f64, last: f64) -> f64 {
+    first + (last - first) / 2.0
 }
 
 /// What holding `s` from `from` to `to` returned, in %.
@@ -456,9 +513,6 @@ pub fn hold_in(s: &Series, from: f64, to: f64) -> Option<f64> {
     let b = s.points.iter().rev().find(|p| p.0 <= to)?.1;
     pct(a, b)
 }
-
-/// The share of the time `best` picks its stops on (the rest checks them).
-pub const TRAIN: f64 = 0.7;
 
 /// The strategies among marker rules: pairs labelled `NAME in` and `NAME out` (or
 /// buy/sell, entry/exit), as (name, entry rule, exit rule).
@@ -622,8 +676,10 @@ mod tests {
         );
         assert_eq!(t.closed, [-1.0]);
         assert!(t.open.is_none());
-        // The best way, picked on the first half, then run on the second.
-        let b = best(&[0.0, 180.0], &[120.0, 240.0], &p, 0.0, 0.5).unwrap();
+        // The best way, picked on the first half, then walked forward over the second.
+        let b = best(&[0.0, 180.0], &[120.0, 240.0], &p, 0.0).unwrap();
+        assert_eq!(b.stretches, 1, "two signals: one stretch");
+        assert_eq!(b.same, 1, "picked on the same data: the same way");
         assert_eq!(b.all.len(), 2 * STOPS.len() * TAKES.len());
         assert!(b.picked_on.total() >= b.all.iter().copied().fold(f64::MIN, f64::max) - 1e-9);
         let d = b.rules.describe();

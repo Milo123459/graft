@@ -474,11 +474,11 @@ The database spikes now and then: mark it."#,
             ),
             (
                 r#":strategies(0.05)"#,
-                "every strategy at once — rule pairs labelled NAME in and NAME out (or buy/sell): long, short, and the best side, stop-loss and take-profit, picked on the first 70% of the data and checked on the last 30%; against holding, with a 0.05% fee per buy and sell (the table stays until Esc or a tap)",
+                "every strategy at once — rule pairs labelled NAME in and NAME out (or buy/sell): long, short, and the best side, stop-loss and take-profit, picked on the first half of the data and checked walking forward over the second (in stretches, each traded the way that was best on everything before it); against holding, with a 0.05% fee per buy and sell (the table stays until Esc or a tap)",
             ),
             (
                 r#":sweep()"#,
-                "the strategies again for every combination of the --param settings your lines and rules use (ema(values(\"close\"), {fast})), with every side, SL and TP: the best for each, ranked by how it did on the last 30% it wasn't picked on, and the median of all",
+                "the strategies again for every combination of the --param settings your lines and rules use (ema(values(\"close\"), {fast})), with every side, SL and TP: the best for each, each strategy's setting picked on the first half and ranked by how it did walking forward, and the median of all",
             ),
             (
                 "--mark 'cross_above(api, db) => api passed db'",

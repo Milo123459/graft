@@ -299,7 +299,7 @@ struct StrategyResult {
     long: crate::backtest::Trades,
     short: crate::backtest::Trades,
     best: Option<crate::backtest::Best>,
-    /// Holding: all of it, the part the best way was picked on, and the rest.
+    /// Holding: all of it, the first half (where the best way was picked), the rest.
     hold: [f64; 3],
 }
 
@@ -330,12 +330,12 @@ fn strategy_results(
                 ..Rules::long(fee)
             };
             let (first, last) = (close.points.first()?.0, close.points.last()?.0);
-            let split = first + (last - first) * crate::backtest::TRAIN;
+            let split = crate::backtest::learned_until(first, last);
             let h = |a, b| crate::backtest::hold_in(close, a, b).unwrap_or(0.0);
             Some(StrategyResult {
                 long: crate::backtest::simulate(&ins, &outs, &p, &side(Side::Long), all),
                 short: crate::backtest::simulate(&ins, &outs, &p, &side(Side::Short), all),
-                best: crate::backtest::best(&ins, &outs, &p, fee, crate::backtest::TRAIN),
+                best: crate::backtest::best(&ins, &outs, &p, fee),
                 hold: [h(first, last), h(first, split), h(split, last)],
                 on: close.name.clone(),
                 name,
@@ -345,6 +345,24 @@ fn strategy_results(
     let after = |r: &StrategyResult| r.best.as_ref().map_or(f64::MIN, |b| b.after.total());
     out.sort_by(|a, b| after(b).total_cmp(&after(a)));
     out
+}
+
+/// ` (3 stretches, 2 traded that way; now: short · SL 1% · TP 3%)`: how the
+/// walk-forward went, and the way to trade it from now on when that's another.
+fn walked(b: &crate::backtest::Best) -> String {
+    let now = if b.now == b.rules {
+        String::new()
+    } else {
+        format!("; now: {}", b.now.describe())
+    };
+    if b.stretches == 1 && now.is_empty() {
+        return String::new();
+    }
+    format!(
+        " ({}, {} traded that way{now})",
+        plural(b.stretches, "stretch", "stretches"),
+        b.same
+    )
 }
 
 /// `+2.40% (9 trades, 67% won)`.
@@ -2307,7 +2325,7 @@ impl App {
     }
 
     /// `strategies(fee)`: every NAME in / NAME out pair — long, short, and the best
-    /// side, stop and take-profit (picked on the first 70%, checked on the rest).
+    /// side, stop and take-profit (picked on the first half, checked walking forward).
     fn strategies(&self, fee: f64) -> String {
         let labels = self.rule_labels();
         let results = strategy_results(&self.ds, &self.opts.marks, &labels, fee);
@@ -2316,17 +2334,18 @@ impl App {
         };
         let [all, a, b] = first.hold;
         let mut lines = vec![format!(
-            "{} on {} · holding {all:+.2}% (first 70% {a:+.2}%, last 30% {b:+.2}%) · fee {fee}% a side",
+            "{} on {} · holding {all:+.2}% (first half {a:+.2}%, second half {b:+.2}%) · fee {fee}% a side",
             plural(results.len(), "strategy", "strategies"),
             first.on,
         )];
         for r in &results {
             let best = r.best.as_ref().map_or(String::new(), |b| {
                 format!(
-                    " · best on the first 70%: {} {} → last 30% {}",
+                    " · best on the first half: {} {} → walking forward {}{}",
                     b.rules.describe(),
                     trades_brief(&b.picked_on),
-                    trades_brief(&b.after)
+                    trades_brief(&b.after),
+                    walked(b)
                 )
             });
             lines.push(format!(
@@ -2446,7 +2465,7 @@ impl App {
         by_name.sort_by(|a, b| b.1.1.after.total().total_cmp(&a.1.1.after.total()));
         let ways = crate::backtest::STOPS.len() * crate::backtest::TAKES.len() * 2;
         let mut out = vec![format!(
-            "sweep: {} × {} × {ways} ways to trade (long/short, SL, TP) on {on} · picked on the first 70%, checked on the last 30% · holding {h_all:+.2}% (first 70% {h_a:+.2}%, last 30% {h_b:+.2}%) · fee {fee}% a side",
+            "sweep: {} × {} × {ways} ways to trade (long/short, SL, TP) on {on} · picked on the first half, checked walking forward over the second (re-picked before each stretch) · holding {h_all:+.2}% (first half {h_a:+.2}%, second half {h_b:+.2}%) · fee {fee}% a side",
             plural(combos.len(), "setting", "settings"),
             plural(by_name.len(), "strategy", "strategies"),
         )];
@@ -2454,10 +2473,11 @@ impl App {
             every.sort_by(f64::total_cmp);
             let median = every.get(every.len() / 2).copied().unwrap_or(0.0);
             out.push(format!(
-                "{name}: {} with {setting} → first 70% {} · last 30% {} · median of all {median:+.2}%",
+                "{name}: {} with {setting} → first half {} · walking forward {}{} · median of all {median:+.2}%",
                 b.rules.describe(),
                 trades_brief(&b.picked_on),
                 trades_brief(&b.after),
+                walked(&b),
             ));
         }
         Ok(out.join("\n"))
@@ -10961,7 +10981,7 @@ pub(crate) mod tests {
             "{text}"
         );
         assert!(
-            text.contains("· short ") && text.contains("best on the first 70%"),
+            text.contains("· short ") && text.contains("best on the first half"),
             "{text}"
         );
         run(&mut app, "sweep()");
@@ -10971,7 +10991,7 @@ pub(crate) mod tests {
             "{text}"
         );
         assert!(
-            text.contains("with n=") && text.contains("last 30%"),
+            text.contains("with n=") && text.contains("walking forward"),
             "{text}"
         );
         assert!(text.contains("SL") && text.contains("TP"), "{text}");

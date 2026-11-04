@@ -398,14 +398,17 @@ trading-specific: `backtest("deploy", "latency", "1h")` works the same way.
 in markers, out at the out markers), **short** (the other way round), and the best
 side, stop-loss and take-profit (SL none/0.5–5%, TP none/1–8%; stops and take-profits
 are checked against each candle's high and low, the stop first if a candle touches
-both). That best way is picked on the first 70% of the data and then run on the last
-30%, which it wasn't picked on — if it only did well on the part it was picked on, it
-fitted the past. Each result is next to what holding did (overall and in each part);
+both). That best way is picked on the first half of the data and then checked
+**walking forward** over the second: in stretches (as many as leave about 5 signals
+each, up to 5), each traded the way that was best on everything before it — as you'd
+have traded it then. If it only did well where it was picked, it fitted the past. It
+also says how many stretches were traded the way it picked, and the way that's best on
+all of it (how to trade it from now on) when that's another. Each result is next to what holding did (overall and in each part);
 `:strategies(0.045)` takes a 0.045% fee off every buy and sell. Put settings in the
 lines with `--param` (`--param 'fast = 9 | 12 | 20'` and `ema(values("close"),
 {fast})`) and `:sweep()` does all of that for every combination of them — without
-fetching anything (settings the source's command uses are left as they are) — ranked
-by the last 30%, with the median of every way it tried. These tables stay above the
+fetching anything (settings the source's command uses are left as they are) — each
+strategy's setting picked on the first half, ranked by walking forward, with the median of every way it tried. These tables stay above the
 legend until you close them (Esc, a tap, or the next command).
 
 While it runs, press `K` (or tap **markers**) for the list of rules and
