@@ -273,6 +273,9 @@ pub struct Overlay<'a> {
     pub pixels: Option<&'a pixels::Pixels>,
 }
 
+/// A measured stretch's background (pixels show through it).
+pub const SHADE: Color = Color::Indexed(236);
+
 /// Most rows the markers strip takes (the rest share the last one).
 const MAX_LANES: usize = 6;
 
@@ -1599,25 +1602,22 @@ impl<'a> ChartWidget<'a> {
             .hidden_legend_constraints((Constraint::Ratio(2, 3), Constraint::Ratio(2, 3)))
             .render(area, buf);
         let plot = PlotArea { rect: plot, x0, x1 };
-        if let Some(px) = px {
-            px.pictures.borrow_mut().push(pixels::Picture {
-                rect: plot.rect,
-                x: (x0, x1),
-                y: (y0, y1),
-                strokes,
-                shade: self.overlay.selection.into_iter().collect(),
-                covered: Vec::new(),
-            });
-        }
-        // Shade a measured stretch (in the picture, with pixels).
+        let mut picture = px.map(|_| pixels::Picture {
+            rect: plot.rect,
+            x: (x0, x1),
+            y: (y0, y1),
+            strokes,
+            ..pixels::Picture::default()
+        });
+        // Shade a measured stretch (pixels show through: the image is above cell
+        // backgrounds, under the text).
         if let Some((a, b)) = self.overlay.selection
             && b > x0
             && a < x1
-            && px.is_none()
         {
             for col in plot.col_of(a.max(x0))..=plot.col_of(b.min(x1)) {
                 for row in plot.rect.y..plot.rect.bottom() {
-                    buf[(col, row)].set_bg(Color::Indexed(236));
+                    buf[(col, row)].set_bg(SHADE);
                 }
             }
         }
@@ -1637,9 +1637,14 @@ impl<'a> ChartWidget<'a> {
         if let Some(roles) = ohlc {
             draw_candles(buf, &plot, (y0, y1), roles.map(|r| r.1), &ty);
         }
-        match strip {
-            Some(strip) => self.draw_lanes(buf, strip, &plot, &lanes),
-            None => self.draw_marks(buf, &plot, (y0, y1), &visible),
+        if strip.is_none() {
+            self.draw_marks(buf, &plot, (y0, y1), &visible, picture.as_mut());
+        }
+        if let (Some(px), Some(p)) = (px, picture) {
+            px.pictures.borrow_mut().push(p);
+        }
+        if let Some(strip) = strip {
+            self.draw_lanes(buf, strip, &plot, &lanes, px);
         }
         if let Some(c) = self.overlay.cursor
             && (x0..=x1).contains(&c)
@@ -1670,7 +1675,14 @@ impl<'a> ChartWidget<'a> {
     /// each marker at its moment — lined up with the chart above, so the lines stay
     /// clear and every marker can be seen. Past `MAX_LANES` the rest share the last
     /// row.
-    fn draw_lanes(&self, buf: &mut Buffer, strip: Rect, plot: &PlotArea, lanes: &[String]) {
+    fn draw_lanes(
+        &self,
+        buf: &mut Buffer,
+        strip: Rect,
+        plot: &PlotArea,
+        lanes: &[String],
+        px: Option<&pixels::Pixels>,
+    ) {
         let block = self.block_titled("markers");
         let inner = block.inner(strip);
         block.render(strip, buf);
@@ -1715,6 +1727,18 @@ impl<'a> ChartWidget<'a> {
                     .map_or(Color::Yellow, |i| self.opts.color(i))
             })
         };
+        // With pixels the markers are shapes in a picture of the strip's rows (y: the
+        // rows, the first at the top), at their exact moments.
+        let mut picture = px.map(|_| pixels::Picture {
+            rect: Rect {
+                x: plot.rect.x,
+                width: plot.rect.width,
+                ..inner
+            },
+            x: (plot.x0, plot.x1),
+            y: (0.0, rows as f64),
+            ..pixels::Picture::default()
+        });
         let mut placed: Vec<(u16, u16, &Mark)> = Vec::new();
         for m in self
             .opts
@@ -1722,8 +1746,22 @@ impl<'a> ChartWidget<'a> {
             .iter()
             .filter(|m| m.x >= plot.x0 && m.x <= plot.x1)
         {
-            let row = inner.y + row_of(lane_of(m)) as u16;
+            let k = row_of(lane_of(m));
+            let row = inner.y + k as u16;
             let col = plot.col_of(m.x);
+            placed.push((col, row, m));
+            if let Some(p) = picture.as_mut()
+                && let Some(kind) = pixels::ShapeKind::of(&m.symbol)
+            {
+                p.shapes.push(pixels::Shape {
+                    x: m.x,
+                    y: rows as f64 - k as f64 - 0.5,
+                    kind,
+                    color: color_of(m),
+                    side: 0.0,
+                });
+                continue;
+            }
             let mut style = Style::default()
                 .fg(color_of(m))
                 .add_modifier(Modifier::BOLD | m.effects);
@@ -1731,7 +1769,9 @@ impl<'a> ChartWidget<'a> {
                 style = style.bg(bg);
             }
             buf[(col, row)].set_symbol(&m.symbol).set_style(style);
-            placed.push((col, row, m));
+        }
+        if let (Some(px), Some(p)) = (px, picture) {
+            px.pictures.borrow_mut().push(p);
         }
         // Labels where there's room: the newest first, a few per row.
         placed.sort_by(|a, b| b.2.x.total_cmp(&a.2.x));
@@ -1783,6 +1823,7 @@ impl<'a> ChartWidget<'a> {
         plot: &PlotArea,
         (y0, y1): (f64, f64),
         visible: &[(usize, &Series)],
+        mut picture: Option<&mut pixels::Picture>,
     ) {
         let in_view: Vec<&Mark> = self
             .opts
@@ -1805,6 +1846,8 @@ impl<'a> ChartWidget<'a> {
         let mut at: std::collections::HashSet<(u16, u16)> = Default::default();
         for m in in_view {
             let col = plot.col_of(m.x);
+            // With pixels: (where, which side of it) for a shape in the picture.
+            let mut exact: Option<(f64, f64)> = None;
             let (color, row) = match (&m.series, m.y) {
                 (Some(name), Some(y)) => {
                     let Some(&(i, _)) = visible.iter().find(|(_, s)| &s.name == name) else {
@@ -1821,20 +1864,40 @@ impl<'a> ChartWidget<'a> {
                     let frac = ((y1 - v) / (y1 - y0)).clamp(0.0, 1.0);
                     let point = r.y + (frac * f64::from(r.height - 1)).round() as u16;
                     // Upward symbols sit below the point, the rest above it.
-                    let row = if crate::marks::MarkRule::points_up(&m.symbol) {
+                    let up = crate::marks::MarkRule::points_up(&m.symbol);
+                    let row = if up {
                         (point + 1).min(r.bottom() - 1)
                     } else {
                         point.saturating_sub(1).max(r.y)
                     };
+                    exact = Some((v, if up { 1.0 } else { -1.0 }));
                     (m.color.unwrap_or(self.opts.color(i)), row)
                 }
                 _ => {
-                    for row in r.y..r.bottom() {
-                        if buf[(col, row)].symbol() == " " {
-                            buf[(col, row)].set_symbol("┊").set_fg(Color::Yellow);
+                    let color = m.color.unwrap_or(Color::Yellow);
+                    match picture.as_deref_mut() {
+                        // A dashed line down the plot, the symbol at the top.
+                        Some(p) => {
+                            let n = usize::from(r.height) * 2;
+                            for k in (0..n).step_by(2) {
+                                let at = |k: usize| y1 - (y1 - y0) * k as f64 / n as f64;
+                                p.strokes.push(pixels::Stroke {
+                                    points: vec![(m.x, at(k)), (m.x, at(k + 1))],
+                                    color: dim_color(color),
+                                    dots: false,
+                                });
+                            }
+                            exact = Some((y1, 1.0));
+                        }
+                        None => {
+                            for row in r.y..r.bottom() {
+                                if buf[(col, row)].symbol() == " " {
+                                    buf[(col, row)].set_symbol("┊").set_fg(Color::Yellow);
+                                }
+                            }
                         }
                     }
-                    (m.color.unwrap_or(Color::Yellow), r.y)
+                    (color, r.y)
                 }
             };
             // Never over the legend or other text (not even a gap between words).
@@ -1846,6 +1909,22 @@ impl<'a> ChartWidget<'a> {
             if !free_cell(&buf[(col, row)]) || beside_text {
                 continue;
             }
+            placed.push((col, row, color, m));
+            at.insert((col, row));
+            if let (Some(p), Some((y, side)), Some(kind)) = (
+                picture.as_deref_mut(),
+                exact,
+                pixels::ShapeKind::of(&m.symbol),
+            ) {
+                p.shapes.push(pixels::Shape {
+                    x: m.x,
+                    y,
+                    kind,
+                    color,
+                    side,
+                });
+                continue;
+            }
             let mut style = Style::default()
                 .fg(color)
                 .add_modifier(Modifier::BOLD | m.effects);
@@ -1853,8 +1932,6 @@ impl<'a> ChartWidget<'a> {
                 style = style.bg(bg);
             }
             buf[(col, row)].set_symbol(&m.symbol).set_style(style);
-            placed.push((col, row, color, m));
-            at.insert((col, row));
         }
         let mut taken: Vec<(u16, u16, u16)> = placed.iter().map(|p| (p.1, p.0, p.0)).collect();
         // Labels where there's room — the newest first, and only a few when it's busy

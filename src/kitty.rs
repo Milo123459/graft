@@ -7,6 +7,7 @@
 
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
+use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
 
@@ -42,34 +43,60 @@ pub fn cell_size() -> (f64, f64) {
 /// What's on screen, to send only what changed.
 #[derive(Debug, Default)]
 pub struct Kitty {
-    /// Per picture slot: its image id and what it showed.
-    shown: Vec<(u32, u64)>,
+    /// Per picture slot, what's showing.
+    shown: Vec<Shown>,
     next_id: u32,
 }
+
+#[derive(Debug)]
+struct Shown {
+    id: u32,
+    /// Everything it showed, and just where and what range (not the data).
+    all: u64,
+    frame: u64,
+    at: Instant,
+}
+
+/// New data alone redraws a picture at most this often: a live feed ticks many
+/// times a second, and each picture is a few hundred KB for the terminal to take in.
+/// A move of the view (a pan, a zoom, a popup) redraws at once.
+const DATA_EVERY: Duration = Duration::from_millis(1000);
 
 impl Kitty {
     /// Escapes that bring the screen up to date with these pictures (empty: nothing to do).
     pub fn update(&mut self, pictures: &[Picture], cell: (f64, f64)) -> String {
+        self.update_at(pictures, cell, Instant::now())
+    }
+
+    fn update_at(&mut self, pictures: &[Picture], cell: (f64, f64), now: Instant) -> String {
         let mut out = String::new();
         for (slot, p) in pictures.iter().enumerate() {
-            let key = fingerprint(p, cell);
-            if self.shown.get(slot).is_some_and(|s| s.1 == key) {
+            let (all, frame) = fingerprint(p, cell);
+            if let Some(s) = self.shown.get(slot)
+                && (s.all == all || (s.frame == frame && now - s.at < DATA_EVERY))
+            {
                 continue;
             }
             self.next_id = self.next_id % 1_000_000 + 1;
             let id = self.next_id;
             let (w, h, rgba) = p.rasterize(cell);
             place(&mut out, id, p.rect, w, h, &rgba);
+            let shown = Shown {
+                id,
+                all,
+                frame,
+                at: now,
+            };
             match self.shown.get_mut(slot) {
                 Some(s) => {
-                    delete(&mut out, s.0);
-                    *s = (id, key);
+                    delete(&mut out, s.id);
+                    *s = shown;
                 }
-                None => self.shown.push((id, key)),
+                None => self.shown.push(shown),
             }
         }
-        for (id, _) in self.shown.drain(pictures.len()..) {
-            delete(&mut out, id);
+        for s in self.shown.drain(pictures.len()..) {
+            delete(&mut out, s.id);
         }
         out
     }
@@ -89,13 +116,18 @@ impl Kitty {
     }
 }
 
-fn fingerprint(p: &Picture, cell: (f64, f64)) -> u64 {
+/// Hashes of everything a picture shows, and of just its place, size, x range and
+/// what covers it.
+fn fingerprint(p: &Picture, cell: (f64, f64)) -> (u64, u64) {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     (p.rect.x, p.rect.y, p.rect.width, p.rect.height).hash(&mut h);
     p.size(cell).hash(&mut h);
-    for v in [p.x.0, p.x.1, p.y.0, p.y.1] {
-        v.to_bits().hash(&mut h);
-    }
+    p.x.0.to_bits().hash(&mut h);
+    p.x.1.to_bits().hash(&mut h);
+    p.covered.hash(&mut h);
+    let frame = h.finish();
+    p.y.0.to_bits().hash(&mut h);
+    p.y.1.to_bits().hash(&mut h);
     for s in &p.strokes {
         format!("{:?}{}", s.color, s.dots).hash(&mut h);
         s.points.len().hash(&mut h);
@@ -104,12 +136,13 @@ fn fingerprint(p: &Picture, cell: (f64, f64)) -> u64 {
             pt.1.to_bits().hash(&mut h);
         }
     }
-    for s in &p.shade {
-        s.0.to_bits().hash(&mut h);
-        s.1.to_bits().hash(&mut h);
+    for m in &p.shapes {
+        format!("{:?}{:?}", m.kind, m.color).hash(&mut h);
+        for v in [m.x, m.y, m.side] {
+            v.to_bits().hash(&mut h);
+        }
     }
-    p.covered.hash(&mut h);
-    h.finish()
+    (h.finish(), frame)
 }
 
 /// Send an image and place it over `rect`'s cells, under the text, leaving the cursor
@@ -190,7 +223,8 @@ mod tests {
     #[test]
     fn sends_a_picture_once_and_again_only_when_it_changes() {
         let mut k = Kitty::default();
-        let first = k.update(&[picture(0.2)], (10.0, 20.0));
+        let t = Instant::now();
+        let first = k.update_at(&[picture(0.2)], (10.0, 20.0), t);
         // Placed at row 3, column 4 (1-based), 40×10 cells, under the text.
         assert!(first.starts_with(
             "\x1b7\x1b[3;4H\x1b_Ga=T,f=32,o=z,s=400,v=200,i=1,p=1,c=40,r=10,C=1,z=-1"
@@ -207,14 +241,73 @@ mod tests {
                     <= 4096
             );
         }
-        assert_eq!(k.update(&[picture(0.2)], (10.0, 20.0)), "", "unchanged");
-        let moved = k.update(&[picture(0.3)], (10.0, 20.0));
+        assert_eq!(
+            k.update_at(&[picture(0.2)], (10.0, 20.0), t),
+            "",
+            "unchanged"
+        );
+        // New data alone waits a second…
+        let soon = t + Duration::from_millis(300);
+        assert_eq!(k.update_at(&[picture(0.3)], (10.0, 20.0), soon), "");
+        let later = t + Duration::from_millis(1100);
+        let moved = k.update_at(&[picture(0.3)], (10.0, 20.0), later);
         assert!(moved.contains("i=2,"), "a fresh id");
         assert!(
             moved.ends_with("\x1b_Ga=d,d=I,i=1,q=2\x1b\\"),
             "then the old one goes"
         );
-        assert_eq!(k.update(&[], (10.0, 20.0)), "\x1b_Ga=d,d=I,i=2,q=2\x1b\\");
+        // …but a move of the view goes at once.
+        let mut panned = picture(0.3);
+        panned.x = (0.5, 1.5);
+        let soon = later + Duration::from_millis(50);
+        assert!(k.update_at(&[panned], (10.0, 20.0), soon).contains("i=3,"));
+        assert_eq!(k.update(&[], (10.0, 20.0)), "\x1b_Ga=d,d=I,i=3,q=2\x1b\\");
         assert_eq!(k.clear(), "", "nothing left to clear");
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use crate::render::pixels::Stroke;
+    use ratatui::style::Color;
+
+    #[test]
+    #[ignore]
+    fn time_a_frame() {
+        let pts: Vec<(f64, f64)> = (0..3200)
+            .map(|i| {
+                (
+                    i as f64,
+                    (i as f64 / 50.0).sin() * 40.0 + (i as f64 * 7.3).sin() * 5.0,
+                )
+            })
+            .collect();
+        let p = Picture {
+            rect: Rect::new(12, 1, 170, 45),
+            x: (0.0, 3200.0),
+            y: (-50.0, 50.0),
+            strokes: vec![Stroke {
+                points: pts,
+                color: Color::Indexed(81),
+                dots: false,
+            }],
+            ..Picture::default()
+        };
+        let cell = (18.0, 38.0);
+        let t = std::time::Instant::now();
+        let (w, h, rgba) = p.rasterize(cell);
+        let r = t.elapsed();
+        let t = std::time::Instant::now();
+        let z = miniz_oxide::deflate::compress_to_vec_zlib(&rgba, 1);
+        let c = t.elapsed();
+        let t = std::time::Instant::now();
+        let b = base64(&z);
+        let e = t.elapsed();
+        eprintln!(
+            "{w}x{h}: raster {r:?}, zlib {c:?} ({} KB), base64 {e:?} ({} KB)",
+            z.len() / 1024,
+            b.len() / 1024
+        );
     }
 }

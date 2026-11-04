@@ -8239,8 +8239,10 @@ impl App {
         self.covers.borrow_mut().push(rect);
     }
 
-    /// Where each picture must stay clear: under text, coloured cells, boxes inside
-    /// the plot (the legend, the cursor's readout) and popups.
+    /// Where each picture must stay clear: under coloured cells (a badge, a button),
+    /// boxes inside the plot (a legend) and popups. Text is drawn over the picture as
+    /// it is: clearing under it too would change the picture whenever the cursor and
+    /// its readout move, and send it again on every mouse move.
     fn mark_covered(&self, buf: &ratatui::buffer::Buffer) {
         let covers = self.covers.borrow();
         for p in self.pixels.pictures.borrow_mut().iter_mut() {
@@ -8264,11 +8266,7 @@ impl App {
                 for x in r.left()..r.right() {
                     let cell = &buf[(x, y)];
                     let sym = cell.symbol();
-                    let braille = sym
-                        .chars()
-                        .next()
-                        .is_some_and(|c| ('\u{2800}'..='\u{28FF}').contains(&c));
-                    if (sym != " " && !braille) || cell.bg != Color::Reset {
+                    if !matches!(cell.bg, Color::Reset | crate::render::SHADE) {
                         covered[at(x, y)] = true;
                     }
                     // A box's top left corner: the whole box.
@@ -10710,46 +10708,46 @@ pub(crate) mod tests {
         ]);
         assert!(app.pixels_on());
         let s = screen_sized(&app, 110, 34);
-        // The lines aren't text any more, but the axes and markers are.
+        // The lines and markers aren't text any more, but the axes and labels are.
         assert_eq!(braille(&s), 0, "{s}");
-        assert!(s.contains("GB") && s.contains('▼'), "{s}");
-        let covered_at = |app: &App, text: char| {
-            let s = screen_sized(app, 110, 34);
-            let (pictures, _) = app.pictures();
-            let p = &pictures[0];
-            assert_eq!(p.covered.len(), usize::from(p.rect.width * p.rect.height));
-            let mut hits = (0, 0);
-            for (y, line) in s.lines().enumerate() {
-                for (x, c) in line.chars().enumerate() {
-                    let (x, y) = (x as u16, y as u16);
-                    if c == text && p.rect.contains(ratatui::layout::Position { x, y }) {
-                        let i = usize::from((y - p.rect.y) * p.rect.width + x - p.rect.x);
-                        hits.0 += 1;
-                        hits.1 += usize::from(p.covered[i]);
-                    }
-                }
-            }
-            hits
-        };
+        assert!(!s.contains('▼'), "{s}");
+        assert!(s.contains("GB") && s.contains("fell"), "{s}");
         {
             let (pictures, _) = app.pictures();
             assert_eq!(pictures.len(), 1);
             let p = &pictures[0];
             assert!(!p.strokes.is_empty() && p.strokes.iter().all(|s| s.points.len() > 1));
-            assert!(!p.covered[usize::from(p.rect.height / 2 * p.rect.width + p.rect.width / 3)]);
+            assert!(!p.shapes.is_empty());
+            assert!(
+                p.shapes
+                    .iter()
+                    .all(|m| m.kind == crate::render::pixels::ShapeKind::Down && m.side < 0.0)
+            );
+            assert_eq!(p.covered.len(), usize::from(p.rect.width * p.rect.height));
+            assert!(p.covered.iter().all(|c| !c), "nothing over it");
         }
-        // Under each marker the picture is clear, so it reads.
-        let (marks, clear) = covered_at(&app, '▼');
-        assert!(marks > 0 && clear == marks, "{marks} {clear}");
-        // The cursor stays text (it moves with the mouse).
+        // The cursor stays text, and moving it leaves the picture as it was (so it
+        // isn't sent again on every mouse move).
         key(&mut app, KeyCode::Char('c'));
         assert!(app.cursor.is_some());
         let s = screen_sized(&app, 110, 34);
         assert!(braille(&s) > 0, "{s}");
-        // Its readout (the time and values beside it) is clear too.
-        let (digits, clear) = covered_at(&app, '8');
-        assert!(digits > 0 && clear == digits, "{s}");
+        let before = app.pictures().0[0].clone();
+        key(&mut app, KeyCode::Left);
+        key(&mut app, KeyCode::Left);
+        screen_sized(&app, 110, 34);
+        assert_eq!(app.pictures().0[0], before);
         key(&mut app, KeyCode::Esc);
+        // In the strip below the chart they're shapes too, a row each.
+        key(&mut app, KeyCode::Char('B'));
+        screen_sized(&app, 110, 34);
+        {
+            let (pictures, _) = app.pictures();
+            assert_eq!(pictures.len(), 2, "the chart and the strip");
+            assert!(pictures[0].shapes.is_empty());
+            assert!(!pictures[1].shapes.is_empty() && pictures[1].strokes.is_empty());
+        }
+        key(&mut app, KeyCode::Char('B'));
         // A popup over the chart is kept clear too.
         key(&mut app, KeyCode::Char('?'));
         screen_sized(&app, 110, 34);
@@ -12354,8 +12352,9 @@ pub(crate) mod tests {
         let t = out(&mut app, r#"mean("db")"#).1;
         assert!(t.contains(" · at the cursor ("), "{t}");
         assert!(out(&mut app, r#"at("api")"#).1.contains("at the cursor"));
+        // (The demo's times follow the clock: any time will do.)
         assert!(
-            screen(&app).contains("cursor 09:") || screen(&app).contains("cursor 1"),
+            Regex::new(r"cursor \d").unwrap().is_match(&screen(&app)),
             "the legend row says it's the cursor"
         );
         // `5m` is five minutes.

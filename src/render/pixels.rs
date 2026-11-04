@@ -15,6 +15,43 @@ pub struct Stroke {
     pub dots: bool,
 }
 
+/// A marker's symbol drawn as a shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShapeKind {
+    Up,
+    Down,
+    Dot,
+    Square,
+    Diamond,
+    Cross,
+}
+
+impl ShapeKind {
+    /// The shape for a marker symbol (`None`: it stays text).
+    pub fn of(symbol: &str) -> Option<Self> {
+        Some(match symbol {
+            "▲" | "△" | "↑" | "▴" => Self::Up,
+            "▼" | "▽" | "↓" | "▾" => Self::Down,
+            "•" | "●" | "○" | "·" | "∙" | "⬤" => Self::Dot,
+            "■" | "□" | "▪" | "◼" => Self::Square,
+            "◆" | "◇" | "♦" => Self::Diamond,
+            "✕" | "×" | "✖" | "x" => Self::Cross,
+            _ => return None,
+        })
+    }
+}
+
+/// A marker at its exact place (data coordinates).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Shape {
+    pub x: f64,
+    pub y: f64,
+    pub kind: ShapeKind,
+    pub color: Color,
+    /// -1: just above the point (a ▼ pointing at it), 1: just below, 0: on it.
+    pub side: f64,
+}
+
 /// One plot's image: where it goes (in cells), what it shows, and what's on it.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Picture {
@@ -22,9 +59,9 @@ pub struct Picture {
     pub x: (f64, f64),
     pub y: (f64, f64),
     pub strokes: Vec<Stroke>,
-    /// x ranges shaded (a measured stretch).
-    pub shade: Vec<(f64, f64)>,
-    /// Cells covered by text or a popup (the image is left clear there), row by row.
+    pub shapes: Vec<Shape>,
+    /// Cells under a popup, a box or a coloured cell (the image is left clear there),
+    /// row by row.
     pub covered: Vec<bool>,
 }
 
@@ -56,13 +93,12 @@ impl Picture {
         let sx = w as f64 / (x1 - x0).max(f64::MIN_POSITIVE);
         let sy = h as f64 / (y1 - y0).max(f64::MIN_POSITIVE);
         let at = |p: &(f64, f64)| ((p.0 - x0) * sx, (y1 - p.1) * sy);
-        for &(a, b) in &self.shade {
-            let (l, r) = (at(&(a.max(x0), 0.0)).0, at(&(b.min(x1), 0.0)).0);
-            canvas.fill_columns(l, r, rgb(Color::Indexed(236)), 0.6);
-        }
+        let (cw, ch) = (
+            w as f64 / f64::from(self.rect.width.max(1)),
+            h as f64 / f64::from(self.rect.height.max(1)),
+        );
         // About a ninth of a row: thin, but never a hairline.
-        let px_per_row = h as f64 / f64::from(self.rect.height.max(1));
-        let width = (px_per_row / 9.0).clamp(1.2, 4.0);
+        let width = (ch / 9.0).clamp(1.2, 4.0);
         for s in &self.strokes {
             let pts: Vec<(f64, f64)> = s
                 .points
@@ -77,11 +113,67 @@ impl Picture {
             }
             canvas.composite(rgb(s.color));
         }
-        // Keep text and popups readable: nothing under them.
-        let (cw, ch) = (
-            w as f64 / f64::from(self.rect.width.max(1)),
-            h as f64 / f64::from(self.rect.height.max(1)),
-        );
+        // Markers: about a glyph's size, a ▼ with its tip just above the point.
+        let a = (ch * 0.3).min(cw * 0.75).max(2.0);
+        // One per shape's width (the last listed wins, as text keeps one per cell):
+        // a day of trades in a row would otherwise be a smear.
+        let mut slots: std::collections::HashMap<(i64, i64), usize> = Default::default();
+        let spots: Vec<Option<(f64, f64)>> = self
+            .shapes
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                if !(m.x.is_finite() && m.y.is_finite()) {
+                    return None;
+                }
+                let (cx, py) = at(&(m.x, m.y));
+                let cy = py + m.side * (a + ch * 0.12);
+                slots.insert(((cx / (a * 2.0)) as i64, (cy / (a * 2.0)) as i64), i);
+                Some((cx, cy))
+            })
+            .collect();
+        let mut drawn: Vec<usize> = slots.into_values().collect();
+        drawn.sort_unstable();
+        for i in drawn {
+            let (m, Some((cx, cy))) = (&self.shapes[i], spots[i]) else {
+                continue;
+            };
+            match m.kind {
+                ShapeKind::Up => canvas.convex(&[
+                    (cx, cy - a),
+                    (cx + a * 0.95, cy + a * 0.8),
+                    (cx - a * 0.95, cy + a * 0.8),
+                ]),
+                ShapeKind::Down => canvas.convex(&[
+                    (cx - a * 0.95, cy - a * 0.8),
+                    (cx + a * 0.95, cy - a * 0.8),
+                    (cx, cy + a),
+                ]),
+                ShapeKind::Dot => canvas.segment((cx, cy), (cx, cy), a * 1.3),
+                ShapeKind::Square => {
+                    let s = a * 0.7;
+                    canvas.convex(&[
+                        (cx - s, cy - s),
+                        (cx + s, cy - s),
+                        (cx + s, cy + s),
+                        (cx - s, cy + s),
+                    ])
+                }
+                ShapeKind::Diamond => canvas.convex(&[
+                    (cx, cy - a),
+                    (cx + a * 0.8, cy),
+                    (cx, cy + a),
+                    (cx - a * 0.8, cy),
+                ]),
+                ShapeKind::Cross => {
+                    let s = a * 0.7;
+                    canvas.segment((cx - s, cy - s), (cx + s, cy + s), a * 0.35);
+                    canvas.segment((cx - s, cy + s), (cx + s, cy - s), a * 0.35);
+                }
+            }
+            canvas.composite(rgb(m.color));
+        }
+        // Keep popups and boxes readable: nothing under them.
         for (i, _) in self.covered.iter().enumerate().filter(|c| *c.1) {
             let (col, row) = (
                 i % usize::from(self.rect.width),
@@ -98,8 +190,9 @@ impl Picture {
     }
 }
 
-/// Most pixels in one image (about 1920×1250).
-const MAX_PIXELS: f64 = 2.4e6;
+/// Most pixels in one image (about 1600×1000): sharp enough on a Retina screen, and
+/// a picture stays quick to draw, send and for the terminal to take in.
+const MAX_PIXELS: f64 = 1.6e6;
 
 struct Canvas {
     w: usize,
@@ -198,13 +291,44 @@ impl Canvas {
         self.dirty = (usize::MAX, usize::MAX, 0, 0);
     }
 
-    /// Shade whole columns from `l` to `r` (pixels).
-    fn fill_columns(&mut self, l: f64, r: f64, color: (u8, u8, u8), alpha: f32) {
-        let (a, b) = Self::span(l, r, 0.0, self.w);
-        for y in 0..self.h {
-            for x in a..b {
-                let i = y * self.w + x;
-                blend(&mut self.rgba[i * 4..i * 4 + 4], color, alpha);
+    /// A filled, anti-aliased convex polygon.
+    fn convex(&mut self, pts: &[(f64, f64)]) {
+        let (lo_x, hi_x) = pts
+            .iter()
+            .fold((f64::MAX, f64::MIN), |a, p| (a.0.min(p.0), a.1.max(p.0)));
+        let (lo_y, hi_y) = pts
+            .iter()
+            .fold((f64::MAX, f64::MIN), |a, p| (a.0.min(p.1), a.1.max(p.1)));
+        let (xa, xb) = Self::span(lo_x, hi_x, 1.0, self.w);
+        let (ya, yb) = Self::span(lo_y, hi_y, 1.0, self.h);
+        if xa >= xb || ya >= yb || pts.len() < 3 {
+            return;
+        }
+        self.touch(xa, ya, xb, yb);
+        // Which way round the corners go, so "outside" has one sign.
+        let area: f64 = (0..pts.len())
+            .map(|i| {
+                let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+                a.0 * b.1 - b.0 * a.1
+            })
+            .sum();
+        let sign = if area < 0.0 { -1.0 } else { 1.0 };
+        for y in ya..yb {
+            let py = y as f64 + 0.5;
+            for x in xa..xb {
+                let px = x as f64 + 0.5;
+                // The furthest outside of any edge (negative: inside all of them).
+                let out = (0..pts.len())
+                    .map(|i| {
+                        let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+                        let (ex, ey) = (b.0 - a.0, b.1 - a.1);
+                        let len = (ex * ex + ey * ey).sqrt().max(f64::MIN_POSITIVE);
+                        -sign * (ex * (py - a.1) - ey * (px - a.0)) / len
+                    })
+                    .fold(f64::MIN, f64::max);
+                let c = (0.5 - out).clamp(0.0, 1.0) as f32;
+                let cell = &mut self.cover[y * self.w + x];
+                *cell = cell.max(c);
             }
         }
     }
@@ -343,17 +467,33 @@ mod tests {
     }
 
     #[test]
-    fn dots_and_shading() {
+    fn dots_and_markers() {
         let mut p = picture(vec![Stroke {
             points: vec![(2.0, 8.0)],
             color: Color::Red,
             dots: true,
         }]);
-        p.shade = vec![(6.0, 8.0)];
+        let shape = |x, kind, side| Shape {
+            x,
+            y: 5.0,
+            kind,
+            color: Color::Green,
+            side,
+        };
+        p.shapes = vec![
+            shape(5.0, ShapeKind::Down, -1.0),
+            shape(8.0, ShapeKind::Up, 1.0),
+        ];
         let (w, _, img) = p.rasterize((10.0, 20.0));
         assert_eq!(alpha(&img, w, 20, 20), 255, "the dot");
         assert_eq!(alpha(&img, w, 40, 20), 0, "nothing beside it");
-        assert!(alpha(&img, w, 70, 50) > 0, "the shaded stretch");
+        // The ▼ sits above its point (y 50), the ▲ below.
+        assert_eq!(alpha(&img, w, 50, 42), 255, "inside the ▼");
+        assert_eq!(alpha(&img, w, 50, 58), 0, "not below it");
+        assert_eq!(alpha(&img, w, 80, 58), 255, "inside the ▲");
+        assert_eq!(alpha(&img, w, 80, 42), 0, "not above it");
+        assert_eq!(ShapeKind::of("▼"), Some(ShapeKind::Down));
+        assert_eq!(ShapeKind::of("🚀"), None, "stays text");
     }
 
     #[test]
