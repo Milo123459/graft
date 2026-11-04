@@ -170,6 +170,7 @@ enum Cmd {
     Legend,
     Undo,
     Discover,
+    MarksBelow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -889,6 +890,7 @@ impl App {
         c.front = self.opts.front.clone();
         c.side_by_side = self.opts.side_by_side;
         c.no_targets = !self.opts.show_targets;
+        c.marks_below = self.opts.marks_below;
         c.last = self.timeframe.last;
         if self.timeframe.since.is_none() {
             c.since = None;
@@ -4004,6 +4006,17 @@ impl App {
                     false,
                 );
             }
+            Cmd::MarksBelow => {
+                self.opts.marks_below = !self.opts.marks_below;
+                self.say(
+                    if self.opts.marks_below {
+                        "markers below the chart, a row each (B puts them back on it)"
+                    } else {
+                        "markers on the chart"
+                    },
+                    false,
+                );
+            }
             Cmd::Markers => {
                 self.marks_menu = match self.marks_menu {
                     Some(_) => None,
@@ -4303,6 +4316,17 @@ impl App {
             head.push((t, Style::default().fg(c).add_modifier(Modifier::BOLD)));
         }
         g.push((head, None));
+        // Paused: easy to miss as a dot, and the chart looks stuck — say so, and a tap
+        // resumes (the data kept coming meanwhile).
+        if self.paused {
+            g.push((
+                vec![(
+                    " paused — tap or space to resume ".into(),
+                    Style::default().fg(Color::Black).bg(Color::Yellow),
+                )],
+                Some(Hit::Cmd(Cmd::Pause)),
+            ));
+        }
         // Lines are arriving but the format matches none of them: say so, rather than
         // leaving an empty chart.
         if self.session.matched == 0 && self.session.lines > 0 {
@@ -6267,6 +6291,7 @@ impl App {
                             effects: ratatui::style::Modifier::empty(),
                             badge: false,
                             bg: None,
+                            lane: Some("marked".into()),
                         });
                         self.update_marks();
                     }
@@ -6675,6 +6700,7 @@ impl App {
             Flag::Cursor => self.cursor.is_some(),
             Flag::Mouse => self.mouse,
             Flag::Legend => self.show_legend,
+            Flag::MarksBelow => self.opts.marks_below,
             Flag::Measure => self.measuring || self.anchor.is_some() || self.selection.is_some(),
         }
     }
@@ -6696,6 +6722,7 @@ impl App {
             Flag::Cursor => Cmd::Cursor,
             Flag::Mouse => Cmd::Mouse,
             Flag::Legend => Cmd::Legend,
+            Flag::MarksBelow => Cmd::MarksBelow,
             Flag::Measure => Cmd::Select,
         };
         let t = self.run_cmd(cmd);
@@ -6925,6 +6952,7 @@ impl App {
             KeyCode::Char('N') => Cmd::Alerts,
             KeyCode::Char('S') => Cmd::Sources,
             KeyCode::Char('i') => Cmd::Legend,
+            KeyCode::Char('B') => Cmd::MarksBelow,
             KeyCode::Char('[') => Cmd::RangeStep(-1),
             KeyCode::Char(']') => Cmd::RangeStep(1),
             KeyCode::Char(' ' | 'p') => Cmd::Pause,
@@ -7519,6 +7547,7 @@ impl App {
                 b("svg", Cmd::Export),
                 b("mouse", Cmd::Mouse).active(self.mouse),
                 b("legend", Cmd::Legend).active(self.show_legend),
+                b("marks below", Cmd::MarksBelow).active(self.opts.marks_below),
                 b("?", Cmd::Help),
                 b("quit", Cmd::Quit),
             ]);
@@ -9281,6 +9310,46 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn markers_go_in_a_strip_below_the_chart() {
+        let mut app = app(&[
+            "graft",
+            LOG,
+            "-s",
+            "node2",
+            "--mark",
+            "delta < -1.5GB => fell {delta}",
+            "--mark",
+            "pct > 0.3 => up {pct}",
+        ]);
+        let count = |s: &str| s.matches('▼').count();
+        let on_chart = count(&screen(&app));
+        assert!(on_chart > 0);
+        key(&mut app, KeyCode::Char('B'));
+        assert!(app.opts.marks_below);
+        for (w, h) in [(100, 30), (46, 30)] {
+            let s = screen_sized(&app, w, h);
+            if std::env::var("SHOW").is_ok() {
+                eprintln!("{s}");
+            }
+            assert!(s.contains("markers"), "{s}");
+            // A row per rule, named on the left (as far as fits).
+            let fell = s.lines().position(|l| l.contains("│fel")).expect(&s);
+            let up = s.lines().position(|l| l.contains("│up")).expect(&s);
+            assert_ne!(fell, up, "{s}");
+            assert!(s.lines().nth(fell).unwrap().contains('▼'), "{s}");
+            // Not on the lines any more: they're all in the strip.
+            let strip = s.lines().position(|l| l.contains("markers")).unwrap();
+            let above: usize = s.lines().take(strip).map(count).sum();
+            assert_eq!(above, 0, "{s}");
+        }
+        // The setting is kept, and the console has it.
+        assert!(app.current_cli().marks_below);
+        run(&mut app, "marks_below(false)");
+        assert!(!app.opts.marks_below);
+        assert_eq!(count(&screen(&app)), on_chart);
+    }
+
+    #[test]
     fn markers_from_rules_scripts_and_by_hand() {
         let mut app = app(&[
             "graft",
@@ -10001,6 +10070,20 @@ pub(crate) mod tests {
             app.tick_lab();
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn paused_says_so_and_a_tap_resumes() {
+        let path = bouncy_log(200);
+        let mut app = app(&["graft", path.to_str().unwrap(), "--kv"]);
+        run(&mut app, "pause()");
+        assert!(app.paused);
+        let s = screen_sized(&app, 46, 30);
+        assert!(s.contains("paused"), "{s}");
+        let (x, y) = find(&app, "paused");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+        assert!(!app.paused);
+        assert!(!screen_sized(&app, 46, 30).contains("paused"));
     }
 
     #[test]

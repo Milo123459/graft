@@ -35,6 +35,29 @@ pub struct MarkRule {
     pub bg: Option<String>,
 }
 
+impl MarkRule {
+    /// Its name in the markers strip: its label without the `{…}` parts (`cross in`),
+    /// else the condition.
+    pub fn lane(&self) -> String {
+        let mut name = String::new();
+        let mut depth = 0;
+        for c in self.label.as_deref().unwrap_or("").chars() {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ if depth == 0 => name.push(c),
+                _ => {}
+            }
+        }
+        let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+        if name.is_empty() {
+            self.expr.clone()
+        } else {
+            name
+        }
+    }
+}
+
 /// Text effects a marker can have; `badge` puts its label on its colour.
 pub const EFFECTS: [&str; 6] = ["bold", "italic", "underline", "dim", "reverse", "badge"];
 
@@ -411,6 +434,7 @@ fn evaluate_rule(
                 effects: modifiers(&rule.effects),
                 badge: rule.effects.iter().any(|e| e == "badge"),
                 bg: rule.bg.as_deref().and_then(color),
+                lane: Some(rule.lane()),
             });
         }
     }

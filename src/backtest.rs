@@ -572,6 +572,7 @@ mod tests {
             effects: ratatui::style::Modifier::empty(),
             badge: false,
             bg: None,
+            lane: None,
         }
     }
 

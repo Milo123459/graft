@@ -99,6 +99,9 @@ pub struct ChartOpts {
     pub panes: Option<panes::Panes>,
     /// Markers (from `--mark` rules or `mark()`).
     pub marks: Vec<Mark>,
+    /// Markers in a strip of their own below the chart (a row per rule), not on the
+    /// lines.
+    pub marks_below: bool,
 
     /// Draw explicit target lines.
     pub show_targets: bool,
@@ -133,6 +136,7 @@ impl Default for ChartOpts {
             right: crate::cli::Lines::default_right(),
             panes: None,
             marks: Vec::new(),
+            marks_below: false,
             show_targets: true,
             tidy: false,
             front: Vec::new(),
@@ -263,6 +267,14 @@ pub struct Overlay<'a> {
     pub sources: Option<&'a [SourceView]>,
 }
 
+/// Most rows the markers strip takes (the rest share the last one).
+const MAX_LANES: usize = 6;
+
+/// The markers strip row a marker goes in.
+fn lane_of(m: &Mark) -> &str {
+    m.lane.as_deref().unwrap_or("marks")
+}
+
 /// A marker on the chart: at a point of a series, or (no series) a whole moment.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Mark {
@@ -280,6 +292,9 @@ pub struct Mark {
     /// The label on the marker's colour, like a tag.
     pub badge: bool,
     pub bg: Option<Color>,
+    /// Its row in the markers strip below the chart (`--marks-below`): the rule's
+    /// name, the strategy… (`None`: "marks").
+    pub lane: Option<String>,
 }
 
 /// What a pane's own source has produced so far.
@@ -1158,6 +1173,29 @@ impl<'a> ChartWidget<'a> {
         panel: bool,
     ) {
         let (x0, x1) = plot_x_bounds(self.ds, self.opts, self.overlay.view, self.overlay.hidden);
+        // Markers below: a strip under the chart, a row per lane (when there's room).
+        let lanes = if self.opts.marks_below && !panel {
+            self.lanes()
+        } else {
+            Vec::new()
+        };
+        let rows = lanes.len().min(MAX_LANES) as u16;
+        let (area, strip) = if rows > 0 && area.height >= rows + 2 + 8 {
+            let h = rows + 2;
+            (
+                Rect {
+                    height: area.height - h,
+                    ..area
+                },
+                Some(Rect {
+                    y: area.y + area.height - h,
+                    height: h,
+                    ..area
+                }),
+            )
+        } else {
+            (area, None)
+        };
         let buckets = area.width.saturating_sub(14).max(10) as usize * 2;
         let log = self.opts.log;
         let ty = |v: f64| if log { v.log10() } else { v };
@@ -1535,7 +1573,10 @@ impl<'a> ChartWidget<'a> {
         if let Some(roles) = ohlc {
             draw_candles(buf, &plot, (y0, y1), roles.map(|r| r.1), &ty);
         }
-        self.draw_marks(buf, &plot, (y0, y1), &visible);
+        match strip {
+            Some(strip) => self.draw_lanes(buf, strip, &plot, &lanes),
+            None => self.draw_marks(buf, &plot, (y0, y1), &visible),
+        }
         if let Some(c) = self.overlay.cursor
             && (x0..=x1).contains(&c)
         {
@@ -1546,6 +1587,123 @@ impl<'a> ChartWidget<'a> {
                 &lines.iter().map(|l| (l.0, l.1)).collect::<Vec<_>>(),
                 ohlc.map(|r| r.map(|v| v.1)),
             );
+        }
+    }
+
+    /// The markers strip's rows, in the order their markers first come.
+    fn lanes(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for m in &self.opts.marks {
+            let lane = lane_of(m);
+            if !out.iter().any(|l| *l == lane) {
+                out.push(lane.to_string());
+            }
+        }
+        out
+    }
+
+    /// The markers strip: a row per lane (the rule, the strategy…), named on the left,
+    /// each marker at its moment — lined up with the chart above, so the lines stay
+    /// clear and every marker can be seen. Past `MAX_LANES` the rest share the last
+    /// row.
+    fn draw_lanes(&self, buf: &mut Buffer, strip: Rect, plot: &PlotArea, lanes: &[String]) {
+        let block = self.block_titled("markers");
+        let inner = block.inner(strip);
+        block.render(strip, buf);
+        let rows = inner.height as usize;
+        if rows == 0 || plot.rect.width == 0 {
+            return;
+        }
+        let row_of = |lane: &str| {
+            let k = lanes.iter().position(|l| l == lane).unwrap_or(0);
+            k.min(rows - 1)
+        };
+        let gutter = plot.rect.x.saturating_sub(inner.x);
+        let dim = Style::default().fg(Color::DarkGray);
+        for (k, name) in lanes.iter().enumerate().take(rows) {
+            let name = if k + 1 == rows && lanes.len() > rows {
+                format!("+{} more", lanes.len() - k)
+            } else {
+                name.clone()
+            };
+            if gutter >= 3 {
+                let w = gutter as usize - 1;
+                let text: String = name.chars().take(w).collect();
+                buf.set_stringn(inner.x, inner.y + k as u16, &text, w, dim);
+            }
+        }
+        // Where the cursor is, down the strip too.
+        if let Some(c) = self.overlay.cursor
+            && (plot.x0..=plot.x1).contains(&c)
+        {
+            let col = plot.col_of(c);
+            for k in 0..rows {
+                buf[(col, inner.y + k as u16)]
+                    .set_symbol("┊")
+                    .set_fg(Color::DarkGray);
+            }
+        }
+        let color_of = |m: &Mark| {
+            m.color.unwrap_or_else(|| {
+                m.series
+                    .as_ref()
+                    .and_then(|n| self.ds.series.iter().position(|s| &s.name == n))
+                    .map_or(Color::Yellow, |i| self.opts.color(i))
+            })
+        };
+        let mut placed: Vec<(u16, u16, &Mark)> = Vec::new();
+        for m in self
+            .opts
+            .marks
+            .iter()
+            .filter(|m| m.x >= plot.x0 && m.x <= plot.x1)
+        {
+            let row = inner.y + row_of(lane_of(m)) as u16;
+            let col = plot.col_of(m.x);
+            let mut style = Style::default()
+                .fg(color_of(m))
+                .add_modifier(Modifier::BOLD | m.effects);
+            if let Some(bg) = m.bg {
+                style = style.bg(bg);
+            }
+            buf[(col, row)].set_symbol(&m.symbol).set_style(style);
+            placed.push((col, row, m));
+        }
+        // Labels where there's room: the newest first, a few per row.
+        placed.sort_by(|a, b| b.2.x.total_cmp(&a.2.x));
+        let mut per_row: std::collections::HashMap<u16, usize> = Default::default();
+        let marked: Vec<(u16, u16)> = placed.iter().map(|p| (p.0, p.1)).collect();
+        for &(col, row, m) in &placed {
+            let n = per_row.entry(row).or_default();
+            if *n >= 6 || m.label.is_empty() {
+                continue;
+            }
+            let text = if m.badge {
+                format!(" {} ", m.label)
+            } else {
+                m.label.clone()
+            };
+            let w = unicode_width::UnicodeWidthStr::width(text.as_str()) as u16;
+            let fits = |x: u16| {
+                x >= plot.rect.x
+                    && x + w <= plot.rect.right()
+                    && (x.saturating_sub(1)..x + w + 1)
+                        .all(|c| !marked.contains(&(c, row)) && free_cell(&buf[(c, row)]))
+            };
+            let right = Some(col + 2).filter(|&x| fits(x));
+            let left = col.checked_sub(w + 1).filter(|&x| fits(x));
+            let Some(x) = right.or(left) else {
+                continue;
+            };
+            let style = if m.badge {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(m.bg.unwrap_or(color_of(m)))
+            } else {
+                Style::default().fg(color_of(m))
+            };
+            buf.set_stringn(x, row, &text, w as usize, style);
+            *n += 1;
         }
     }
 
@@ -2577,6 +2735,7 @@ impl ChartWidget<'_> {
         let base = ChartOpts {
             trend_window: self.opts.trend_window,
             show_targets: self.opts.show_targets,
+            marks_below: self.opts.marks_below,
             forecast: self.opts.forecast,
             split: self.opts.split,
             log: self.opts.log,
@@ -2918,6 +3077,7 @@ mod tests {
             effects: Modifier::ITALIC,
             badge: true,
             bg: None,
+            lane: None,
         };
         let opts = ChartOpts {
             marks: vec![mark],

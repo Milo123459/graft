@@ -416,6 +416,11 @@ markers: tap a rule to edit it (it opens in the console; Enter saves, Esc
 cancels), tap the buttons under it to cycle its symbol, colour or effect (plain, badge, bold,
 underline, italic, reverse, dim — for several at once, edit the rule), **notify** to be
 told about new ones, **✕** deletes one, **+ add rule** and **mark now** add more.
+`B` (or **marks below** in **⋯**, `marks_below()`, `--marks-below`) moves every
+marker off the lines into a strip below the chart: a row per rule, named by its label
+without the `{…}` parts (or its condition), each marker at its moment and lined up
+with the chart above; discovery's trades get a row of their own, markers placed by
+hand one called *marked*. Past six rows the rest share the last.
 `N` (or **alerts**) lists alerts, which markers notify, and where notifications
 go (bell, desktop, ntfy on your phone, a webhook or a command), with a test
 button.
@@ -556,7 +561,7 @@ graft --stream 'https://feed-v3.veranta.xyz/v1/stream?price_feed_ids=1' --json -
   --series 'price:USD = priceFeeds_0_price * 1e-8' --series 'bid:USD = priceFeeds_0_bestBidPrice * 1e-8' \
   --series 'ask:USD = priceFeeds_0_bestAskPrice * 1e-8' --select price,bid,ask --hide bid,ask --resample 1s:last \
   --history '-c "curl -s \"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1s&limit=1000&startTime={from_ms:1000s}&endTime={now_ms}\"" --json --time-field 0 --series "price:USD = c4" --select price' \
-  --history-depth 6h --discover upside:250
+  --history-depth 6h --discover upside:250 --marks-below
 ```
 
 ### Counting log lines

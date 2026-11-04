@@ -257,6 +257,7 @@ pub fn chart_opts(cli: &Cli, spec: &SourceSpec, analysis: Analysis) -> Result<Ch
         panes: crate::render::panes::Panes::from_args(&cli.pane, cli.layout.as_deref())
             .map_err(anyhow::Error::msg)?,
         show_targets: !cli.no_targets,
+        marks_below: cli.marks_below,
         analysis,
         forecast: cli
             .forecast

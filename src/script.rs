@@ -165,6 +165,7 @@ pub enum Flag {
     Mouse,
     Measure,
     Legend,
+    MarksBelow,
 }
 
 /// Script names of the on/off buttons. Each takes an optional bool (none = toggle).
@@ -182,6 +183,7 @@ pub const FLAGS: &[(&str, Flag)] = &[
     ("mouse", Flag::Mouse),
     ("measure", Flag::Measure),
     ("legend", Flag::Legend),
+    ("marks_below", Flag::MarksBelow),
 ];
 
 /// State shared between the host and registered functions.
@@ -762,6 +764,11 @@ pub const USAGE: &[(&str, &str, &str)] = &[
     ("mouse", "mouse()", "the mouse on/off"),
     ("measure", "measure()", "start measuring a stretch"),
     ("legend", "legend()  ·  legend(false)", "the legends on/off"),
+    (
+        "marks_below",
+        "marks_below()  ·  marks_below(false)",
+        "markers in a strip below the chart, a row per rule, instead of on the lines",
+    ),
     // panes
     ("split_right", "split_right()", "a new pane to the right"),
     ("split_down", "split_down()", "a new pane below"),
@@ -1000,6 +1007,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "mouse",
             "measure",
             "legend",
+            "marks_below",
         ],
     ),
     (

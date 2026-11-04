@@ -478,6 +478,11 @@ pub struct Cli {
     #[arg(long, help_heading = "Analysis")]
     pub no_targets: bool,
 
+    /// Draw markers in a strip below the chart, a row per rule (or strategy), instead
+    /// of on the lines. `B` in the viewer.
+    #[arg(long, help_heading = "Chart")]
+    pub marks_below: bool,
+
     /// Exit with status 3 if a Rhai condition holds, e.g. `node1 < 50GB` or `slope("node2") < 0`.
     #[arg(long, value_name = "EXPR", action = ArgAction::Append, help_heading = "Analysis")]
     pub alert: Vec<String>,
@@ -825,6 +830,7 @@ impl Cli {
             (self.trend_only, "--trend-only"),
             (self.side_by_side, "--side-by-side"),
             (self.no_targets, "--no-targets"),
+            (self.marks_below, "--marks-below"),
             (self.no_sync, "--no-sync"),
         ];
         a.extend(flags.iter().filter(|f| f.0).map(|f| f.1.to_string()));

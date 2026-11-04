@@ -446,6 +446,10 @@ The database spikes now and then: mark it."#,
                 "in it: edit / delete a rule (symbol, colour, notify too)",
             ),
             ("a n", "in it: add a rule / mark now, by hand"),
+            (
+                "B / marks below",
+                "markers in a strip of their own below the chart: a row per rule (named by its label without the {…} parts), each marker at its moment, lined up with the chart above — the lines stay clear and busy markers stay readable. Discovery's trades get a row too. Again (or marks_below(false)) puts them back on the lines; --marks-below starts that way",
+            ),
         ],
         examples: &[
             (
@@ -1084,7 +1088,7 @@ The next pages are recipes for real use: copy puts one on your clipboard."#,
         title: "recipe: a scalping lab",
         text: "A live BTC price pushed 5 times a second (server-sent events) with its bid and ask, resampled to a point a second, with 6 hours of Binance's 1-second prices before it (--history pages back, 1,000 seconds a request). Discovery waits for the history, then searches it and keeps paper-trading what it finds on the live price, with Upside's profit sharing at 250x. Leave it running: live trades are the only test the search never saw.",
         command: Some(
-            r#"graft --stream 'https://feed-v3.veranta.xyz/v1/stream?price_feed_ids=1' --json --time-field timestampUs --series 'price:USD = priceFeeds_0_price * 1e-8' --series 'bid:USD = priceFeeds_0_bestBidPrice * 1e-8' --series 'ask:USD = priceFeeds_0_bestAskPrice * 1e-8' --select price,bid,ask --hide bid,ask --resample 1s:last --history '-c "curl -s \"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1s&limit=1000&startTime={from_ms:1000s}&endTime={now_ms}\"" --json --time-field 0 --series "price:USD = c4" --select price' --history-depth 6h --discover upside:250 --title 'BTC scalping lab'"#,
+            r#"graft --stream 'https://feed-v3.veranta.xyz/v1/stream?price_feed_ids=1' --json --time-field timestampUs --series 'price:USD = priceFeeds_0_price * 1e-8' --series 'bid:USD = priceFeeds_0_bestBidPrice * 1e-8' --series 'ask:USD = priceFeeds_0_bestAskPrice * 1e-8' --select price,bid,ask --hide bid,ask --resample 1s:last --history '-c "curl -s \"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1s&limit=1000&startTime={from_ms:1000s}&endTime={now_ms}\"" --json --time-field 0 --series "price:USD = c4" --select price' --history-depth 6h --discover upside:250 --marks-below --title 'BTC scalping lab'"#,
         ),
         ..BASE
     },

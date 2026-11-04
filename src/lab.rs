@@ -404,6 +404,7 @@ impl Lab {
             return Vec::new();
         };
         let series = Some(report.input.name.clone());
+        let lane = Some(format!("strategy {}", self.selected + 1));
         let mark = |x: f64, y: Option<f64>, label: String, symbol: &str, color: Color| {
             crate::render::Mark {
                 series: series.clone(),
@@ -416,6 +417,7 @@ impl Lab {
                 effects: Modifier::empty(),
                 badge: false,
                 bg: None,
+                lane: lane.clone(),
             }
         };
         let mut out = Vec::new();
