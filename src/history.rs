@@ -5,8 +5,8 @@
 //! chart (and discovery) starts with hours of data instead of none.
 //!
 //! When its command asks for a window (`{from…}` … `{now…}`), it pages back: run for
-//! the window ending now, then for the window before the oldest point it got, and so on
-//! until `--history-depth` is covered. Scrolling back to the oldest data asks for the
+//! the window ending now and the ones before it, four at once (each the window's length
+//! earlier), until `--history-depth` is covered or a page comes back empty. Scrolling back to the oldest data asks for the
 //! window before that, like the backfill of a command source.
 
 use anyhow::{Result, bail};
@@ -18,17 +18,36 @@ use crate::session::Session;
 use crate::source::SourceSpec;
 
 /// Pages it runs at most to cover the depth at the start.
-const MAX_PAGES: usize = 200;
+const MAX_PAGES: usize = 500;
+/// Pages it fetches at once while filling (an API a second or two away loads 4× as
+/// fast).
+const PARALLEL: usize = 4;
+
+/// A page being read: what it was asked for (the window ending at `end`) and how many
+/// lines of it matched so far.
+struct Page {
+    live: Live,
+    end: f64,
+    got: usize,
+}
 
 pub struct History {
     session: Session,
     /// Its command (with `{from…}` / `{now…}` still in it), if it's one.
     cmd: Option<(String, Option<String>)>,
-    /// The page being read, and the time it ends at.
-    page: Option<(Live, f64)>,
+    /// How long a window each run asks for (`None`: not known, so pages go one at a
+    /// time, each ending at the oldest point so far).
+    span: Option<f64>,
+    /// The pages being read.
+    loading: Vec<Page>,
+    /// Where the next page ends, while filling.
+    next_end: Option<f64>,
+    /// Pages read.
     pub pages: usize,
     /// How far back to go at the start (seconds).
     depth: f64,
+    /// When it started (the depth is counted back from here).
+    started: f64,
     /// Still paging back to cover the depth.
     filling: bool,
     /// The source has nothing older.
@@ -85,17 +104,30 @@ impl History {
         if !own_resample {
             setup.session.set_resample(chart.resample);
         }
-        Ok(History {
+        let span = cmd
+            .as_ref()
+            .and_then(|(c, _)| crate::params::window_span(c));
+        let now = crate::time::now_secs();
+        let mut h = History {
             own_resample,
             session: setup.session,
             cmd,
-            page: Some((Live::new(first), crate::time::now_secs())),
+            span,
+            loading: vec![Page {
+                live: Live::new(first),
+                end: now,
+                got: 0,
+            }],
+            next_end: span.map(|s| now - s),
             pages: 0,
             depth,
+            started: now,
             filling: true,
             done: false,
             cache: None,
-        })
+        };
+        h.fill();
+        Ok(h)
     }
 
     /// The chart's points changed spacing: its own follow (unless it set its own).
@@ -110,15 +142,15 @@ impl History {
     /// Returns whether it's loading more.
     pub fn set_depth(&mut self, depth: f64) -> bool {
         self.depth = depth;
-        let covered = match (self.oldest(), self.newest()) {
-            (Some(a), Some(b)) => b - a,
-            _ => 0.0,
-        };
-        if covered >= depth || self.done {
-            return false;
+        if self.covered() >= depth || self.done || !self.pages_back() {
+            return self.loading();
         }
         self.filling = true;
-        self.more()
+        if self.next_end.is_none() || self.span.is_none() {
+            self.next_end = self.oldest();
+        }
+        self.fill();
+        self.loading()
     }
 
     /// Whether its command asks for a window (so it can page back).
@@ -130,11 +162,11 @@ impl History {
 
     /// Still paging back to cover the depth (the first load).
     pub fn filling(&self) -> bool {
-        self.filling && self.page.is_some()
+        self.filling && self.loading()
     }
 
     pub fn loading(&self) -> bool {
-        self.page.is_some()
+        !self.loading.is_empty()
     }
 
     pub fn oldest(&self) -> Option<f64> {
@@ -155,35 +187,99 @@ impl History {
             .max_by(f64::total_cmp)
     }
 
-    /// Read the page being loaded; when it's done, start the next one while the depth
+    /// How much time it has, oldest to newest.
+    fn covered(&self) -> f64 {
+        match (self.oldest(), self.newest()) {
+            (Some(a), Some(b)) => b - a,
+            _ => 0.0,
+        }
+    }
+
+    /// Start a page: the window ending at `end`.
+    fn launch(&mut self, end: f64) {
+        let Some((cmd, ssh)) = &self.cmd else { return };
+        let spec = SourceSpec::Command {
+            cmd: crate::params::fill_times(cmd, end),
+            every: std::time::Duration::from_secs(1),
+            count: Some(1),
+            ssh: ssh.clone(),
+        };
+        self.loading.push(Page {
+            live: Live::new(spec),
+            end,
+            got: 0,
+        });
+    }
+
+    /// While filling: keep up to PARALLEL pages going, back to the depth. When the
+    /// window's length isn't known, one at a time from the oldest point.
+    fn fill(&mut self) {
+        if !self.filling || self.done || !self.pages_back() {
+            return;
+        }
+        // Back to the depth from its newest point (from now until there's one).
+        let until = self.newest().unwrap_or(self.started) - self.depth;
+        let at_once = if self.span.is_some() { PARALLEL } else { 1 };
+        while self.loading.len() < at_once && self.pages + self.loading.len() < MAX_PAGES {
+            let end = match (self.span, self.next_end) {
+                (Some(_), Some(e)) => e,
+                // One at a time: from the oldest point, once the last page is in.
+                _ if self.loading.is_empty() => match self.oldest() {
+                    Some(o) => o,
+                    None => return,
+                },
+                _ => return,
+            };
+            if end <= until {
+                return;
+            }
+            self.launch(end);
+            self.next_end = self.span.map(|s| end - s);
+        }
+    }
+
+    /// Read the pages being loaded; when one is done, start the next while the depth
     /// isn't covered. Returns (a page finished, an error or news to show).
     pub fn tick(&mut self) -> (bool, Option<(String, bool)>) {
-        let Some((live, end)) = &mut self.page else {
+        if self.loading.is_empty() {
             return (false, None);
-        };
+        }
         let session = &mut self.session;
-        let errors = live.pump(std::time::Duration::from_millis(30), &mut |line, meta| {
-            let _ = session.feed(line, meta);
-        });
-        if let Some(e) = errors.into_iter().last() {
-            self.page = None;
+        let mut finished = Vec::new();
+        let mut error = None;
+        for (k, page) in self.loading.iter_mut().enumerate() {
+            let got = &mut page.got;
+            let errors = page
+                .live
+                .pump(std::time::Duration::from_millis(10), &mut |line, meta| {
+                    if session.feed(line, meta).is_ok() {
+                        *got += 1;
+                    }
+                });
+            if let Some(e) = errors.into_iter().last() {
+                error = Some(e);
+                finished.push(k);
+            } else if page.live.eof {
+                finished.push(k);
+            }
+        }
+        if finished.is_empty() {
+            return (false, None);
+        }
+        let mut empty = false;
+        for k in finished.into_iter().rev() {
+            let page = self.loading.remove(k);
+            self.pages += 1;
+            // Nothing where it asked (and it asked before what it has): that's all.
+            empty |= page.got == 0 && self.oldest().is_some_and(|o| page.end <= o + 1.0);
+        }
+        if let Some(e) = error {
+            self.loading.clear();
             self.filling = false;
             return (true, Some((format!("history: {e}"), true)));
         }
-        if !live.eof {
-            return (false, None);
-        }
-        let end = *end;
-        self.page = None;
-        self.pages += 1;
-        let oldest = self.oldest();
-        // Nothing older than asked for: that's all there is.
-        if oldest.is_none_or(|o| o >= end - 1e-9) && self.pages > 1 {
-            self.done = true;
-            self.filling = false;
-            return (true, Some(("history: no older data".into(), false)));
-        }
         if self.session.lines > 0 && self.session.matched == 0 {
+            self.loading.clear();
             self.filling = false;
             return (
                 true,
@@ -196,78 +292,80 @@ impl History {
                 )),
             );
         }
-        let covered = match (oldest, self.newest()) {
-            (Some(a), Some(b)) => b - a,
-            _ => 0.0,
-        };
+        if empty && self.pages > 1 {
+            self.done = true;
+        }
+        let covered = self.covered();
         let page_s = if self.pages == 1 { "" } else { "s" };
-        if self.filling && covered < self.depth && self.pages < MAX_PAGES && self.more() {
-            // How far it's got, page by page, so it's clearly moving.
+        if self.filling {
+            self.fill();
+            if self.loading() {
+                // How far it's got, page by page, so it's clearly moving.
+                return (
+                    true,
+                    Some((
+                        format!(
+                            "history: loading… {} of {} ({} page{page_s})",
+                            crate::time::fmt_duration(covered),
+                            crate::time::fmt_duration(self.depth),
+                            self.pages
+                        ),
+                        false,
+                    )),
+                );
+            }
+            self.filling = false;
+            let all = if self.done { ", all it has" } else { "" };
             return (
                 true,
                 Some((
                     format!(
-                        "history: loading… {} of {} ({} page{page_s})",
+                        "history: {} loaded ({} page{page_s}{all})",
                         crate::time::fmt_duration(covered),
-                        crate::time::fmt_duration(self.depth),
-                        self.pages
+                        self.pages,
                     ),
                     false,
                 )),
             );
+        }
+        if self.loading() {
+            return (true, None);
         }
         // Scrolled back for more: say what came.
-        if !self.filling {
-            let back = oldest.map_or(String::new(), |o| {
-                format!(
-                    ", back to {} ago",
-                    crate::time::fmt_ago(crate::time::now_secs() - o)
-                )
-            });
-            return (
-                true,
-                Some((
-                    format!(
-                        "history: older data loaded ({} in all{back})",
-                        crate::time::fmt_duration(covered)
-                    ),
-                    false,
-                )),
-            );
+        if self.done {
+            return (true, Some(("history: no older data".into(), false)));
         }
-        let news = self.filling.then(|| {
-            (
-                format!(
-                    "history: {} loaded ({} page{page_s})",
-                    crate::time::fmt_duration(covered),
-                    self.pages,
-                ),
-                false,
+        let back = self.oldest().map_or(String::new(), |o| {
+            format!(
+                ", back to {} ago",
+                crate::time::fmt_ago(crate::time::now_secs() - o)
             )
         });
-        self.filling = false;
-        (true, news)
+        (
+            true,
+            Some((
+                format!(
+                    "history: older data loaded ({} in all{back})",
+                    crate::time::fmt_duration(covered)
+                ),
+                false,
+            )),
+        )
     }
 
     /// Ask for the window before the oldest point (scrolled back to it). False when it
-    /// can't: no window in its command, nothing older, or a page already loading.
+    /// can't: no window in its command, or nothing older. True while pages are loading.
     pub fn more(&mut self) -> bool {
-        if self.page.is_some() {
+        if self.loading() {
             return true;
         }
         if self.done || !self.pages_back() {
             return false;
         }
-        let (Some((cmd, ssh)), Some(oldest)) = (&self.cmd, self.oldest()) else {
+        let Some(oldest) = self.oldest() else {
             return false;
         };
-        let spec = SourceSpec::Command {
-            cmd: crate::params::fill_times(cmd, oldest),
-            every: std::time::Duration::from_secs(1),
-            count: Some(1),
-            ssh: ssh.clone(),
-        };
-        self.page = Some((Live::new(spec), oldest));
+        self.launch(oldest);
         true
     }
 
@@ -348,6 +446,36 @@ mod tests {
             said.contains("older data loaded") && said.contains("back to"),
             "{said}"
         );
+    }
+
+    #[test]
+    fn several_pages_load_at_once_with_no_gaps() {
+        // Each page takes 0.3 s and has a point a minute; 8 of them one at a time would
+        // take 2.4 s.
+        let cmd = r#"-c 'sleep 0.3; start={from:10m}; end={now}; for i in 0 1 2 3 4 5 6 7 8 9; do echo "{\"t\":$((start + i * 60)),\"price\":1}"; done' --json --time-field t"#;
+        let started = std::time::Instant::now();
+        let mut h = History::open(cmd, &Cli::empty(), 8.0 * 600.0).unwrap();
+        while h.loading() && started.elapsed() < std::time::Duration::from_secs(10) {
+            h.tick();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1600),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(h.pages >= 8, "{}", h.pages);
+        let mut full = Dataset {
+            x_kind: XKind::Time,
+            series: Vec::new(),
+        };
+        h.join(&mut full);
+        let p = &full.series[0].points;
+        assert!(
+            p.windows(2).all(|w| w[1].0 - w[0].0 <= 60.0 + 1e-9),
+            "a point a minute, no gaps"
+        );
+        assert!(p.last().unwrap().0 - p[0].0 >= 8.0 * 600.0 - 60.0);
     }
 
     #[test]

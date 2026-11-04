@@ -714,7 +714,7 @@ From here on the steps are a reference: read what's useful, skip the rest with E
             ),
             (
                 r#"--history '-c "curl -s \"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1s&limit=1000&startTime={from_ms:1000s}&endTime={now_ms}\"" --json --time-field 0 --series "price = c4" --select price' --history-depth 6h"#,
-                "older data for a source that only sends what's new (a stream): another source with its own format, whose series go in before the source's own under the same names. With a window in its command it pages back to --history-depth (1h unless you say), saying how far it's got, and scrolling to the oldest data fetches more",
+                "older data for a source that only sends what's new (a stream): another source with its own format, whose series go in before the source's own under the same names. With a window in its command it pages back to --history-depth (1h unless you say), four pages at once, saying how far it's got, and scrolling to the oldest data fetches more",
             ),
             (
                 r#":history_depth("24h")"#,

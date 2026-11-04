@@ -152,6 +152,26 @@ pub fn fill_times(text: &str, end: f64) -> String {
         .into_owned()
 }
 
+/// How long a window a command asks for (seconds): `{from_ms:1000s}` … `{now_ms}` is
+/// 1000. `None` when it doesn't ask for one.
+pub fn window_span(text: &str) -> Option<f64> {
+    if !has_window(text) {
+        return None;
+    }
+    static FROM: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\{from(_ms)?(:[^}]*)?\}").expect("valid"));
+    let m = FROM.find(text)?;
+    let end = 2.0e9;
+    let at: f64 = fill_times(m.as_str(), end).parse().ok()?;
+    let at = if m.as_str().starts_with("{from_ms") {
+        at / 1000.0
+    } else {
+        at
+    };
+    let span = end - at;
+    (span > 0.0).then_some(span)
+}
+
 /// Whether a command asks for a time window (so older data can be fetched).
 pub fn has_window(text: &str) -> bool {
     text.contains("{from") && text.contains("{now")
@@ -160,6 +180,17 @@ pub fn has_window(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_commands_window_length() {
+        assert_eq!(
+            window_span("curl \"…?start={from_ms:1000s}&end={now_ms}\""),
+            Some(1000.0)
+        );
+        assert_eq!(window_span("x {from:6h} {now}"), Some(21600.0));
+        assert_eq!(window_span("x {from:500*1m} {now}"), Some(30000.0));
+        assert_eq!(window_span("curl …"), None);
+    }
 
     #[test]
     fn params_parse_fill_and_change() {
