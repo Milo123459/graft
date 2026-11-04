@@ -117,7 +117,7 @@ impl Lab {
             match Input::from_dataset(ds, &self.settings) {
                 Ok(input) if input.len() >= discover::MIN_POINTS => {
                     let (tx, rx) = std::sync::mpsc::channel();
-                    let fee = self.settings.fee;
+                    let fees = self.settings.fees;
                     let pool = self.pool.clone();
                     self.runs += 1;
                     let budget = Budget {
@@ -126,7 +126,7 @@ impl Lab {
                         seed: 0x9e37_79b9_7f4a_7c15 ^ (self.runs as u64) ^ input.len() as u64,
                     };
                     std::thread::spawn(move || {
-                        let _ = tx.send(discover::search(input, fee, &pool, budget));
+                        let _ = tx.send(discover::search(input, fees, &pool, budget));
                     });
                     self.worker = Some(rx);
                 }
@@ -230,7 +230,7 @@ impl Lab {
         self.refreshed = Some((Instant::now(), newest.0, newest.1));
         let mut news = None;
         for (k, t) in self.tracked.iter_mut().enumerate() {
-            let trades = discover::trade(&t.found.strategy, &input, 0, self.settings.fee);
+            let trades = discover::trade(&t.found.strategy, &input, 0, &self.settings.fees);
             let before = t.trades.iter().filter(|r| r.3).count();
             t.prices = trades
                 .iter()

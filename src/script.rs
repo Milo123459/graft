@@ -76,8 +76,8 @@ pub enum Action {
     Strategies(f64),
     /// The strategies for every combination of the settings the lines and rules use.
     Sweep(f64),
-    /// Start (or restart) discovering strategies: fee % per side, the price series.
-    Discover(f64, Option<String>),
+    /// Start (or restart) discovering strategies: the costs, the price series.
+    Discover(crate::discover::Fees, Option<String>),
     Undiscover,
     /// Keep discovered strategy n (`None`: the one on the chart) as lines and a rule.
     DiscoverKeep(Option<usize>),
@@ -300,7 +300,11 @@ pub fn ident(name: &str) -> String {
             }
         })
         .collect();
-    if s.is_empty() || s.starts_with(|c: char| c.is_ascii_digit()) {
+    // Rhai names can't start with a digit, nor be `_` and digits: a JSON row's
+    // field 4 is `c4` (column 4), `1min` is `_1min`.
+    if s.chars().all(|c| c.is_ascii_digit() || c == '_') {
+        s.insert(0, 'c');
+    } else if s.starts_with(|c: char| c.is_ascii_digit()) {
         s.insert(0, '_');
     }
     if RESERVED.contains(&s.as_str()) {
@@ -830,8 +834,8 @@ pub const USAGE: &[(&str, &str, &str)] = &[
     ),
     (
         "discover",
-        r#"discover(0.045)  ·  discover(0.045, "price")"#,
-        "invent formulas and strategies from the data as it streams in, and paper-trade them (fee % a side)",
+        r#"discover(0.045)  ·  discover("upside:250", "price")"#,
+        "invent formulas and strategies from the data as it streams in, and paper-trade them (a fee % a side, or upside:LEVERAGE profit sharing)",
     ),
     (
         "undiscover",
@@ -2734,17 +2738,30 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
         Ok(())
     });
     let st = state.clone();
-    engine.register_fn("discover", move || push(&st, Action::Discover(0.0, None)));
+    engine.register_fn("discover", move || {
+        push(
+            &st,
+            Action::Discover(crate::discover::Fees::Flat(0.0), None),
+        )
+    });
+    // A fee % a side, or "upside:250".
+    let fees_of = |d: &Dynamic| -> FnResult<crate::discover::Fees> {
+        let text = match dyn_to_f64(d) {
+            Some(f) => f.to_string(),
+            None => d.to_string(),
+        };
+        Ok(crate::discover::Fees::parse(&text)?)
+    };
     let st = state.clone();
     engine.register_fn("discover", move |fee: Dynamic| -> FnResult<()> {
-        push(&st, Action::Discover(fee_of(&fee)?, None));
+        push(&st, Action::Discover(fees_of(&fee)?, None));
         Ok(())
     });
     let st = state.clone();
     engine.register_fn(
         "discover",
         move |fee: Dynamic, series: &str| -> FnResult<()> {
-            push(&st, Action::Discover(fee_of(&fee)?, Some(series.into())));
+            push(&st, Action::Discover(fees_of(&fee)?, Some(series.into())));
             Ok(())
         },
     );
@@ -3065,6 +3082,7 @@ rebind("a", b)"#;
         assert_eq!(ident("cpu.user"), "cpu_user");
         assert_eq!(ident("Active(anon)"), "Active_anon_");
         assert_eq!(ident("1min"), "_1min");
+        assert_eq!(ident("4"), "c4");
         assert_eq!(ident("in"), "in_");
     }
 

@@ -100,6 +100,24 @@ pub struct Cli {
     #[arg(long = "source", value_name = "NAME = ARGS", help_heading = "Input")]
     pub source: Vec<String>,
 
+    /// Older data for a source that only sends what's new (a stream): another source
+    /// with its own arguments, like --source: `--history '-c "curl -s
+    /// …&startTime={from_ms:1000s}&endTime={now_ms}" --json --time-field 0 --series
+    /// "price = c4"'`. Its series go in under the same names, before the source's first
+    /// point. With a window in its command it pages back to --history-depth, and
+    /// scrolling to the oldest data fetches the window before it.
+    #[arg(
+        long,
+        value_name = "ARGS",
+        allow_hyphen_values = true,
+        help_heading = "Input"
+    )]
+    pub history: Option<String>,
+
+    /// How far back --history goes at the start.
+    #[arg(long, value_name = "DURATION", default_value = "1h", value_parser = parse_duration, help_heading = "Input")]
+    pub history_depth: Duration,
+
     /// With --merge, redraw as soon as any source has new data, instead of waiting
     /// for a round with something new from every live source.
     #[arg(long, help_heading = "Input")]
@@ -372,10 +390,12 @@ pub struct Cli {
 
     // ───────────── Analysis ─────────────
     /// Discover strategies as the data comes in: invent formulas over the series, test
-    /// what the price does after their extremes, build strategies (with this fee in %
-    /// per buy and per sell) and paper-trade them live. Same as `discover(FEE)`.
-    #[arg(long, value_name = "FEE", num_args = 0..=1, default_missing_value = "0", help_heading = "Analysis")]
-    pub discover: Option<f64>,
+    /// what the price does after their extremes, build strategies and paper-trade them
+    /// live. FEES: a % per buy and per sell (0.045), or `upside:LEVERAGE` (Veranta's
+    /// profit sharing: nothing on losses, 25% down to 5% of profits; `upside:250:staked`).
+    /// Same as `discover(FEES)`.
+    #[arg(long, value_name = "FEES", num_args = 0..=1, default_missing_value = "0", value_parser = parse_fees, help_heading = "Analysis")]
+    pub discover: Option<crate::discover::Fees>,
 
     /// Print statistics and trends (slope, R², forecast) for each series.
     #[arg(short = 'S', long, help_heading = "Analysis")]
@@ -640,7 +660,13 @@ impl Cli {
         };
         opt("--cmd", self.cmd.clone());
         opt("--stream", self.stream.clone());
-        opt("--discover", self.discover.map(|f| f.to_string()));
+        opt("--history", self.history.clone());
+        opt(
+            "--history-depth",
+            (self.history_depth != d.history_depth)
+                .then(|| fmt_secs(self.history_depth.as_secs_f64())),
+        );
+        opt("--discover", self.discover.map(|f| f.to_arg()));
         for m in &self.send {
             opt("--send", Some(m.clone()));
         }
@@ -942,6 +968,10 @@ fn value_name<T: ValueEnum>(v: T) -> String {
     v.to_possible_value()
         .map(|p| p.get_name().to_string())
         .unwrap_or_default()
+}
+
+fn parse_fees(s: &str) -> Result<crate::discover::Fees, String> {
+    crate::discover::Fees::parse(s)
 }
 
 fn fmt_secs(s: f64) -> String {

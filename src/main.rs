@@ -8,6 +8,7 @@ mod discover;
 mod explain;
 mod export;
 mod formula;
+mod history;
 mod interactive;
 mod lab;
 mod lines;

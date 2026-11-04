@@ -588,6 +588,8 @@ pub struct App {
     /// Fetching older data (scrolled back to the oldest): that run of the command,
     /// and the oldest time when it started.
     backfill: Option<(Live, f64)>,
+    /// `--history`: older data under the source's own.
+    older: Option<crate::history::History>,
     /// The source had nothing older to give.
     backfill_done: bool,
     /// The open popup's area (as last drawn), and which of its buttons the arrow
@@ -698,9 +700,9 @@ impl App {
             paged: false,
             built_uncut: false,
             show_stats: cli.stats,
-            lab: cli.discover.map(|fee| {
+            lab: cli.discover.map(|fees| {
                 crate::lab::Lab::new(crate::discover::Settings {
-                    fee,
+                    fees,
                     ..Default::default()
                 })
             }),
@@ -748,6 +750,7 @@ impl App {
             settings_menu: false,
             show_legend: true,
             backfill: None,
+            older: None,
             backfill_done: false,
             popup_rect: std::cell::Cell::new(None),
             popup_focus: std::cell::Cell::new(0),
@@ -786,6 +789,16 @@ impl App {
             presets: Vec::new(),
         };
         app.start_merges();
+        if let Some(args) = app.cli.history.clone() {
+            let depth = app.cli.history_depth.as_secs_f64();
+            match crate::history::History::open(&args, &app.cli, depth) {
+                Ok(h) => {
+                    app.older = Some(h);
+                    app.say("history: loading…", false);
+                }
+                Err(e) => app.say(format!("{e:#}"), true),
+            }
+        }
         app.hidden.extend(app.cli.hide.iter().cloned());
         for spec in app.cli.bind.clone() {
             if let Ok((k, code)) = crate::cli::split_bind(&spec) {
@@ -810,7 +823,7 @@ impl App {
         c.split = self.opts.split;
         c.log = self.opts.log;
         c.stats = self.show_stats;
-        c.discover = self.lab.as_ref().map(|l| l.settings.fee);
+        c.discover = self.lab.as_ref().map(|l| l.settings.fees);
         c.no_mouse = !self.mouse;
         c.target = self.opts.analysis.targets.to_specs();
         c.trend = self.opts.trends.clone();
@@ -904,6 +917,7 @@ impl App {
             m.pump(Duration::from_millis(10));
         }
         self.tick_backfill();
+        self.tick_history();
         // A merged source in trouble says so, by name.
         let problems: Vec<String> = self
             .merge_subs
@@ -982,6 +996,9 @@ impl App {
                 self.full.x_kind = merged.x_kind;
             }
             self.full.series.append(&mut merged.series);
+        }
+        if let Some(h) = &mut self.older {
+            h.join(&mut self.full);
         }
         self.session.add_custom_lines(&mut self.full);
         self.presets = timeframe_presets(&self.full);
@@ -1163,6 +1180,14 @@ impl App {
         let Some(lab) = self.lab.as_mut() else {
             return;
         };
+        // History first: a search now would only see its first page.
+        if let Some(h) = self.older.as_ref().filter(|h| h.filling()) {
+            lab.waiting = Some(format!(
+                "waiting for the history to load ({} pages so far)",
+                h.pages
+            ));
+            return;
+        }
         let before = (lab.runs, lab.report.is_some(), lab.selected);
         let news = lab.tick(&self.ds);
         let changed = before != (lab.runs, lab.report.is_some(), lab.selected) || news.is_some();
@@ -1185,7 +1210,7 @@ impl App {
     }
 
     /// `discover(fee, series)`: start (or restart) the lab.
-    fn start_discover(&mut self, fee: f64, series: Option<String>) {
+    fn start_discover(&mut self, fees: crate::discover::Fees, series: Option<String>) {
         if let Some(name) = &series
             && crate::discover::price_series(&self.ds, Some(name)).is_none()
         {
@@ -1200,7 +1225,7 @@ impl App {
             return;
         }
         let settings = crate::discover::Settings {
-            fee,
+            fees,
             series,
             ..Default::default()
         };
@@ -1214,7 +1239,8 @@ impl App {
         .map_or("the price".to_string(), |s| s.name.clone());
         self.say(
             format!(
-                "discover: inventing formulas on {on} and testing them (fee {fee}% a side) — strategies are paper-traded from when they're found"
+                "discover: inventing formulas on {on} and testing them ({}) — strategies are paper-traded from when they're found",
+                fees.short()
             ),
             false,
         );
@@ -3883,7 +3909,7 @@ impl App {
             Cmd::Log => self.opts.log = !self.opts.log,
             Cmd::Stats => self.show_stats = !self.show_stats,
             Cmd::Discover if self.lab.is_some() => self.stop_discover(),
-            Cmd::Discover => self.start_discover(0.0, None),
+            Cmd::Discover => self.start_discover(crate::discover::Fees::Flat(0.0), None),
             Cmd::Forecast => self.toggle_forecast(),
             Cmd::Pause => {
                 self.paused = !self.paused;
@@ -4537,7 +4563,22 @@ impl App {
             .series
             .values()
             .filter_map(|s| s.points.first().map(|p| p.0))
+            .chain(self.older.as_ref().and_then(|h| h.oldest()))
             .min_by(f64::total_cmp)
+    }
+
+    /// Read `--history` pages; each one finished redraws the chart.
+    fn tick_history(&mut self) {
+        let Some(h) = self.older.as_mut() else {
+            return;
+        };
+        let (finished, news) = h.tick();
+        if let Some((text, error)) = news {
+            self.say(text, error);
+        }
+        if finished {
+            self.rebuild(true);
+        }
     }
 
     /// Scrolled back to the oldest data, and the command asks for a time window
@@ -4583,6 +4624,16 @@ impl App {
     fn start_backfill(&mut self) -> bool {
         if self.backfill.is_some() {
             return true;
+        }
+        // --history fetches the older data, when it can.
+        if let Some(h) = self.older.as_mut().filter(|h| h.pages_back()) {
+            let more = h.more();
+            if more && h.loading() {
+                self.say("loading older data…", false);
+            } else if !more {
+                self.say("no older data from the history source", false);
+            }
+            return more;
         }
         if self.backfill_done {
             return false;
@@ -7874,14 +7925,15 @@ impl App {
         };
         match (&lab.report, &lab.waiting) {
             (_, Some(w)) if lab.report.is_none() => {
-                push(format!("{w} · {status}"), dim, None, &mut rows);
+                let sep = if status.is_empty() { "" } else { " · " };
+                push(format!("{w}{sep}{status}"), dim, None, &mut rows);
             }
             (None, _) => push(format!("first search… {status}"), dim, None, &mut rows),
             (Some(r), _) => {
                 let invented = r.pool.iter().filter(|s| s.invented).count();
                 push(
                     format!(
-                        "search {} · {} · {} pts · {:.1}s · {} formulas, {} strategies tried · {invented}/{} best formulas invented · costs {:.1}bp a trip · {status}",
+                        "search {} · {} · {} pts · {:.1}s · {} formulas, {} strategies tried · {invented}/{} best formulas invented · {} · {status}",
                         lab.runs,
                         r.input.name,
                         r.input.len(),
@@ -7889,7 +7941,7 @@ impl App {
                         r.formulas,
                         r.tried,
                         r.pool.len(),
-                        r.cost
+                        r.fees.explain(r.spread)
                     ),
                     dim,
                     None,
@@ -7945,8 +7997,8 @@ impl App {
         if lab.tracked.is_empty() {
             push(
                 format!(
-                    "no strategy has made money after costs ({:.1}bp a round trip) on both the first 70% and the last 30% yet — it keeps looking as data comes in",
-                    report.cost
+                    "no strategy has made money after costs ({}) on both the first 70% and the last 30% yet — it keeps looking as data comes in",
+                    report.fees.explain(report.spread)
                 ),
                 plain,
                 None,
@@ -7985,6 +8037,15 @@ impl App {
             let open = t
                 .open
                 .map_or(String::new(), |o| format!(" · in a trade {o:+.1}bp"));
+            // With leverage: what that is on the margin.
+            let roi = report
+                .fees
+                .roi(if t.live.n > 0 {
+                    t.live.mean
+                } else {
+                    t.found.checked.mean
+                })
+                .map_or(String::new(), |r| format!(" · {r:+.1}% ROI a trade"));
             let color = if t.live.n == 0 {
                 Color::Gray
             } else if t.live.mean > 0.0 {
@@ -7994,7 +8055,7 @@ impl App {
             };
             push(
                 format!(
-                    "↳ first 70% {} · last 30% {} · {live}{open} · found in search {}",
+                    "↳ first 70% {} · last 30% {} · {live}{open}{roi} · found in search {}",
                     t.found.picked.brief(),
                     t.found.checked.brief(),
                     t.run
@@ -8038,10 +8099,13 @@ impl App {
         rows: Vec<(Line<'static>, Option<Hit>)>,
         buttons: &[Button<Hit>],
     ) {
-        let fee = self.lab.as_ref().map_or(0.0, |l| l.settings.fee);
+        let fees = self
+            .lab
+            .as_ref()
+            .map_or(String::new(), |l| l.settings.fees.short());
         let block = Block::bordered()
             .border_style(Style::default().fg(Color::DarkGray))
-            .title(format!(" discover · fee {fee}% a side "));
+            .title(format!(" discover · {fees} "));
         let inner = block.inner(area);
         f.render_widget(block, area);
         let bh = flow_height(buttons, inner.width).min(inner.height);
@@ -9924,6 +9988,58 @@ pub(crate) mod tests {
                 .any(|m| m.rule.is_none() && m.symbol == "•")
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn history_goes_in_before_the_live_data_and_discovery_waits_for_it() {
+        let mut app = app(&[
+            "graft",
+            "-c",
+            r#"echo "{\"t\":{now},\"price\":2}""#,
+            "--json",
+            "--time-field",
+            "t",
+            "--count",
+            "1",
+            "--history",
+            r#"-c 'start={from:10m}; for i in 0 1 2 3 4 5 6 7 8 9; do echo "{\"t\":$((start + i * 60 - 60)),\"price\":1}"; done; test {now} -gt $start' --json --time-field t"#,
+            "--history-depth",
+            "2h",
+            "--discover",
+            "upside:250",
+        ]);
+        assert!(app.older.is_some());
+        app.tick_lab();
+        assert!(
+            app.lab
+                .as_ref()
+                .unwrap()
+                .waiting
+                .as_deref()
+                .is_some_and(|w| w.contains("history")),
+            "{:?}",
+            app.lab.as_ref().unwrap().waiting
+        );
+        let end = Instant::now() + Duration::from_secs(20);
+        while app.older.as_ref().is_some_and(|h| h.loading()) && Instant::now() < end {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let price = app.ds.get("price").unwrap();
+        let span = price.points.last().unwrap().0 - price.points[0].0;
+        assert!(span >= 7200.0, "{span}");
+        assert_eq!(
+            price.points.last().unwrap().1,
+            2.0,
+            "the live point is the newest"
+        );
+        // Kept with the chart.
+        let args = app.current_cli().to_args();
+        assert!(
+            args.iter().any(|a| a.starts_with("--history=-c")),
+            "{args:?}"
+        );
+        assert!(args.contains(&"upside:250".to_string()), "{args:?}");
     }
 
     #[test]

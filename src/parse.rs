@@ -794,10 +794,11 @@ impl LineParser for JsonParser {
             }
         };
         self.buf.clear();
-        // An array of objects (an API's list of candles): one record per object.
+        // An array of objects (an API's list of candles), or of rows (`[[time, open,
+        // high, …], …]`, fields named 0, 1, 2…): one record per item.
         if let Value::Array(items) = &v
             && !items.is_empty()
-            && items.iter().all(Value::is_object)
+            && (items.iter().all(Value::is_object) || items.iter().all(Value::is_array))
         {
             let mut records = items.iter().filter_map(|item| {
                 let mut fields = Vec::new();
@@ -946,6 +947,25 @@ mod tests {
         let r = p.parse("2026-11-01 04:00:01 GET / took 12ms").unwrap();
         assert_eq!(r.points[0].series, "latency");
         assert!((r.points[0].value - 0.012).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_json_array_of_rows_is_one_record_per_row() {
+        let mut p = JsonParser {
+            buf: String::new(),
+            time_field: Some("0".into()),
+            time: TimeParser::new(None),
+            binary: false,
+        };
+        let parsed = p
+            .parse(r#"[[1793787292000,"78533.71"],[1793787293000,"78534.00"]]"#)
+            .unwrap();
+        assert_eq!(parsed.points[0].series, "1");
+        assert_eq!(parsed.points[0].value, 78533.71);
+        assert_eq!(parsed.more.len(), 1);
+        assert!(
+            matches!((parsed.x, parsed.more[0].x), (Some(XVal::Time(a)), Some(XVal::Time(b))) if b - a == 1.0)
+        );
     }
 
     #[test]

@@ -86,6 +86,7 @@ graft -p cpu                           # a preset: cpu, memory, load, network, d
 | Follow a file | `-f, --follow` (handles truncation/rotation) |
 | Run a command repeatedly | `-c, --cmd 'COMMAND'`, `-n, --every 2s`, `--count N` |
 | A stream a server pushes | `--stream URL` (or `--ws`, `--sse`): a WebSocket (`wss://…`; `--send MSG` goes out once connected, e.g. a subscription) or a streaming HTTP response (`https://…`: server-sent events, each event's `data:` is a record, or plain lines; with `--send` it's a POST). Reconnects when dropped. With `--once`, `--count N` records |
+| Older data for a stream | `--history 'ARGS'`: another source with its own format (like `--source`), whose series go in before the source's own under the same names; with `{from_ms:…}` / `{now_ms}` in its command it pages back to `--history-depth 6h` (default 1h), and scrolling to the oldest data fetches more |
 | Keep only recent data | `-w, --window 6h` or `--window 500` (points); older data is dropped from memory |
 | Timeframe | `-L, --last 7d` (or `--last 500` points), `--since 2026-10-15`, `--until "2026-10-20 12:00"`: what's shown **and** analysed. The viewer can change it |
 
@@ -419,46 +420,87 @@ button.
 ### Discovering strategies (`discover()`)
 
 `:discover(0.045)` (or `--discover 0.045`, or `E`, or the **discover** button) hunts
-for edges in a price as data streams in, without being told which indicators to use:
+for edges in a price as data streams in, without being told which indicators to use.
+It searches every 20 s in the background (3 s each time), on what's on the chart: the
+price (`close`, `price` or `mid`, else the first series, or `discover(fees, "name")`),
+bid and ask if there are series named …bid… and …ask…, and every other series as a
+possible signal.
 
-1. **It invents formulas** over every series on the chart, in a small language:
-   `pct(price, 5)` (the change over 5 points, in bp), `z(…, 50)` (distance from the
-   50-point average in standard deviations), `pos` (place in the range, 0–100), `lag
-   diff mean ema std max min rsi slope`, `abs neg sign log`, `+ - * /` and `gap(a, b)`
-   (a relative to b, in bp). It starts from the usual indicators and random formulas
-   and evolves them: mutations (another window, another operation, a part replaced) and
-   crossovers (parts swapped between two good ones). A formula is fit when the price
-   moved clearly one way after its extremes (its lowest or highest 10%), judged on the
-   **first 70%** of the data only; formulas that drift out of their range, or whose
-   parts are of wildly different sizes, are dropped. The best 150 carry over to the next
-   search (every 20 s), so it keeps improving as data arrives.
-2. **Theories**: when a formula is in its lowest or highest 5% / 15%, what the price
-   does 5, 15, 50 or 150 points later, from moments far enough apart not to overlap.
-   Listed only when |t| beats what luck alone would give from that many tests, and
-   checked on the **last 30%** (✓ held / ✗ faded).
-3. **Strategies**: in the theory's direction, out after so many points or at a
-   take-profit / stop-loss sized from the usual move, with a filter from another
-   formula where it clearly helps. Costs come off every trade: the fee on each side, and
-   buying at the ask / selling at the bid when the chart has series named …bid… and
-   …ask…. A strategy has to make money on the first 70% to be checked on the last 30%,
-   and then it's **paper-traded live** from the moment it was found — the only record
-   the search never saw. The panel ranks them by the last 30% and live together.
+**Costs** are either a flat fee, `discover(0.045)` (0.045% per buy and per sell), or
+**profit sharing** as on Veranta's Upside Perps, `discover("upside:250")` at 250x: a
+losing trade pays nothing (you lose the move, at most your margin); a winning one gives
+up part of its profit, less the more it made — you keep 75% up to 250% ROI, 80% up to
+500%, 90% up to 1,500%, 95% beyond, where ROI is the move × the leverage (+2% at 250x
+is 500% ROI: keep 80%). The take-profit can't go past 2,500% ROI, and a trade is
+liquidated at −85% ROI (a 34bp move against you at 250x, 17bp at 500x).
+`upside:250:staked` takes a quarter less (staking AVNT). The spread is paid either way:
+in at the ask, out at the bid (where there's no bid and ask, e.g. in history from
+elsewhere, the average spread around the price).
+
+**1. Formulas.** Signals are formulas in a small language over the series:
+`pct(price, 5)` (the change over 5 points, in bp), `z(…, 50)` (how many standard
+deviations from the 50-point average), `pos` (place in the range, 0–100), `lag diff
+mean ema std max min rsi slope`, `abs neg sign log`, `+ - * /` and `gap(a, b)` (a
+relative to b, in bp). Every value uses only points up to its own. The search starts
+from the usual indicators (as formulas) and 150 random ones, then evolves them:
+mutations (another window, another operation, a part replaced) and crossovers (a part
+of one swapped into another), keeping the fittest. A formula's **fitness** is how
+clearly the price moved one way after its extremes — its lowest and highest 10% — on
+the **first 70%** of the data only (the best |t| over 5, 15, 50 and 150 points ahead,
+less a little per part, so simpler wins ties). Formulas that drift out of the range
+they had (like the price itself: "price above 78,000" means something else tomorrow),
+or that add things of wildly different sizes, are thrown out. The best 150 carry over
+to the next search, so it keeps improving as data arrives.
+
+**2. Theories** are its findings, each a statement you can check: *when this formula
+is in its lowest (or highest) 5% (or 15%), the price over the next h points moves this
+much on average*. For each of the fittest 40 formulas (plus the usual indicators), each
+tail and each h:
+
+- the moments it holds on the first 70% are taken **at least h points apart**, so no
+  two overlap (overlapping windows would count the same move many times and inflate
+  the evidence);
+- the price's change h points after each gives an average and a **t-statistic**: the
+  average divided by its standard error (t = mean ÷ (sd ÷ √n)). Around 2 is "probably
+  not luck" for one test — but it tests thousands, and the strongest of thousands of
+  pure-noise tests has a |t| near √(2 ln N) (about 4.5 for 20,000). That's the **bar**:
+  a theory is listed only above it;
+- then it's checked on the **last 30%**, which it never saw: **✓ held** when the move
+  there is the same way with t ≥ 2, else **✗ faded**.
+
+A theory is about the move, before costs — e.g. on 6 hours of BTC 1-second prices:
+*z(price, 15) > 1.53 (top 15%) → 5 s later +0.51bp (t 7.4, 761 times) · last 30%:
++0.43bp (t 6.9) ✓ held* — real short-term momentum, but half a basis point.
+
+**3. Strategies** trade the theories that cleared t 2 on the first 70%: in their
+direction, out after h points or at a take-profit / stop-loss sized from the usual move
+(several ways, including small stops with big targets, which profit sharing favours);
+the best 15 get one filter from another formula where that clearly helps. Every trade
+pays the costs above. A strategy must make money on the first 70% (t ≥ 1.5, at least 10
+trades) to be checked on the last 30%, and they're ranked by both. The best are then
+**paper-traded live** from the moment they're found — the only record the search
+never saw, so trust it most. The panel shows each one's first 70%, last 30% and live
+record (and, with leverage, the ROI a trade), ranked by the last 30% and live together.
 
 Tap a strategy (or `discover_pick(2)`) to draw its trades (▲/▼ in, • out with its
-result). **keep** (`discover_keep()`) turns it into ordinary chart parts: its formulas
-become hidden lines (`--line 'disc1_1 = formula("…")'`) and its entries a marker rule
-(`disc1 long`) you can backtest, notify on or alert. `undiscover()` stops. The pieces
-work on their own too: `formula("z(pct(price, 5), 50)")` in a line, and `zscore`,
-`change_bp`, `range_pos`, `updown`, `volatility`, `gap` for arrays.
+result); **theories** switches the panel to them. **keep** (`discover_keep()`) turns a
+strategy into ordinary chart parts: its formulas become hidden lines (`--line 'disc1_1
+= formula("…")'`) and its entries a marker rule (`disc1 long`) you can backtest,
+notify on or alert. `undiscover()` stops. The pieces work on their own: `formula("z(pct(
+price, 5), 50)")` in a line, and `zscore`, `change_bp`, `range_pos`, `updown`,
+`volatility`, `gap` for arrays.
 
-Be sceptical: most of what looks good fades, and on real prices few edges survive
-costs. A live BTC price with bid and ask, pushed 5 times a second:
+Be sceptical: most of what looks good fades, and few edges survive costs — on BTC the
+moves it finds are fractions of a basis point. A live BTC price with bid and ask from
+an oracle feed, resampled to a point a second, with 6 hours of Binance's 1-second
+prices before it, and Upside's profit sharing at 250x:
 
 ```sh
 graft --stream 'https://feed-v3.veranta.xyz/v1/stream?price_feed_ids=1' --json --time-field timestampUs \
   --series 'price:USD = priceFeeds_0_price * 1e-8' --series 'bid:USD = priceFeeds_0_bestBidPrice * 1e-8' \
-  --series 'ask:USD = priceFeeds_0_bestAskPrice * 1e-8' --series 'confidence:USD = priceFeeds_0_confidence * 1e-8' \
-  --select price,bid,ask,confidence --hide bid,ask,confidence --window 20000 --discover 0.045
+  --series 'ask:USD = priceFeeds_0_bestAskPrice * 1e-8' --select price,bid,ask --hide bid,ask --resample 1s:last \
+  --history '-c "curl -s \"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1s&limit=1000&startTime={from_ms:1000s}&endTime={now_ms}\"" --json --time-field 0 --series "price:USD = c4" --select price' \
+  --history-depth 6h --discover upside:250
 ```
 
 ### Counting log lines

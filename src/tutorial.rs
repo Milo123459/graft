@@ -547,6 +547,7 @@ The expression can go in quotes or be written as code: add_line("total", user + 
     Step {
         title: "discover strategies",
         text: r#"discover() hunts for edges in a price (here: api) as data streams in, without being told which indicators to use. It invents formulas over every series on the chart, in a small language: pct(price, 5) is the change over 5 points in bp, z(…, 50) the distance from the 50-point average in standard deviations, pos the place in the range; also lag diff mean ema std max min rsi slope, abs neg sign log, + - * / and gap(a, b). Starting from the usual indicators and random formulas, it keeps changing and combining the ones after whose extremes (their lowest or highest 10%) the price moved most clearly one way: evolution, judged only on the first 70% of the data. The best carry over to the next search, every 20 s.
+Costs: a flat fee (% a side) or profit sharing (upside:LEVERAGE, below) — strategies are judged on what you'd actually keep.
 Then it tests theories (when a formula is in its lowest or highest 5%/15%, what the price does 5…150 points later, from moments far enough apart not to overlap) and builds strategies from them: in that direction, out after so many points or at a take-profit / stop-loss sized from the usual move, maybe with a filter from another formula. Costs come off every trade: the fee on each side, and buying at the ask / selling at the bid when the chart has bid and ask series. A strategy must make money on the first 70% (where it was picked) to be checked on the last 30%, and is then paper-traded live from the moment it was found: that's the only record the search never saw, so trust it most. Theories must beat the |t| luck alone would give from that many tests.
 Most of what looks good fades: on real prices, few edges survive costs. That's the honest answer, not a bug."#,
         keys: &[
@@ -571,6 +572,10 @@ Most of what looks good fades: on real prices, few edges survive costs. That's t
             (
                 r#":discover(0.045)"#,
                 "with a fee of 0.045% per buy and per sell; discover() alone: no fee",
+            ),
+            (
+                r#":discover("upside:250")"#,
+                "profit sharing (Veranta's Upside Perps) at 250x: no fee on a losing trade; on a winning one you keep 75% of the profit up to 250% ROI, 80% to 500%, 90% to 1,500%, 95% beyond (ROI = the move × leverage); liquidated at -85% ROI (a 34bp move at 250x). upside:250:staked: a quarter less taken",
             ),
             (
                 r#":discover(0, "api")  :undiscover()"#,
@@ -699,6 +704,10 @@ From here on the steps are a reference: read what's useful, skip the rest with E
                 "the window it asks for: scroll back to the oldest data (or press ← with everything in view) and older is fetched",
             ),
             (
+                r#"--history '-c "curl -s \"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1s&limit=1000&startTime={from_ms:1000s}&endTime={now_ms}\"" --json --time-field 0 --series "price = c4" --select price' --history-depth 6h"#,
+                "older data for a source that only sends what's new (a stream): another source with its own format, whose series go in before the source's own under the same names. With a window in its command it pages back to --history-depth (1h unless you say), and scrolling to the oldest data fetches more",
+            ),
+            (
                 r#"--source 'mem = -c "cat /proc/meminfo" --kv' --pane 'source=mem'"#,
                 "a named source for a pane (it replaces a preset with that name)",
             ),
@@ -730,7 +739,7 @@ From here on the steps are a reference: read what's useful, skip the rest with E
             ),
             (
                 "--json --time-field ts",
-                "JSON lines; nested keys become a.b.c (an array: one record per object)",
+                "JSON lines; nested keys become a.b.c (an array: one record per object, or per row — [[time, open, …], …] — whose fields are 0, 1, 2…, written c0, c1… in expressions)",
             ),
             (
                 "--json --time-field t --replace",
@@ -1072,9 +1081,9 @@ The next pages are recipes for real use: copy puts one on your clipboard."#,
     },
     Step {
         title: "recipe: a scalping lab",
-        text: "A live BTC price pushed 5 times a second (server-sent events), with its bid and ask: discover strategies on it with a 0.045% fee a side. Its confidence and publisher count are signals the formulas can use too. Give it a few minutes of data; the longer it runs, the more it has to learn from and the more live trades judge what it found.",
+        text: "A live BTC price pushed 5 times a second (server-sent events) with its bid and ask, resampled to a point a second, with 6 hours of Binance's 1-second prices before it (--history pages back, 1,000 seconds a request). Discovery waits for the history, then searches it and keeps paper-trading what it finds on the live price, with Upside's profit sharing at 250x. Leave it running: live trades are the only test the search never saw.",
         command: Some(
-            r#"graft --stream 'https://feed-v3.veranta.xyz/v1/stream?price_feed_ids=1' --json --time-field timestampUs --series 'price:USD = priceFeeds_0_price * 1e-8' --series 'bid:USD = priceFeeds_0_bestBidPrice * 1e-8' --series 'ask:USD = priceFeeds_0_bestAskPrice * 1e-8' --series 'confidence:USD = priceFeeds_0_confidence * 1e-8' --select price,bid,ask,confidence --hide bid,ask,confidence --window 20000 --discover 0.045 --title 'BTC scalping lab'"#,
+            r#"graft --stream 'https://feed-v3.veranta.xyz/v1/stream?price_feed_ids=1' --json --time-field timestampUs --series 'price:USD = priceFeeds_0_price * 1e-8' --series 'bid:USD = priceFeeds_0_bestBidPrice * 1e-8' --series 'ask:USD = priceFeeds_0_bestAskPrice * 1e-8' --select price,bid,ask --hide bid,ask --resample 1s:last --history '-c "curl -s \"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1s&limit=1000&startTime={from_ms:1000s}&endTime={now_ms}\"" --json --time-field 0 --series "price:USD = c4" --select price' --history-depth 6h --discover upside:250 --title 'BTC scalping lab'"#,
         ),
         ..BASE
     },

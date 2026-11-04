@@ -34,10 +34,148 @@ const MIN_TRADES: usize = 10;
 /// …and the t-statistic of its returns after costs there.
 const MIN_T: f64 = 1.5;
 
+/// What trading costs, besides the spread (buying at the ask, selling at the bid).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Fees {
+    /// A % of the trade's value on each buy and each sell (0.045: Hyperliquid's taker
+    /// fee).
+    Flat(f64),
+    /// Profit sharing, as on Veranta's Upside Perps, at this leverage: nothing on a
+    /// losing trade; on a winning one you keep 75% of the profit up to 250% ROI, 80% up
+    /// to 500%, 90% up to 1,500%, 95% beyond (ROI = the move × leverage), and the
+    /// take-profit can't go past 2,500% ROI. Liquidated at -85% ROI. `staked`: the
+    /// protocol's share is 25% smaller (staking AVNT).
+    Share { leverage: f64, staked: bool },
+}
+
+impl Fees {
+    /// `0.045` (a flat % a side), `upside:250` or `upside:250:staked`.
+    pub fn parse(text: &str) -> Result<Fees, String> {
+        let t = text.trim().to_lowercase();
+        if let Ok(v) = t.trim_end_matches('%').parse::<f64>() {
+            return if v >= 0.0 {
+                Ok(Fees::Flat(v))
+            } else {
+                Err("the fee is a % per buy and per sell, e.g. 0.045".into())
+            };
+        }
+        let mut parts = t.split([':', ' ']).filter(|p| !p.is_empty());
+        if parts.next() == Some("upside") {
+            let lev = parts
+                .next()
+                .and_then(|l| l.trim_end_matches('x').parse::<f64>().ok())
+                .filter(|l| *l >= 1.0)
+                .ok_or("upside:LEVERAGE, e.g. upside:250 (1x to 500x for BTC)")?;
+            let staked = parts.next() == Some("staked");
+            return Ok(Fees::Share {
+                leverage: lev,
+                staked,
+            });
+        }
+        Err(format!(
+            "'{text}': a fee in % a side (0.045) or upside:LEVERAGE (upside:250, upside:250:staked)"
+        ))
+    }
+
+    /// As --discover takes it.
+    pub fn to_arg(self) -> String {
+        match self {
+            Fees::Flat(f) => f.to_string(),
+            Fees::Share { leverage, staked } => {
+                format!("upside:{leverage}{}", if staked { ":staked" } else { "" })
+            }
+        }
+    }
+
+    /// `fee 0.045% a side`, `Upside 250x`.
+    pub fn short(&self) -> String {
+        match self {
+            Fees::Flat(f) => format!("fee {f}% a side"),
+            Fees::Share { leverage, staked } => {
+                format!("Upside {leverage}x{}", if *staked { " staked" } else { "" })
+            }
+        }
+    }
+
+    /// The share of a profit of `roi` % that you keep.
+    pub fn keep(roi: f64, staked: bool) -> f64 {
+        let keep = if roi <= 250.0 {
+            0.75
+        } else if roi <= 500.0 {
+            0.80
+        } else if roi <= 1500.0 {
+            0.90
+        } else {
+            0.95
+        };
+        if staked {
+            1.0 - (1.0 - keep) * 0.75
+        } else {
+            keep
+        }
+    }
+
+    /// A trade's result after costs, from its move after the spread (bp of the
+    /// position's value).
+    pub fn net(&self, gross: f64) -> f64 {
+        match *self {
+            Fees::Flat(f) => gross - 2.0 * f * 100.0,
+            Fees::Share { leverage, staked } => {
+                if gross <= 0.0 {
+                    // Nothing on losses; at most the margin is lost.
+                    gross.max(-1e4 / leverage)
+                } else {
+                    gross * Self::keep(gross * leverage / 100.0, staked)
+                }
+            }
+        }
+    }
+
+    /// The move (bp, against you) that liquidates, if there's leverage.
+    pub fn liquidation(&self) -> Option<f64> {
+        match self {
+            Fees::Flat(_) => None,
+            Fees::Share { leverage, .. } => Some(0.85 * 1e4 / leverage),
+        }
+    }
+
+    /// The most a trade can make (the take-profit's limit, bp).
+    pub fn max_take(&self) -> Option<f64> {
+        match self {
+            Fees::Flat(_) => None,
+            Fees::Share { leverage, .. } => Some(25.0 * 1e4 / leverage),
+        }
+    }
+
+    /// The position's return on its margin (%) for a result in bp.
+    pub fn roi(&self, bp: f64) -> Option<f64> {
+        match self {
+            Fees::Flat(_) => None,
+            Fees::Share { leverage, .. } => Some(bp * leverage / 100.0),
+        }
+    }
+
+    /// What it costs, for the panel.
+    pub fn explain(&self, spread: f64) -> String {
+        match self {
+            Fees::Flat(f) => format!(
+                "a round trip costs {:.1}bp ({:.1}bp fees + {spread:.1}bp spread)",
+                2.0 * f * 100.0 + spread,
+                2.0 * f * 100.0
+            ),
+            Fees::Share { leverage, staked } => format!(
+                "{spread:.1}bp spread; no fee on losses; {}% of profits taken (less above 250% ROI = a {:.0}bp move); liquidated at a {:.1}bp move against",
+                if *staked { 18.75 } else { 25.0 },
+                250.0 / leverage * 100.0,
+                0.85 * 1e4 / leverage
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
-    /// Fee in % per buy and per sell.
-    pub fee: f64,
+    pub fees: Fees,
     /// The price series (`None`: close, price or mid, else the first).
     pub series: Option<String>,
     /// Only the newest this many points are searched.
@@ -47,7 +185,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            fee: 0.0,
+            fees: Fees::Flat(0.0),
             series: None,
             max_points: 20_000,
         }
@@ -71,6 +209,9 @@ pub struct Input {
     pub price: Vec<f64>,
     /// Bid and ask, lined up with the price (series named …bid… and …ask…).
     pub book: Option<(String, Vec<f64>, String, Vec<f64>)>,
+    /// Half the average spread (a fraction of the price): what buying and selling cost
+    /// where there's no bid or ask (history with prices only).
+    pub half_spread: f64,
     pub others: Vec<Other>,
     /// Whether x is time (so lengths can be told in seconds).
     pub time: bool,
@@ -132,20 +273,12 @@ impl Input {
             }
             let lined = line_up(&o.points, &x);
             let finite: Vec<f64> = lined.iter().copied().filter(|v| v.is_finite()).collect();
-            if finite.len() < lined.len() / 2 {
+            if finite.is_empty() {
                 continue;
             }
             let (lo, hi) = finite
                 .iter()
                 .fold((f64::MAX, f64::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
-            if lo == hi {
-                continue; // a constant
-            }
-            // A clock (a timestamp field): never falls and is huge.
-            let rising = finite.windows(2).filter(|w| w[1] >= w[0]).count();
-            if rising + 1 >= finite.len() && lo > 1e8 {
-                continue;
-            }
             let near = |v: f64| median > 0.0 && (v / median - 1.0).abs() < 0.2;
             let price_like = near(lo) && near(hi);
             let lower = o.name.to_lowercase();
@@ -154,12 +287,23 @@ impl Input {
                 .next()
                 .unwrap_or(&lower)
                 .to_string();
-            if price_like && bid.is_none() && (last.contains("bid")) {
+            // Bid and ask, however little of the data they cover (history from
+            // elsewhere may have only prices): where they're missing, the usual spread.
+            if price_like && bid.is_none() && last.contains("bid") {
                 bid = Some((o.name.clone(), lined));
                 continue;
             }
-            if price_like && ask.is_none() && (last.contains("ask")) {
+            if price_like && ask.is_none() && last.contains("ask") {
                 ask = Some((o.name.clone(), lined));
+                continue;
+            }
+            // Signals have to be there for most of the data.
+            if finite.len() < lined.len() / 2 || lo == hi {
+                continue;
+            }
+            // A clock (a timestamp field): never falls and is huge.
+            let rising = finite.windows(2).filter(|w| w[1] >= w[0]).count();
+            if rising + 1 >= finite.len() && lo > 1e8 {
                 continue;
             }
             others.push(Other {
@@ -182,11 +326,28 @@ impl Input {
                 None
             }
         };
+        let half_spread = match &book {
+            Some((_, b, _, a)) => {
+                let s: Vec<f64> = b
+                    .iter()
+                    .zip(a)
+                    .filter(|(b, a)| b.is_finite() && a.is_finite() && **b > 0.0)
+                    .map(|(b, a)| a / b - 1.0)
+                    .collect();
+                if s.is_empty() {
+                    0.0
+                } else {
+                    s.iter().sum::<f64>() / s.len() as f64 / 2.0
+                }
+            }
+            None => 0.0,
+        };
         Ok(Input {
             name: price.name.clone(),
             x,
             price: values,
             book,
+            half_spread,
             others,
             time: ds.x_kind == crate::data::XKind::Time,
         })
@@ -220,14 +381,14 @@ impl Input {
     fn buy_at(&self, i: usize) -> f64 {
         match &self.book {
             Some((_, _, _, ask)) if ask[i].is_finite() => ask[i],
-            _ => self.price[i],
+            _ => self.price[i] * (1.0 + self.half_spread),
         }
     }
 
     fn sell_at(&self, i: usize) -> f64 {
         match &self.book {
             Some((_, bid, _, _)) if bid[i].is_finite() => bid[i],
-            _ => self.price[i],
+            _ => self.price[i] * (1.0 - self.half_spread),
         }
     }
 
@@ -571,8 +732,10 @@ impl Strategy {
         values: &[&[f64]],
         from: usize,
         to: usize,
-        fee_bp: f64,
+        fees: &Fees,
     ) -> Vec<Trade> {
+        let liquidation = fees.liquidation();
+        let max_take = fees.max_take();
         let n = input.len();
         let long = self.side == Side::Long;
         let mut out = Vec::new();
@@ -603,6 +766,8 @@ impl Strategy {
                 let r = ret(j);
                 let hit = self.exit.take.is_some_and(|t| r >= t)
                     || self.exit.stop.is_some_and(|s| r <= -s)
+                    || liquidation.is_some_and(|l| r <= -l)
+                    || max_take.is_some_and(|m| r >= m)
                     || j == i + self.exit.hold;
                 if hit {
                     closed = Some((j, r));
@@ -614,7 +779,7 @@ impl Strategy {
                     out.push(Trade {
                         entry: i,
                         exit: Some(j),
-                        net: r - 2.0 * fee_bp,
+                        net: fees.net(r),
                     });
                     i = j + 1;
                 }
@@ -624,7 +789,7 @@ impl Strategy {
                         out.push(Trade {
                             entry: i,
                             exit: None,
-                            net: ret(n - 1) - 2.0 * fee_bp,
+                            net: fees.net(ret(n - 1)),
                         });
                     }
                     break;
@@ -656,8 +821,10 @@ pub struct Report {
     /// The |t| theories needed on the first 70% to be listed: the strongest that luck
     /// alone would give out of that many tests.
     pub bar: f64,
-    /// What a round trip costs (bp): the fees plus the average spread.
-    pub cost: f64,
+    /// The average spread (bp), where there are bid and ask series.
+    pub spread: f64,
+    /// The costs it traded with.
+    pub fees: Fees,
     /// Holding over the first 70% and the last 30% (bp).
     pub hold: [f64; 2],
     /// The best theories (held ones first).
@@ -851,13 +1018,12 @@ fn evolve(lab: &Lab, pool: &[Expr], budget: Budget) -> (Vec<Scored>, usize) {
 
 /// Search `input` for theories and strategies, evolving formulas from `pool` for at
 /// most `budget`.
-pub fn search(input: Input, fee: f64, pool: &[Expr], budget: Budget) -> Result<Report, String> {
+pub fn search(input: Input, fees: Fees, pool: &[Expr], budget: Budget) -> Result<Report, String> {
     let started = std::time::Instant::now();
     let n = input.len();
     if n < MIN_POINTS {
         return Err(format!("{n} of the {MIN_POINTS} points it needs so far"));
     }
-    let fee_bp = fee * 100.0;
     let split = (n as f64 * TRAIN) as usize;
     let aheads: Vec<usize> = [5, 15, 50, 150]
         .into_iter()
@@ -884,21 +1050,7 @@ pub fn search(input: Input, fee: f64, pool: &[Expr], budget: Budget) -> Result<R
         }
     }
     let values: Vec<Vec<f64>> = features.iter().map(|f| f.eval(&input)).collect();
-    let cost = 2.0 * fee_bp
-        + match &input.book {
-            Some((_, b, _, a)) => {
-                let s: Vec<f64> = (0..n)
-                    .filter(|&i| a[i].is_finite() && b[i].is_finite() && b[i] > 0.0)
-                    .map(|i| (a[i] / b[i] - 1.0) * 1e4)
-                    .collect();
-                if s.is_empty() {
-                    0.0
-                } else {
-                    s.iter().sum::<f64>() / s.len() as f64
-                }
-            }
-            None => 0.0,
-        };
+    let spread = input.half_spread * 2.0 * 1e4;
 
     // Theories: each feature's tails, each horizon.
     let mut theories: Vec<Theory> = Vec::new();
@@ -964,7 +1116,7 @@ pub fn search(input: Input, fee: f64, pool: &[Expr], budget: Budget) -> Result<R
             .map(|c| values[index_of(&c.feature)].as_slice())
             .collect();
         let nets: Vec<f64> = s
-            .trades(&input, &vals, from, to, fee_bp)
+            .trades(&input, &vals, from, to, &fees)
             .into_iter()
             .filter(|t| t.exit.is_some())
             .map(|t| t.net)
@@ -1000,6 +1152,12 @@ pub fn search(input: Input, fee: f64, pool: &[Expr], budget: Budget) -> Result<R
                 hold: h,
                 take: Some(0.5 * typical),
                 stop: Some(typical),
+            },
+            // Small losses, big wins (when wins are what's charged for).
+            Exit {
+                hold: 4 * h,
+                take: Some(3.0 * typical),
+                stop: Some(0.5 * typical),
             },
         ];
         let mut best: Option<Found> = None;
@@ -1091,7 +1249,7 @@ pub fn search(input: Input, fee: f64, pool: &[Expr], budget: Budget) -> Result<R
             .iter()
             .map(|c| values[index_of(&c.feature)].as_slice())
             .collect();
-        s.trades(&input, &vals, 0, n, fee_bp)
+        s.trades(&input, &vals, 0, n, &fees)
             .iter()
             .map(|t| t.entry)
             .collect()
@@ -1157,7 +1315,8 @@ pub fn search(input: Input, fee: f64, pool: &[Expr], budget: Budget) -> Result<R
         tests,
         tried,
         bar,
-        cost,
+        spread,
+        fees,
         theories: theories_out,
         strategies,
         pool: evolved,
@@ -1167,10 +1326,10 @@ pub fn search(input: Input, fee: f64, pool: &[Expr], budget: Budget) -> Result<R
 }
 
 /// A strategy's trades over `input`, entering only after point `from`.
-pub fn trade(s: &Strategy, input: &Input, from: usize, fee: f64) -> Vec<Trade> {
+pub fn trade(s: &Strategy, input: &Input, from: usize, fees: &Fees) -> Vec<Trade> {
     let values: Vec<Vec<f64>> = s.conds.iter().map(|c| c.feature.eval(input)).collect();
     let refs: Vec<&[f64]> = values.iter().map(Vec::as_slice).collect();
-    s.trades(input, &refs, from, input.len(), fee * 100.0)
+    s.trades(input, &refs, from, input.len(), fees)
 }
 
 #[cfg(test)]
@@ -1193,6 +1352,7 @@ mod tests {
             x: (0..price.len()).map(|i| i as f64).collect(),
             price,
             book: None,
+            half_spread: 0.0,
             others: Vec::new(),
             time: false,
         }
@@ -1252,10 +1412,139 @@ mod tests {
                 stop: None,
             },
         };
-        let t = s.trades(&inp, &[], 0, 50, 4.5);
+        let t = s.trades(&inp, &[], 0, 50, &Fees::Flat(0.045));
         assert!(t.iter().all(|t| (t.net + 9.0).abs() < 1e-9), "{t:?}");
         // Back to back: the next starts after the last ends.
         assert_eq!(t[1].entry, t[0].exit.unwrap() + 1);
+    }
+
+    #[test]
+    fn profit_sharing_takes_nothing_from_losses_and_less_from_big_wins() {
+        let f = Fees::parse("upside:250").unwrap();
+        assert_eq!(
+            f,
+            Fees::Share {
+                leverage: 250.0,
+                staked: false
+            }
+        );
+        assert_eq!(Fees::parse("0.045").unwrap(), Fees::Flat(0.045));
+        assert!(Fees::parse("upside").is_err());
+        // A loss is just the loss.
+        assert_eq!(f.net(-5.0), -5.0);
+        // +2% at 250x is 500% ROI: you keep 80% (the docs' example); at 50x, 100%: 75%.
+        assert!((f.net(200.0) - 160.0).abs() < 1e-9);
+        let f50 = Fees::parse("upside:50x").unwrap();
+        assert!((f50.net(200.0) - 150.0).abs() < 1e-9);
+        // Staked: the 25% share is a quarter smaller.
+        let staked = Fees::parse("upside:250:staked").unwrap();
+        assert!((staked.net(10.0) - 10.0 * (1.0 - 0.25 * 0.75)).abs() < 1e-9);
+        // Liquidated at -85% ROI: a 34bp move at 250x; never more than the margin.
+        assert!((f.liquidation().unwrap() - 34.0).abs() < 1e-9);
+        assert_eq!(f.net(-900.0), -40.0);
+        // A trade that falls through the liquidation level is closed there.
+        let mut p = vec![100.0; 10];
+        p[3] = 99.5; // -50bp
+        let inp = input(p);
+        let s = Strategy {
+            side: Side::Long,
+            conds: vec![],
+            exit: Exit {
+                hold: 8,
+                take: None,
+                stop: None,
+            },
+        };
+        let t = s.trades(&inp, &[], 0, 1, &f);
+        assert_eq!(t[0].exit, Some(3));
+        assert!((t[0].net + 40.0).abs() < 1e-9, "{t:?}");
+    }
+
+    /// `GRAFT_PRICES=file` (lines: time price) — what it finds on real prices, with
+    /// each fee model. `cargo test --release real_prices -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs GRAFT_PRICES"]
+    fn real_prices() {
+        let path = std::env::var("GRAFT_PRICES").expect("GRAFT_PRICES");
+        let text = std::fs::read_to_string(path).unwrap();
+        let (x, price): (Vec<f64>, Vec<f64>) = text
+            .lines()
+            .filter_map(|l| {
+                let mut w = l.split_whitespace();
+                Some((
+                    w.next()?.parse::<f64>().ok()? / 1000.0,
+                    w.next()?.parse::<f64>().ok()?,
+                ))
+            })
+            .unzip();
+        let spread: f64 = std::env::var("GRAFT_SPREAD_BP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.6);
+        for fees in std::env::var("GRAFT_FEES")
+            .unwrap_or("0,0.045,upside:50,upside:250,upside:500".into())
+            .split(',')
+        {
+            let fees = Fees::parse(fees).unwrap();
+            let inp = Input {
+                name: "price".into(),
+                x: x.clone(),
+                price: price.clone(),
+                book: None,
+                half_spread: spread / 2.0 / 1e4,
+                others: Vec::new(),
+                time: true,
+            };
+            let mut b = budget();
+            b.formulas = 6000;
+            let r = search(inp, fees, &[], b).unwrap();
+            eprintln!(
+                "\n=== {} · {} pts · {} formulas · bar {:.1} · hold {:+.1}bp / {:+.1}bp · {:?}",
+                fees.short(),
+                r.input.len(),
+                r.formulas,
+                r.bar,
+                r.hold[0],
+                r.hold[1],
+                r.took
+            );
+            for s in r.strategies.iter().take(5) {
+                eprintln!(
+                    "  {} · {} → {}",
+                    s.strategy.describe(&r.input),
+                    s.picked.brief(),
+                    s.checked.brief()
+                );
+            }
+            if fees == Fees::Flat(0.0) {
+                for t in r.theories.iter().take(8) {
+                    eprintln!("  T {}", t.describe(&r.input));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn history_without_a_book_pays_the_usual_spread() {
+        // Prices for 400 points; bid and ask only for the last 40 (the live part).
+        let s = |name: &str, from: usize, v: f64| Series {
+            name: name.into(),
+            unit: Unit::default(),
+            points: (from..400).map(|i| (i as f64, v)).collect(),
+        };
+        let ds = Dataset {
+            series: vec![
+                s("price", 0, 100.0),
+                s("bid", 360, 99.99),
+                s("ask", 360, 100.01),
+            ],
+            x_kind: XKind::Number,
+        };
+        let inp = Input::from_dataset(&ds, &Settings::default()).unwrap();
+        assert!(inp.book.is_some(), "kept, though it covers a tenth");
+        assert!((inp.buy_at(0) - 100.01).abs() < 1e-4, "{}", inp.buy_at(0));
+        assert!((inp.sell_at(0) - 99.99).abs() < 1e-4);
+        assert_eq!(inp.buy_at(399), 100.01);
     }
 
     #[test]
@@ -1276,14 +1565,14 @@ mod tests {
                 stop: None,
             },
         };
-        let t = s.trades(&inp, &[], 0, 20, 0.0);
+        let t = s.trades(&inp, &[], 0, 20, &Fees::Flat(0.0));
         // Sold at 99.99, bought back at 100.01: about 2bp lost.
         assert!((t[0].net + 2.0).abs() < 0.01, "{:?}", t[0]);
     }
 
     #[test]
     fn finds_a_planted_edge_and_checks_it() {
-        let report = search(input(bouncy(12_000)), 0.0, &[], budget()).unwrap();
+        let report = search(input(bouncy(12_000)), Fees::Flat(0.0), &[], budget()).unwrap();
         let best = &report.strategies[0];
         for s in &report.strategies {
             eprintln!(
@@ -1321,7 +1610,7 @@ mod tests {
             let r = ((seed >> 33) % 1000) as f64 / 1000.0 - 0.5;
             p.push(p[i - 1] * (1.0 + r * 0.0004));
         }
-        let report = search(input(p), 0.045, &[], budget()).unwrap();
+        let report = search(input(p), Fees::Flat(0.045), &[], budget()).unwrap();
         // Paying 9bp a round trip on noise: nothing makes money where it was picked.
         assert!(report.strategies.is_empty(), "{:?}", report.strategies);
         // Thousands of formulas tested on noise: the bar for a theory is that high.
