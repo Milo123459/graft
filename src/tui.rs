@@ -1533,14 +1533,24 @@ impl App {
             lab.waiting = Some("waiting for what it recorded to be read back".into());
             return;
         }
-        let before = (lab.runs, lab.report.is_some(), lab.selected);
+        let state = |lab: &crate::lab::Lab| {
+            (
+                lab.runs,
+                lab.report.is_some(),
+                lab.selected_id(),
+                lab.changes,
+                lab.tracked.len(),
+            )
+        };
+        let before = state(lab);
         let news = lab.tick(&self.ds);
-        let changed = before != (lab.runs, lab.report.is_some(), lab.selected) || news.is_some();
-        let trading = !lab.tracked.is_empty();
+        // The markers only when the trades (or which strategy) changed: a day of them is
+        // thousands, too many to remake every frame.
+        let changed = before != state(lab) || news.is_some();
         if let Some(n) = news {
             self.say(n, false);
         }
-        if changed || trading {
+        if changed {
             self.place_lab_marks();
         }
     }
@@ -7000,12 +7010,19 @@ impl App {
 
     /// Whether any series has a target line to draw (set, or the automatic 0 for a
     /// clearly falling series).
+    /// Some series has a target to forecast. (Asked every frame, for the toolbar: only
+    /// what that needs — not the full statistics, which sort every value.)
     fn has_targets(&self) -> bool {
+        let a = &self.opts.analysis;
         self.ds.series.iter().any(|s| {
-            self.opts
-                .analysis
-                .report(&self.ds, s)
-                .is_some_and(|r| r.target.is_some())
+            let Some(last) = s.points.last().map(|p| p.1) else {
+                return false;
+            };
+            a.targets.needs_fit(&s.name)
+                && a.targets
+                    .resolve(&s.name, a.fit(s).as_ref(), last)
+                    .is_some()
+                || a.targets.resolve(&s.name, None, last).is_some()
         })
     }
 

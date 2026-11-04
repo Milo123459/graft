@@ -1675,7 +1675,10 @@ impl<'a> ChartWidget<'a> {
         // Labels where there's room: the newest first, a few per row.
         placed.sort_by(|a, b| b.2.x.total_cmp(&a.2.x));
         let mut per_row: std::collections::HashMap<u16, usize> = Default::default();
-        let marked: Vec<(u16, u16)> = placed.iter().map(|p| (p.0, p.1)).collect();
+        // A set: thousands of markers (a day of trades) each checked against the rest
+        // would take seconds a frame.
+        let marked: std::collections::HashSet<(u16, u16)> =
+            placed.iter().map(|p| (p.0, p.1)).collect();
         for &(col, row, m) in &placed {
             let n = per_row.entry(row).or_default();
             if *n >= 6 || m.label.is_empty() {
@@ -1737,6 +1740,8 @@ impl<'a> ChartWidget<'a> {
         }
         // First every ▼ (and where it is), then labels in the space left.
         let mut placed: Vec<(u16, u16, Color, &Mark)> = Vec::new();
+        // Where they are, to look up quickly (there can be thousands).
+        let mut at: std::collections::HashSet<(u16, u16)> = Default::default();
         for m in in_view {
             let col = plot.col_of(m.x);
             let (color, row) = match (&m.series, m.y) {
@@ -1776,9 +1781,7 @@ impl<'a> ChartWidget<'a> {
                 .into_iter()
                 .flatten()
                 .filter(|&c| c >= r.x && c < r.right())
-                .any(|c| {
-                    !free_cell(&buf[(c, row)]) && !placed.iter().any(|p| p.0 == c && p.1 == row)
-                });
+                .any(|c| !free_cell(&buf[(c, row)]) && !at.contains(&(c, row)));
             if !free_cell(&buf[(col, row)]) || beside_text {
                 continue;
             }
@@ -1790,6 +1793,7 @@ impl<'a> ChartWidget<'a> {
             }
             buf[(col, row)].set_symbol(&m.symbol).set_style(style);
             placed.push((col, row, color, m));
+            at.insert((col, row));
         }
         let mut taken: Vec<(u16, u16, u16)> = placed.iter().map(|p| (p.1, p.0, p.0)).collect();
         // Labels where there's room — the newest first, and only a few when it's busy

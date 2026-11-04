@@ -399,9 +399,15 @@ impl Input {
 
     /// The typical gap between points (seconds on a time axis).
     pub fn step(&self) -> f64 {
-        let mut d: Vec<f64> = self.x.windows(2).map(|w| w[1] - w[0]).collect();
-        d.sort_by(f64::total_cmp);
-        d.get(d.len() / 2).copied().unwrap_or(1.0)
+        // From the newest few thousand (it's asked for each strategy the panel
+        // describes, every frame: not worth a day of seconds each time).
+        let from = self.x.len().saturating_sub(4096);
+        let mut d: Vec<f64> = self.x[from..].windows(2).map(|w| w[1] - w[0]).collect();
+        if d.is_empty() {
+            return 1.0;
+        }
+        let mid = d.len() / 2;
+        *d.select_nth_unstable_by(mid, f64::total_cmp).1
     }
 
     /// `3s` (with times), else `15pt`: for tables.

@@ -274,6 +274,11 @@ impl Targets {
         }
     }
 
+    /// Whether this series' target depends on its trend (`auto`).
+    pub fn needs_fit(&self, name: &str) -> bool {
+        self.rule(name) == TargetRule::Auto
+    }
+
     /// The target to forecast for a series with this trend.
     pub fn resolve(&self, name: &str, fit: Option<&Fit>, last: f64) -> Option<f64> {
         match self.rule(name) {

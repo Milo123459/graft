@@ -218,6 +218,31 @@ pub fn newest_from(ds: &Dataset, s: &Settings) -> Option<f64> {
         .map(|p| p.0)
 }
 
+/// `paper` for each, side by side on the cores: each reads every formula over all the
+/// data loaded (a day of seconds), on the thread drawing the screen.
+fn paper_all(mut ts: Vec<&mut Tracked>, input: &Input, fees: &discover::Fees) {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(ts.len())
+        .max(1);
+    if threads == 1 {
+        for t in ts {
+            paper(t, input, fees);
+        }
+        return;
+    }
+    let chunk = ts.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        for part in ts.chunks_mut(chunk) {
+            scope.spawn(move || {
+                for t in part {
+                    paper(t, input, fees);
+                }
+            });
+        }
+    });
+}
+
 /// Its paper trades over `input`, and its live record (the ones entered after
 /// `since`).
 fn paper(t: &mut Tracked, input: &Input, fees: &discover::Fees) {
@@ -317,6 +342,9 @@ pub struct Lab {
     pub selected: usize,
     /// The id the next strategy tracked gets.
     next_id: usize,
+    /// Goes up whenever the paper trades are brought up to date: what's drawn from them
+    /// (the markers) only needs redoing then.
+    pub changes: u64,
     /// The formulas to start the next search from.
     pool: Vec<Expr>,
     /// When the live results were last brought up to date, and for which data.
@@ -355,6 +383,7 @@ impl Lab {
             tracked: Vec::new(),
             selected: 0,
             next_id: 1,
+            changes: 0,
             pool: Vec::new(),
             refreshed: None,
             failed: Vec::new(),
@@ -672,6 +701,16 @@ impl Lab {
         if self.tracked.is_empty() && self.benched.is_empty() {
             return None;
         }
+        // Nothing new, or done less than a second ago: nothing to do. (Asked every
+        // frame, so before reading all the data in.)
+        let price = discover::price_series(ds, self.settings.series.as_deref())?;
+        let seen = (price.points.last()?.0, price.points.len());
+        if let Some((at, x, len)) = self.refreshed
+            && ((x, len) == seen || at.elapsed() < Duration::from_secs(1))
+        {
+            return None;
+        }
+        self.refreshed = Some((Instant::now(), seen.0, seen.1));
         // Paper trades over everything loaded (whatever the searches take).
         let all = Settings {
             max_points: usize::MAX,
@@ -679,17 +718,26 @@ impl Lab {
         };
         let input = Input::from_dataset(ds, &all).ok()?;
         let newest = (input.x.last().copied().unwrap_or(0.0), input.len());
-        if let Some((at, x, len)) = self.refreshed
-            && ((x, len) == newest || at.elapsed() < Duration::from_secs(1))
-        {
-            return None;
-        }
-        self.refreshed = Some((Instant::now(), newest.0, newest.1));
+        self.changes += 1;
         let mut news = None;
         let fees = self.settings.fees;
-        for (k, t) in self.tracked.iter_mut().enumerate() {
-            let before = t.trades.iter().filter(|r| r.live).count();
-            paper(t, &input, &fees);
+        let before: Vec<usize> = self
+            .tracked
+            .iter()
+            .map(|t| t.trades.iter().filter(|r| r.live).count())
+            .collect();
+        // The retired ones too: a strategy that only works in some markets comes back
+        // when it starts paying again.
+        paper_all(
+            self.tracked
+                .iter_mut()
+                .chain(self.benched.iter_mut())
+                .collect(),
+            &input,
+            &fees,
+        );
+        for (k, t) in self.tracked.iter().enumerate() {
+            let before = before[k];
             let now = t.trades.iter().filter(|r| r.live).count();
             if k == 0
                 && now > before
@@ -704,11 +752,6 @@ impl Lab {
                     crate::discover::fmt_num(last.y_in)
                 ));
             }
-        }
-        // The retired ones too: a strategy that only works in some markets comes back
-        // when it starts paying again.
-        for t in &mut self.benched {
-            paper(t, &input, &fees);
         }
         let mut k = 0;
         while k < self.benched.len() {

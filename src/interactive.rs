@@ -152,63 +152,76 @@ pub fn run(start: Start) -> Result<ExitCode> {
             if !event::poll(Duration::from_millis(80))? {
                 continue;
             }
-            let ev = event::read()?;
-            let t = match &mut screen {
-                Screen::Builder(b) => b.on_event(&ev),
-                Screen::Viewer(a) => a.on_event(&ev),
-            };
-            if let Screen::Viewer(a) = &mut screen
-                && let Some(text) = a.take_clipboard()
-            {
-                let mut out = stdout();
-                let _ = out.write_all(crate::notify::osc52(&text).as_bytes());
-                let _ = out.flush();
+            // Everything already waiting before the next frame: a drawing per event
+            // (a mouse move, a trackpad's many scroll steps) falls behind and lags.
+            let drain = std::time::Instant::now();
+            loop {
+                let ev = event::read()?;
+                let t = match &mut screen {
+                    Screen::Builder(b) => b.on_event(&ev),
+                    Screen::Viewer(a) => a.on_event(&ev),
+                };
+                // Anything but nothing (a quit, another screen): draw before the next.
+                let quiet = matches!(t, Transition::None);
+                if let Screen::Viewer(a) = &mut screen
+                    && let Some(text) = a.take_clipboard()
+                {
+                    let mut out = stdout();
+                    let _ = out.write_all(crate::notify::osc52(&text).as_bytes());
+                    let _ = out.flush();
+                }
+                screen = match (screen, t) {
+                    (s, Transition::None) => s,
+                    (Screen::Viewer(a), Transition::Quit) => {
+                        let cli = a.current_cli();
+                        crate::recent::remember(&cli);
+                        return Ok(from_builder.then_some(cli));
+                    }
+                    (Screen::Builder(b), Transition::Quit) => return Ok(b.previous_cli()),
+                    (s, Transition::Mouse(on)) => {
+                        mouse = on;
+                        if on {
+                            execute!(stdout(), EnableMouseCapture)?;
+                        } else {
+                            execute!(stdout(), DisableMouseCapture)?;
+                        }
+                        s
+                    }
+                    (Screen::Viewer(a), Transition::OpenBuilder) => {
+                        let cli = a.current_cli();
+                        crate::recent::remember(&cli);
+                        Screen::Builder(Box::new(Builder::new(cli, None, Some(a))))
+                    }
+                    (Screen::Viewer(mut a), Transition::EditSource) => {
+                        let (name, cli) = a.take_source_edit();
+                        let pane = a.take_pane_to_edit();
+                        Screen::Builder(Box::new(Builder::for_source(name, cli, a, pane)))
+                    }
+                    (Screen::Builder(mut b), Transition::Back) => match b.take_previous() {
+                        Some(app) => Screen::Viewer(app),
+                        None => return Ok(None),
+                    },
+                    (Screen::Builder(mut b), Transition::Start) => match b.launch() {
+                        Ok(app) => {
+                            crate::recent::remember(&app.current_cli());
+                            from_builder = true;
+                            Screen::Viewer(Box::new(app))
+                        }
+                        Err(e) => {
+                            b.error(format!("{e:#}"));
+                            Screen::Builder(b)
+                        }
+                    },
+                    (s, _) => s,
+                };
+                let _ = mouse;
+                if !quiet
+                    || drain.elapsed() > Duration::from_millis(50)
+                    || !event::poll(Duration::ZERO)?
+                {
+                    break;
+                }
             }
-            screen = match (screen, t) {
-                (s, Transition::None) => s,
-                (Screen::Viewer(a), Transition::Quit) => {
-                    let cli = a.current_cli();
-                    crate::recent::remember(&cli);
-                    return Ok(from_builder.then_some(cli));
-                }
-                (Screen::Builder(b), Transition::Quit) => return Ok(b.previous_cli()),
-                (s, Transition::Mouse(on)) => {
-                    mouse = on;
-                    if on {
-                        execute!(stdout(), EnableMouseCapture)?;
-                    } else {
-                        execute!(stdout(), DisableMouseCapture)?;
-                    }
-                    s
-                }
-                (Screen::Viewer(a), Transition::OpenBuilder) => {
-                    let cli = a.current_cli();
-                    crate::recent::remember(&cli);
-                    Screen::Builder(Box::new(Builder::new(cli, None, Some(a))))
-                }
-                (Screen::Viewer(mut a), Transition::EditSource) => {
-                    let (name, cli) = a.take_source_edit();
-                    let pane = a.take_pane_to_edit();
-                    Screen::Builder(Box::new(Builder::for_source(name, cli, a, pane)))
-                }
-                (Screen::Builder(mut b), Transition::Back) => match b.take_previous() {
-                    Some(app) => Screen::Viewer(app),
-                    None => return Ok(None),
-                },
-                (Screen::Builder(mut b), Transition::Start) => match b.launch() {
-                    Ok(app) => {
-                        crate::recent::remember(&app.current_cli());
-                        from_builder = true;
-                        Screen::Viewer(Box::new(app))
-                    }
-                    Err(e) => {
-                        b.error(format!("{e:#}"));
-                        Screen::Builder(b)
-                    }
-                },
-                (s, _) => s,
-            };
-            let _ = mouse;
         }
     })();
 

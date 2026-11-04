@@ -264,8 +264,9 @@ fn spacing(ds: &Dataset) -> f64 {
     if gaps.is_empty() {
         return 0.0;
     }
-    gaps.sort_by(f64::total_cmp);
-    gaps[gaps.len() / 2]
+    // The median without sorting them all (a day of seconds is a million gaps).
+    let mid = gaps.len() / 2;
+    *gaps.select_nth_unstable_by(mid, f64::total_cmp).1
 }
 
 /// Timeframe presets that make sense for a dataset (shorter than its span), smallest first.
@@ -274,22 +275,26 @@ pub fn timeframe_presets(ds: &Dataset) -> Vec<Window> {
         return Vec::new();
     };
     match ds.x_kind {
-        XKind::Time => [
-            60.0,
-            5.0 * 60.0,
-            15.0 * 60.0,
-            3600.0,
-            6.0 * 3600.0,
-            86400.0,
-            7.0 * 86400.0,
-            30.0 * 86400.0,
-            90.0 * 86400.0,
-            365.0 * 86400.0,
-        ]
-        .into_iter()
-        .filter(|d| *d < b - a && *d >= 4.0 * spacing(ds))
-        .map(Window::Span)
-        .collect(),
+        XKind::Time => {
+            // Once (it sorts every gap), not for each preset.
+            let step = spacing(ds);
+            [
+                60.0,
+                5.0 * 60.0,
+                15.0 * 60.0,
+                3600.0,
+                6.0 * 3600.0,
+                86400.0,
+                7.0 * 86400.0,
+                30.0 * 86400.0,
+                90.0 * 86400.0,
+                365.0 * 86400.0,
+            ]
+            .into_iter()
+            .filter(|d| *d < b - a && *d >= 4.0 * step)
+            .map(Window::Span)
+            .collect()
+        }
         _ => {
             let n = ds.series.iter().map(|s| s.points.len()).max().unwrap_or(0);
             [50, 100, 500, 1000, 5000, 10_000]
