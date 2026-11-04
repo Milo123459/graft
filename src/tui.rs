@@ -8139,12 +8139,14 @@ impl App {
                 let invented = r.pool.iter().filter(|s| s.invented).count();
                 push(
                     format!(
-                        "search {} · {} · {} pts · {:.1}s · {} formulas, {} strategies tried · {invented}/{} best formulas invented · {} · {status}",
+                        "search {} · {} pts of {} · {:.1}s · {} formulas ({:.0}/s, {} in all) · {} strategies · {invented}/{} kept invented · {} · {status}",
                         lab.runs,
-                        r.input.name,
                         r.input.len(),
+                        r.input.name,
                         r.took.as_secs_f64(),
                         r.formulas,
+                        lab.tried as f64 / lab.since.elapsed().as_secs_f64().max(1.0),
+                        lab.tried,
                         r.tried,
                         r.pool.len(),
                         r.fees.explain(r.spread)
@@ -8320,7 +8322,8 @@ impl App {
         }
         if !lab.lessons.is_empty() {
             push(
-                "learned (retired after losing live, not picked again):".into(),
+                "learned (retired after losing live; still watched, back if they pay again):"
+                    .into(),
                 Style::default().add_modifier(Modifier::BOLD),
                 None,
                 &mut rows,
@@ -8328,6 +8331,19 @@ impl App {
             for l in &lab.lessons {
                 push(format!("• {l}"), dim, None, &mut rows);
             }
+        }
+        if !lab.benched.is_empty() {
+            let since: Vec<String> = lab.benched.iter().take(4).map(|t| t.live.brief()).collect();
+            push(
+                format!(
+                    "watching {} retired: since retiring {}",
+                    lab.benched.len(),
+                    since.join(" · ")
+                ),
+                dim,
+                None,
+                &mut rows,
+            );
         }
         rows
     }
@@ -10209,12 +10225,7 @@ pub(crate) mod tests {
 
     fn wait_for_search(app: &mut App) {
         let end = Instant::now() + Duration::from_secs(60);
-        while app
-            .lab
-            .as_ref()
-            .is_some_and(|l| l.report.is_none() || l.searching())
-            && Instant::now() < end
-        {
+        while app.lab.as_ref().is_some_and(|l| l.report.is_none()) && Instant::now() < end {
             app.tick_lab();
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -10271,7 +10282,7 @@ pub(crate) mod tests {
         assert!(app.lab_theories);
         let s = screen_sized(&app, 46, 44);
         assert!(
-            s.contains('✓') || s.contains('✗') || s.contains("nothing stood out"),
+            s.contains("theories: |t|") && (s.contains("• ") || s.contains("nothing stood out")),
             "{s}"
         );
         run(&mut app, "discover_pick(1)");

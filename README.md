@@ -429,7 +429,7 @@ button.
 
 `:discover(0.045)` (or `--discover 0.045`, or `E`, or the **discover** button) hunts
 for edges in a price as data streams in, without being told which indicators to use.
-It searches every 20 s in the background (3 s each time) — on as many of the newest
+It searches nonstop in the background (3 s each time, on every core but one) — on as many of the newest
 points as leave time to try about 2,000 formulas, measured on each search (on a fast
 machine, everything loaded; paper trading always uses everything) — on what's on the
 chart, after the timeframe (so `last 1h` searches that hour): the
@@ -563,17 +563,36 @@ price, 5), 50)")` in a line, and `zscore`, `change_bp`, `range_pos`, `updown`,
 `volatility`, `gap` for arrays.
 
 Be sceptical: most of what looks good fades, and few edges survive costs — on BTC the
-moves it finds are fractions of a basis point. A live BTC price with bid and ask from
-an oracle feed, resampled to a point a second, with 6 hours of Binance's 1-second
-prices before it, and Upside's profit sharing at 250x:
+moves it finds are fractions of a basis point, so give it more than the price.
+
+**Order flow.** Every series on the chart is a possible signal, so merge in another
+source's volume. For two series where one is always a part of the other (taker buys of
+all the volume, …) it adds their **share** and how unusual it is now (buying against
+selling), and for each how unusual its last 10 or 60 points are (bursts of volume, of
+trades); a price-like one (another exchange's price) is compared to the price as a gap
+(its premium, which often moves first). The evolution combines them with everything
+else. A live BTC price with bid and ask from an oracle feed, resampled to a point a
+second, with Binance's live 1-second candles merged in (price, volume, taker-buy
+volume, trades), 24 hours of Binance's 1-second history with the same columns (named
+`binance.…` so they join the live ones), and Upside's profit sharing at 250x:
 
 ```sh
 graft --stream 'https://feed-v3.veranta.xyz/v1/stream?price_feed_ids=1' --json --time-field timestampUs \
   --series 'price:USD = priceFeeds_0_price * 1e-8' --series 'bid:USD = priceFeeds_0_bestBidPrice * 1e-8' \
-  --series 'ask:USD = priceFeeds_0_bestAskPrice * 1e-8' --select price,bid,ask --hide bid,ask --resample 1s:last \
-  --history '-c "curl -s \"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1s&limit=1000&startTime={from_ms:1000s}&endTime={now_ms}\"" --json --time-field 0 --series "price:USD = c4" --select price' \
-  --history-depth 6h --discover upside:250 --marks-below
+  --series 'ask:USD = priceFeeds_0_bestAskPrice * 1e-8' --select price,bid,ask --resample 1s:last \
+  --merge 'binance = --stream wss://data-stream.binance.vision/ws/btcusdt@kline_1s --json --time-field k.t --replace --series "price = k_c" --series "vol = k_v" --series "buys = k_V" --series "trades = k_n" --select price' \
+  --history '-c "curl -s \"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1s&limit=1000&startTime={from_ms:1000s}&endTime={now_ms}\"" --json --time-field 0 --series "price:USD = c4" --series "binance.price = c4" --series "binance.vol = c5" --series "binance.buys = c9" --series "binance.trades = c8" --select price' \
+  --history-depth 24h --hide bid,ask,binance.price,binance.vol,binance.buys,binance.trades \
+  --discover upside:250 --marks-below
 ```
+
+**It never stops inventing.** Searches run one after another (3 s each) on every core
+but one, scoring new formulas in parallel — hundreds of thousands a minute on a laptop;
+the panel counts them (formulas a second, and in all). How many it keeps for the next
+search isn't fixed: as many as it has time to score again in a third of a search, so it
+grows with the machine. **Retired strategies are still watched**: paper-traded from
+when they were retired, and one that pays again (8 trades, t ≥ 1) comes back — a
+strategy that only works in some markets isn't lost after one bad patch.
 
 ### Counting log lines
 

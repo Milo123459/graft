@@ -21,6 +21,9 @@ const SEARCH_TIME: Duration = Duration::from_secs(3);
 const ENOUGH_FORMULAS: f64 = 2000.0;
 /// What the first search tries, before it knows how fast searches go.
 const FIRST_POINTS: usize = 50_000;
+const FIRST_POOL: usize = 1000;
+/// Retired strategies still watched (the newest).
+const BENCH: usize = 24;
 /// Strategies paper-traded at once.
 const TRACKED: usize = 8;
 /// Live trades before a losing strategy is retired.
@@ -38,6 +41,36 @@ pub struct PaperTrade {
     /// The price at the entry and the exit.
     pub y_in: f64,
     pub y_out: Option<f64>,
+}
+
+/// Its paper trades over `input`, and its live record (the ones entered after
+/// `since`).
+fn paper(t: &mut Tracked, input: &Input, fees: &discover::Fees) {
+    let trades = discover::trade(&t.found.strategy, input, 0, fees);
+    t.trades = trades
+        .iter()
+        .map(|r| PaperTrade {
+            entry: input.x[r.entry],
+            exit: r.exit.map(|e| input.x[e]),
+            side: r.side,
+            net: r.net,
+            live: input.x[r.entry] > t.since,
+            y_in: input.price[r.entry],
+            y_out: r.exit.map(|e| input.price[e]),
+        })
+        .collect();
+    let live: Vec<f64> = t
+        .trades
+        .iter()
+        .filter(|r| r.live && r.exit.is_some())
+        .map(|r| r.net)
+        .collect();
+    t.live = Perf::of(&live);
+    t.open = t
+        .trades
+        .last()
+        .filter(|r| r.exit.is_none() && r.live)
+        .map(|r| r.net);
 }
 
 /// A strategy being paper-traded since it was found.
@@ -93,12 +126,20 @@ pub struct Lab {
     pool: Vec<Expr>,
     /// When the live results were last brought up to date, and for which data.
     refreshed: Option<(Instant, f64, usize)>,
-    /// Strategies that failed live (keys): not picked again.
+    /// Strategies that failed live (keys): not picked again…
     failed: Vec<String>,
+    /// …but still paper-traded, from when they were retired: one that pays again
+    /// comes back.
+    pub benched: Vec<Tracked>,
     /// What it learned retiring them, newest first.
     pub lessons: Vec<String>,
-    /// How many of the newest points the next search takes.
+    /// How many of the newest points the next search takes…
     pub points: usize,
+    /// …and how many formulas it keeps for the one after.
+    pub pool_size: usize,
+    /// Formulas tried in all, since it started.
+    pub tried: usize,
+    pub since: Instant,
 }
 
 impl Lab {
@@ -107,7 +148,8 @@ impl Lab {
             settings,
             worker: None,
             last_run: None,
-            every: Duration::from_secs(20),
+            // One after another: it keeps inventing while it runs.
+            every: Duration::from_secs(1),
             runs: 0,
             report: None,
             waiting: None,
@@ -116,8 +158,12 @@ impl Lab {
             pool: Vec::new(),
             refreshed: None,
             failed: Vec::new(),
+            benched: Vec::new(),
             lessons: Vec::new(),
             points: FIRST_POINTS,
+            pool_size: FIRST_POOL,
+            tried: 0,
+            since: Instant::now(),
         }
     }
 
@@ -172,7 +218,8 @@ impl Lab {
                     self.runs += 1;
                     let budget = Budget {
                         time: SEARCH_TIME,
-                        formulas: 20_000,
+                        formulas: usize::MAX,
+                        pool: self.pool_size,
                         seed: 0x9e37_79b9_7f4a_7c15 ^ (self.runs as u64) ^ input.len() as u64,
                     };
                     std::thread::spawn(move || {
@@ -211,6 +258,11 @@ impl Lab {
         let rate = report.formulas as f64 * report.input.len() as f64 / secs;
         self.points = ((rate * SEARCH_TIME.as_secs_f64() / ENOUGH_FORMULAS) as usize)
             .max(discover::MIN_POINTS * 10);
+        // Keep as many formulas as the next search can score again in a third of its
+        // time: no fixed number, it grows with the machine.
+        let n = report.input.len().max(1) as f64;
+        self.pool_size = ((rate * SEARCH_TIME.as_secs_f64() / 3.0 / n) as usize).max(150);
+        self.tried += report.formulas;
         let since = report.input.x.last().copied().unwrap_or(f64::NEG_INFINITY);
         let selected_key = self
             .tracked
@@ -324,7 +376,7 @@ impl Lab {
 
     /// Strategies that keep losing live go, each with what it learned (and it isn't
     /// picked again).
-    fn retire(&mut self) {
+    fn retire(&mut self, now: f64) {
         let keep = self
             .tracked
             .get(self.selected)
@@ -339,6 +391,7 @@ impl Lab {
             }
             let t = self.tracked.remove(k);
             let input = self.report.as_ref().map(|r| &r.input);
+            let t_why = t.why.clone();
             let what = input.map_or(t.found.strategy.key(), |i| t.found.strategy.describe(i));
             self.failed.push(t.found.strategy.key());
             self.lessons.insert(
@@ -346,10 +399,17 @@ impl Lab {
                 format!(
                     "retired {what}: live {}{}",
                     t.live.brief(),
-                    t.why.map(|w| format!(" — {w}")).unwrap_or_default()
+                    t_why.map(|w| format!(" — {w}")).unwrap_or_default()
                 ),
             );
             self.lessons.truncate(5);
+            // Still watched, with a record from now: it comes back if it pays.
+            let mut t = t;
+            t.since = now;
+            t.live = Perf::default();
+            t.open = None;
+            self.benched.insert(0, t);
+            self.benched.truncate(BENCH);
         }
         self.selected = keep
             .and_then(|k| {
@@ -362,7 +422,7 @@ impl Lab {
 
     /// Paper trades on the newest data (at most once a second).
     fn refresh(&mut self, ds: &Dataset) -> Option<String> {
-        if self.tracked.is_empty() {
+        if self.tracked.is_empty() && self.benched.is_empty() {
             return None;
         }
         // Paper trades over everything loaded (whatever the searches take).
@@ -379,33 +439,10 @@ impl Lab {
         }
         self.refreshed = Some((Instant::now(), newest.0, newest.1));
         let mut news = None;
+        let fees = self.settings.fees;
         for (k, t) in self.tracked.iter_mut().enumerate() {
-            let trades = discover::trade(&t.found.strategy, &input, 0, &self.settings.fees);
             let before = t.trades.iter().filter(|r| r.live).count();
-            t.trades = trades
-                .iter()
-                .map(|r| PaperTrade {
-                    entry: input.x[r.entry],
-                    exit: r.exit.map(|e| input.x[e]),
-                    side: r.side,
-                    net: r.net,
-                    live: input.x[r.entry] > t.since,
-                    y_in: input.price[r.entry],
-                    y_out: r.exit.map(|e| input.price[e]),
-                })
-                .collect();
-            let live: Vec<f64> = t
-                .trades
-                .iter()
-                .filter(|r| r.live && r.exit.is_some())
-                .map(|r| r.net)
-                .collect();
-            t.live = Perf::of(&live);
-            t.open = t
-                .trades
-                .last()
-                .filter(|r| r.exit.is_none() && r.live)
-                .map(|r| r.net);
+            paper(t, &input, &fees);
             let now = t.trades.iter().filter(|r| r.live).count();
             if k == 0
                 && now > before
@@ -421,7 +458,35 @@ impl Lab {
                 ));
             }
         }
-        self.retire();
+        // The retired ones too: a strategy that only works in some markets comes back
+        // when it starts paying again.
+        for t in &mut self.benched {
+            paper(t, &input, &fees);
+        }
+        let mut k = 0;
+        while k < self.benched.len() {
+            let t = &self.benched[k];
+            if t.live.n >= RETIRE_AFTER && t.live.mean > 0.0 && t.live.t >= 1.0 {
+                let mut t = self.benched.remove(k);
+                let key = t.found.strategy.key();
+                self.failed.retain(|f| *f != key);
+                let back = format!("back: {} since it was retired", t.live.brief());
+                let what = self
+                    .report
+                    .as_ref()
+                    .map_or(key.clone(), |r| t.found.strategy.describe(&r.input));
+                self.lessons.insert(0, format!("{back} — {what}"));
+                self.lessons.truncate(5);
+                t.note = Some(back);
+                // A new live record from here.
+                t.since = newest.0;
+                paper(&mut t, &input, &fees);
+                self.tracked.push(t);
+            } else {
+                k += 1;
+            }
+        }
+        self.retire(newest.0);
         news
     }
 
@@ -507,4 +572,91 @@ fn overlap_x(a: &[f64], b: &[f64]) -> f64 {
         }
     }
     both as f64 / small as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::{Series, XKind};
+    use crate::discover::{Cond, Exit, Found, Strategy};
+    use crate::formula::Expr;
+
+    /// A price that falls for `down` points, then rises, with a little noise.
+    fn prices(down: usize, n: usize) -> Dataset {
+        let mut p = 100.0;
+        let points = (0..n)
+            .map(|i| {
+                let wiggle = if i % 2 == 0 { 1.0002 } else { 0.9999 };
+                p *= if i < down { 0.9995 } else { 1.0005 } * wiggle;
+                (i as f64, p)
+            })
+            .collect();
+        Dataset {
+            x_kind: XKind::Number,
+            series: vec![Series {
+                name: "price".into(),
+                unit: Default::default(),
+                points,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_retired_strategy_comes_back_when_it_pays_again() {
+        // Always long, out after 5 points: it loses while the price falls.
+        let always = Cond {
+            feature: Expr::Num(1.0),
+            above: true,
+            threshold: 0.0,
+        };
+        let s = Strategy::one_way(
+            Side::Long,
+            vec![always],
+            Exit {
+                hold: 5,
+                take: None,
+                stop: None,
+            },
+        );
+        let mut lab = Lab::new(Settings::default());
+        lab.tracked.push(Tracked {
+            found: Found {
+                strategy: s.clone(),
+                ..Found::default()
+            },
+            since: 0.0,
+            run: 1,
+            live: Perf::default(),
+            open: None,
+            trades: Vec::new(),
+            why: None,
+            note: None,
+        });
+        lab.refresh(&prices(400, 400));
+        assert!(lab.tracked.is_empty(), "retired after losing live");
+        assert_eq!(lab.benched.len(), 1);
+        assert!(
+            lab.failed.contains(&s.key()),
+            "not picked again by a search"
+        );
+        // The price turns: still watched, it makes money again, and comes back.
+        lab.refreshed = None;
+        lab.refresh(&prices(400, 600));
+        assert_eq!(
+            lab.tracked.len(),
+            1,
+            "{:?}",
+            lab.benched.first().map(|t| t.live)
+        );
+        assert!(lab.benched.is_empty() && !lab.failed.contains(&s.key()));
+        let t = &lab.tracked[0];
+        assert!(
+            t.note.as_deref().is_some_and(|n| n.starts_with("back: ")),
+            "{:?}",
+            t.note
+        );
+        assert!(lab.lessons[0].starts_with("back: "), "{:?}", lab.lessons);
+        // Its live record starts again from its return.
+        assert_eq!(t.live.n, 0);
+    }
 }

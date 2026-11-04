@@ -459,15 +459,65 @@ impl Input {
             .iter()
             .map(|o| (o.name.clone(), o.price_like))
             .collect();
-        crate::formula::classics(
+        let mut out = crate::formula::classics(
             &self.name,
             self.book
                 .as_ref()
                 .map(|(b, _, a, _)| (b.as_str(), a.as_str())),
             &others,
             self.len(),
-        )
+        );
+        // A part of another (taker buys of all the volume, …): the share, and how unusual
+        // it is now — buying against selling, whatever the series are called.
+        let fits = |n: usize| n * 6 <= self.len();
+        let flows: Vec<&Other> = self.others.iter().filter(|o| !o.price_like).collect();
+        for a in &flows {
+            for b in &flows {
+                if a.name == b.name || !part_of(&a.values, &b.values) {
+                    continue;
+                }
+                let share = Expr::f2(
+                    crate::formula::Op2::Div,
+                    Expr::col(&a.name),
+                    Expr::col(&b.name),
+                );
+                for n in [10, 60].into_iter().filter(|n| fits(*n)) {
+                    out.push(Expr::w(crate::formula::OpW::Mean, share.clone(), n));
+                    out.push(Expr::w(crate::formula::OpW::Z, share.clone(), 6 * n));
+                }
+                out.push(share);
+            }
+        }
+        // How unusual each is now (a burst of volume, of trades).
+        for o in &flows {
+            for n in [10, 60].into_iter().filter(|n| fits(6 * n)) {
+                out.push(Expr::w(
+                    crate::formula::OpW::Z,
+                    Expr::w(crate::formula::OpW::Mean, Expr::col(&o.name), n),
+                    6 * n,
+                ));
+            }
+        }
+        out
     }
+}
+
+/// Whether `a` is a part of `b`: both at least 0 and `a` never above `b`, where
+/// they're both known (nearly everywhere; a quiet second with none of either is fine).
+fn part_of(a: &[f64], b: &[f64]) -> bool {
+    let both: Vec<(f64, f64)> = a
+        .iter()
+        .zip(b)
+        .filter(|(x, y)| x.is_finite() && y.is_finite())
+        .map(|(x, y)| (*x, *y))
+        .collect();
+    let ok = both
+        .iter()
+        .filter(|(x, y)| *x >= 0.0 && *y >= 0.0 && x <= &(y * (1.0 + 1e-9)))
+        .count();
+    both.len() >= 20
+        && ok as f64 >= both.len() as f64 * 0.99
+        && both.iter().filter(|(x, y)| x < y).count() * 2 > both.len()
 }
 
 /// `-3.2`, `0.0041`, `1.2e6`: three significant digits.
@@ -1065,8 +1115,9 @@ pub struct Report {
 /// predict better to be kept. Small, since the walk-forward catches formulas that only
 /// fit the past, so deep formulas can win when they're really better.
 const SIZE_COST: f64 = 0.04;
-/// Formulas kept from one search to the next.
-const POOL: usize = 150;
+/// Formulas kept from one search to the next, at least (the lab keeps as many as a
+/// search has time to score again, `Budget::pool`).
+const MIN_POOL: usize = 150;
 /// The best of them, tried as entries and filters for strategies.
 const FEATURES: usize = 40;
 
@@ -1256,6 +1307,8 @@ pub struct Budget {
     pub time: std::time::Duration,
     /// At most this many new formulas.
     pub formulas: usize,
+    /// How many of the fittest to keep for the next search.
+    pub pool: usize,
     pub seed: u64,
 }
 
@@ -1408,37 +1461,58 @@ fn evolve(lab: &Lab, pool: &[Expr], budget: Budget) -> (Vec<Scored>, usize) {
     let mut seen = std::collections::HashSet::new();
     let mut pop: Vec<Scored> = Vec::new();
     let mut tried = 0;
-    let mut add = |e: Expr, pop: &mut Vec<Scored>, tried: &mut usize| {
+    let keep = budget.pool.max(MIN_POOL);
+    // Every core but one (the viewer keeps drawing).
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get().saturating_sub(1))
+        .max(1);
+    // Score a batch of new formulas, on all those threads.
+    let mut add_all = |batch: Vec<Expr>, pop: &mut Vec<Scored>, tried: &mut usize| {
         // Classics as they are; anything new has to make sense (its parts go together).
-        if e.depth() > 9
-            || e.size() > 30
-            || !(e.sensible() || classics.contains(&e))
-            || !seen.insert(e.to_string())
-        {
-            return;
-        }
-        *tried += 1;
-        if let Some(fitness) = lab.fitness(&e) {
-            let invented = !classics.contains(&e);
-            pop.push(Scored {
-                expr: e,
-                fitness,
-                invented,
-            });
+        let batch: Vec<Expr> = batch
+            .into_iter()
+            .filter(|e| {
+                e.depth() <= 9
+                    && e.size() <= 30
+                    && (e.sensible() || classics.contains(e))
+                    && seen.insert(e.to_string())
+            })
+            .collect();
+        *tried += batch.len();
+        let chunk = batch.len().div_ceil(threads).max(1);
+        let scored: Vec<Option<f64>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = batch
+                .chunks(chunk)
+                .map(|part| {
+                    scope.spawn(move || part.iter().map(|e| lab.fitness(e)).collect::<Vec<_>>())
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap_or_default())
+                .collect()
+        });
+        for (e, f) in batch.into_iter().zip(scored) {
+            if let Some(fitness) = f {
+                let invented = !classics.contains(&e);
+                pop.push(Scored {
+                    expr: e,
+                    fitness,
+                    invented,
+                });
+            }
         }
     };
     // Kept formulas only for the series this data still has.
     let cols = input.columns();
-    for e in pool
+    let start: Vec<Expr> = pool
         .iter()
         .chain(&classics)
         .filter(|e| e.columns().iter().all(|c| cols.contains(c)))
-    {
-        add(e.clone(), &mut pop, &mut tried);
-    }
-    for _ in 0..POOL {
-        add(maker.random(&mut rng), &mut pop, &mut tried);
-    }
+        .cloned()
+        .chain((0..MIN_POOL).map(|_| maker.random(&mut rng)))
+        .collect();
+    add_all(start, &mut pop, &mut tried);
     // The fittest, but varied: at most 3 of a shape (the same operations with other
     // windows or series) and a sixth of the pool with the same outer operation, so one
     // idea (RSI of RSI…) can't crowd out the rest.
@@ -1449,14 +1523,14 @@ fn evolve(lab: &Lab, pool: &[Expr], budget: Budget) -> (Vec<Scored>, usize) {
         pop.retain(|s| {
             let shape = shapes.entry(s.expr.shape()).or_default();
             let head = heads.entry(s.expr.head()).or_default();
-            if *shape >= 3 || *head >= POOL / 6 {
+            if *shape >= 3 || *head >= keep / 6 {
                 return false;
             }
             *shape += 1;
             *head += 1;
             true
         });
-        pop.truncate(POOL);
+        pop.truncate(keep);
     };
     by_fitness(&mut pop);
     while started.elapsed() < budget.time && tried < budget.formulas && !pop.is_empty() {
@@ -1469,29 +1543,31 @@ fn evolve(lab: &Lab, pool: &[Expr], budget: Budget) -> (Vec<Scored>, usize) {
                 .expr
                 .clone()
         };
-        for _ in 0..40 {
-            let a = pick(&mut rng, &pop);
-            let child = match rng.below(12) {
-                0..=3 => maker.mutate(&a, &mut rng),
-                // Built on two that work.
-                8 | 9 => {
-                    let b = pick(&mut rng, &pop);
-                    maker.compose(&a, &b, &mut rng)
-                }
-                4..=7 => {
-                    let b = pick(&mut rng, &pop);
-                    let c = maker.cross(&a, &b, &mut rng);
-                    if rng.chance(0.3) {
-                        maker.mutate(&c, &mut rng)
-                    } else {
-                        c
+        let batch: Vec<Expr> = (0..40 * threads)
+            .map(|_| {
+                let a = pick(&mut rng, &pop);
+                match rng.below(12) {
+                    0..=3 => maker.mutate(&a, &mut rng),
+                    // Built on two that work.
+                    8 | 9 => {
+                        let b = pick(&mut rng, &pop);
+                        maker.compose(&a, &b, &mut rng)
                     }
+                    4..=7 => {
+                        let b = pick(&mut rng, &pop);
+                        let c = maker.cross(&a, &b, &mut rng);
+                        if rng.chance(0.3) {
+                            maker.mutate(&c, &mut rng)
+                        } else {
+                            c
+                        }
+                    }
+                    // Fresh ideas now and then.
+                    _ => maker.random(&mut rng),
                 }
-                // Fresh ideas now and then.
-                _ => maker.random(&mut rng),
-            };
-            add(child, &mut pop, &mut tried);
-        }
+            })
+            .collect();
+        add_all(batch, &mut pop, &mut tried);
         by_fitness(&mut pop);
     }
     (pop, tried)
@@ -2033,6 +2109,7 @@ mod tests {
         Budget {
             time: std::time::Duration::from_secs(30),
             formulas: 1500,
+            pool: 150,
             seed: 1,
         }
     }

@@ -273,7 +273,8 @@ impl Sub {
 
     /// Everything it has read, named after it (for merging into another chart).
     pub fn merged(&self) -> Dataset {
-        let mut ds = self.session.full_dataset();
+        // Its own --select / --exclude apply (its raw fields stay out of the chart).
+        let mut ds = self.session.select(&self.session.full_dataset());
         rename(&self.name, &mut ds);
         ds
     }
