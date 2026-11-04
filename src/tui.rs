@@ -2998,6 +2998,8 @@ impl App {
                 self.opts.panes = None;
                 self.opts.side_by_side = false;
                 self.pane_menu = false;
+                // Its settings were a pane's, and there are no panes now.
+                self.settings_menu = false;
                 return self.say("one chart", false);
             }
             PaneOp::Lines => {
@@ -3014,13 +3016,15 @@ impl App {
         let kind = self.opts.kind;
         let p = self.ensure_panes();
         let f = p.focus;
+        let mut closed = false;
         let complaint = match op {
             PaneOp::Split(sp) => {
                 p.split(sp);
                 None
             }
             PaneOp::Close => {
-                (!p.close()).then_some("that's the last pane — \"one chart\" leaves panes")
+                closed = p.close();
+                (!closed).then_some("that's the last pane — \"one chart\" leaves panes")
             }
             PaneOp::Focus(d) => (!p.focus_dir(area, d)).then_some("no pane that way"),
             PaneOp::Move(d) => (!p.move_dir(area, d)).then_some("no pane that way to swap with"),
@@ -3067,6 +3071,11 @@ impl App {
             }
             PaneOp::Done | PaneOp::Single | PaneOp::Lines | PaneOp::Source => None,
         };
+        // The pane whose settings were open is gone: so is its menu (not another
+        // pane's in its place).
+        if closed {
+            self.settings_menu = false;
+        }
         if let Some(c) = complaint {
             self.say(c, false);
         }
@@ -11979,6 +11988,15 @@ pub(crate) mod tests {
             phone.contains("pane 1 settings") && phone.contains(" done "),
             "{phone}"
         );
+        // Closing the pane closes its settings too (not another pane's in its place).
+        app.pane_op(PaneOp::Close);
+        assert_eq!(app.opts.panes.as_ref().unwrap().count(), 1);
+        assert!(!app.settings_menu);
+        assert!(!screen(&app).contains("settings"));
+        // And with panes gone altogether ("one chart").
+        app.open_settings(Some(0));
+        app.pane_op(PaneOp::Single);
+        assert!(!app.settings_menu && app.opts.panes.is_none());
         // One chart: right-click anywhere on it.
         let mut app = app_from(&[LOG.to_string()]);
         screen(&app);
