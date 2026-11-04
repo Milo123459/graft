@@ -253,6 +253,8 @@ enum LabHit {
     Pick(usize),
     Keep,
     SearchNow,
+    /// Cycle how long orders take to fill.
+    Latency,
     /// Strategies or theories.
     View,
     Stop,
@@ -730,6 +732,7 @@ impl App {
             lab: cli.discover.map(|fees| {
                 crate::lab::Lab::new(crate::discover::Settings {
                     fees,
+                    latency: cli.latency.map_or(0.0, |l| l.as_secs_f64()),
                     ..Default::default()
                 })
             }),
@@ -1275,6 +1278,12 @@ impl App {
                 }
                 self.tick_lab();
             }
+            LabHit::Latency => {
+                // Off → 100ms → 300ms (a standard Lighter account) → 1s → off.
+                let now = self.cli.latency.map_or(0.0, |l| l.as_secs_f64());
+                let next = [0.1, 0.3, 1.0].into_iter().find(|s| *s > now + 1e-9);
+                self.set_latency(next);
+            }
             LabHit::View => self.lab_theories = !self.lab_theories,
             LabHit::Stop => self.stop_discover(),
         }
@@ -1338,6 +1347,7 @@ impl App {
         let settings = crate::discover::Settings {
             fees,
             series,
+            latency: self.cli.latency.map_or(0.0, |l| l.as_secs_f64()),
             ..Default::default()
         };
         self.lab = Some(crate::lab::Lab::new(settings));
@@ -1356,6 +1366,27 @@ impl App {
             false,
         );
         self.tick_lab();
+    }
+
+    /// `--latency` (`latency("300ms")`): how long discovery's orders take to fill. It
+    /// searches again at once, and the strategies it's trading are re-scored with it.
+    fn set_latency(&mut self, secs: Option<f64>) {
+        self.cli.latency = secs.map(Duration::from_secs_f64);
+        let what = secs.map_or("at once".to_string(), |s| {
+            format!("{} late", crate::time::fmt_duration_compact(s))
+        });
+        match self.lab.as_mut() {
+            Some(lab) => {
+                lab.settings.latency = secs.unwrap_or(0.0);
+                lab.rerun();
+                self.say(format!("discover: orders fill {what}"), false);
+                self.tick_lab();
+            }
+            None => self.say(
+                format!("orders will fill {what} — discover() to start discovering"),
+                false,
+            ),
+        }
     }
 
     fn stop_discover(&mut self) {
@@ -6410,6 +6441,7 @@ impl App {
                 self.note(text, false);
             }
             Action::Discover(fee, series) => self.start_discover(fee, series),
+            Action::Latency(secs) => self.set_latency(secs),
             Action::Undiscover => self.stop_discover(),
             Action::DiscoverPick(n) => match self.lab.as_mut() {
                 Some(lab) if n >= 1 && n <= lab.tracked.len() => {
@@ -8469,6 +8501,14 @@ impl App {
             Hit::Lab(LabHit::View),
         ));
         v.push(Button::new("search now", Hit::Lab(LabHit::SearchNow)).active(lab.searching()));
+        let latency = match lab.settings.latency {
+            s if s > 0.0 => crate::time::fmt_duration_compact(s),
+            _ => "off".into(),
+        };
+        v.push(
+            Button::new(format!("latency: {latency}"), Hit::Lab(LabHit::Latency))
+                .active(lab.settings.latency > 0.0),
+        );
         v.push(Button::new("stop", Hit::Lab(LabHit::Stop)));
         v
     }
@@ -8480,10 +8520,13 @@ impl App {
         rows: Vec<(Line<'static>, Option<Hit>)>,
         buttons: &[Button<Hit>],
     ) {
-        let fees = self
-            .lab
-            .as_ref()
-            .map_or(String::new(), |l| l.settings.fees.short());
+        let fees = self.lab.as_ref().map_or(String::new(), |l| {
+            let late = match l.settings.latency {
+                s if s > 0.0 => format!(" · fills {} late", crate::time::fmt_duration_compact(s)),
+                _ => String::new(),
+            };
+            format!("{}{late}", l.settings.fees.short())
+        });
         let block = Block::bordered()
             .border_style(Style::default().fg(Color::DarkGray))
             .title(format!(" discover · {fees} "));
@@ -10690,6 +10733,37 @@ pub(crate) mod tests {
         assert!(s.contains("collecting data"), "{s}");
         key(&mut app, KeyCode::Char('E'));
         assert!(app.lab.is_none());
+    }
+
+    #[test]
+    fn latency_from_the_flag_the_console_and_the_panel() {
+        let mut app = app(&["graft", LOG, "--discover", "0", "--latency", "300ms"]);
+        let lab = |app: &App| app.lab.as_ref().unwrap().settings.latency;
+        assert_eq!(lab(&app), 0.3);
+        let s = screen_sized(&app, 46, 30);
+        assert!(s.contains("fills 300ms late"), "{s}");
+        assert!(s.contains("latency: 300ms"), "{s}");
+        run(&mut app, "latency(false)");
+        assert_eq!((lab(&app), app.cli.latency), (0.0, None));
+        // The button cycles: off → 100ms → 300ms → 1s → off.
+        app.lab_hit(LabHit::Latency);
+        assert_eq!(lab(&app), 0.1);
+        app.lab_hit(LabHit::Latency);
+        app.lab_hit(LabHit::Latency);
+        assert_eq!(lab(&app), 1.0);
+        app.lab_hit(LabHit::Latency);
+        assert_eq!(lab(&app), 0.0);
+        run(&mut app, r#"latency("250ms")"#);
+        assert!((lab(&app) - 0.25).abs() < 1e-9);
+        assert!(
+            app.current_cli()
+                .to_args()
+                .windows(2)
+                .any(|w| w[0] == "--latency" && w[1] == "250ms")
+        );
+        // Set before discovering: it starts with it.
+        run(&mut app, "undiscover(); latency(\"1s\"); discover(0)");
+        assert_eq!(lab(&app), 1.0);
     }
 
     #[test]

@@ -27,6 +27,8 @@ pub struct Session {
     binary: bool,
     /// `--record`: where every line read goes too.
     record: Option<(std::path::PathBuf, std::io::LineWriter<std::fs::File>)>,
+    /// `--book`: the order book kept from a snapshot and its changes.
+    book: Option<crate::book::Book>,
 }
 
 impl Session {
@@ -60,6 +62,13 @@ impl Session {
             line_errors: Default::default(),
             binary: cli.binary_units,
             record: None,
+            book: match &cli.book {
+                Some(b) => Some(crate::book::Book::new(
+                    crate::book::BookSpec::parse(b).map_err(anyhow::Error::msg)?,
+                    cli.every.as_secs_f64(),
+                )),
+                None => None,
+            },
         }
         .recording(cli.record.as_deref())
     }
@@ -96,6 +105,18 @@ impl Session {
 
     /// Parse and store one line, returning the x it was placed at.
     pub fn feed(&mut self, line: &str, meta: &LineMeta) -> Result<f64, Skip> {
+        // A book's changes are kept, and the book read out every so often.
+        let read_out;
+        let line = match &mut self.book {
+            Some(b) => match b.apply(line, meta.arrival) {
+                Some(l) => {
+                    read_out = l;
+                    read_out.as_str()
+                }
+                None => return Err(Skip::Incomplete),
+            },
+            None => line,
+        };
         self.lines += 1;
         if let Some((_, w)) = &mut self.record {
             use std::io::Write;

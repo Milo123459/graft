@@ -196,6 +196,9 @@ pub struct Settings {
     /// Only the newest this many points are searched (the lab sizes it from how fast
     /// its searches go; everything by default).
     pub max_points: usize,
+    /// How long an order takes to fill (seconds, `--latency`): every trade gets in and
+    /// out at the price that much after it decided to.
+    pub latency: f64,
 }
 
 impl Default for Settings {
@@ -204,6 +207,7 @@ impl Default for Settings {
             fees: Fees::Flat(0.0),
             series: None,
             max_points: usize::MAX,
+            latency: 0.0,
         }
     }
 }
@@ -231,6 +235,8 @@ pub struct Input {
     pub others: Vec<Other>,
     /// Whether x is time (so lengths can be told in seconds).
     pub time: bool,
+    /// How long after deciding a trade's orders fill (seconds; time axes only).
+    pub delay: f64,
 }
 
 /// The value of points (sorted by x) at each of `xs`: the one at or just before it.
@@ -372,6 +378,7 @@ impl Input {
             half_spread,
             others,
             time: ds.x_kind == crate::data::XKind::Time,
+            delay: s.latency.max(0.0),
         })
     }
 
@@ -412,6 +419,33 @@ impl Input {
             Some((_, bid, _, _)) if bid[i].is_finite() => bid[i],
             _ => self.price[i] * (1.0 - self.half_spread),
         }
+    }
+
+    /// What an order sent at point i fills at: `price(j)` `delay` later, between the
+    /// points either side of then. `None` when that's past the newest point.
+    fn later(&self, i: usize, price: impl Fn(usize) -> f64) -> Option<f64> {
+        if self.delay <= 0.0 || !self.time {
+            return Some(price(i));
+        }
+        let t = self.x[i] + self.delay;
+        // The first point after then (there's one at or before it: point i).
+        let k = i + self.x[i..].partition_point(|x| *x <= t);
+        if k >= self.x.len() {
+            return None;
+        }
+        let a = k - 1;
+        let f = (t - self.x[a]) / (self.x[k] - self.x[a]);
+        Some(price(a) + (price(k) - price(a)) * f)
+    }
+
+    /// Buying (at the ask) with an order sent at point i.
+    fn fill_buy(&self, i: usize) -> Option<f64> {
+        self.later(i, |j| self.buy_at(j))
+    }
+
+    /// Selling (at the bid) with an order sent at point i.
+    fn fill_sell(&self, i: usize) -> Option<f64> {
+        self.later(i, |j| self.sell_at(j))
     }
 
     fn other(&self, name: &str) -> Option<&Other> {
@@ -907,31 +941,47 @@ impl Strategy {
                 continue;
             };
             let long = side == Side::Long;
-            let entry = if long {
-                input.buy_at(i)
+            // Sent at i, filled `delay` later (with none: at i).
+            let Some(entry) = (if long {
+                input.fill_buy(i)
             } else {
-                input.sell_at(i)
+                input.fill_sell(i)
+            }) else {
+                break;
             };
-            let ret = |j: usize| {
-                let exit = if long {
+            let ret = |exit: f64| {
+                let r = (exit / entry - 1.0) * 1e4;
+                if long { r } else { -r }
+            };
+            // What it sees at j (it decides on that) and what an order to get out sent
+            // then fills at.
+            let seen = |j: usize| {
+                ret(if long {
                     input.sell_at(j)
                 } else {
                     input.buy_at(j)
-                };
-                let r = (exit / entry - 1.0) * 1e4;
-                if long { r } else { -r }
+                })
+            };
+            let filled = |j: usize| {
+                if long {
+                    input.fill_sell(j)
+                } else {
+                    input.fill_buy(j)
+                }
+                .map(ret)
             };
             let last = (i + self.exit.hold).min(n - 1);
             let mut closed = None;
             for j in i + 1..=last {
-                let r = ret(j);
+                let r = seen(j);
                 let hit = self.exit.take.is_some_and(|t| r >= t)
                     || self.exit.stop.is_some_and(|s| r <= -s)
                     || liquidation.is_some_and(|l| r <= -l)
                     || max_take.is_some_and(|m| r >= m)
                     || j == i + self.exit.hold;
                 if hit {
-                    closed = Some((j, r));
+                    // Getting out fills past the newest point: still open.
+                    closed = filled(j).map(|r| (j, r));
                     break;
                 }
             }
@@ -949,7 +999,7 @@ impl Strategy {
                 None => {
                     // Still open at the newest point.
                     if i + 1 < n {
-                        let r = ret(n - 1);
+                        let r = seen(n - 1);
                         out.push(Trade {
                             entry: i,
                             exit: None,
@@ -2119,6 +2169,7 @@ mod tests {
             half_spread: 0.0,
             others: Vec::new(),
             time: false,
+            delay: 0.0,
         }
     }
 
@@ -2180,6 +2231,55 @@ mod tests {
         assert!(t.iter().all(|t| (t.net + 9.0).abs() < 1e-9), "{t:?}");
         // Back to back: the next starts after the last ends.
         assert_eq!(t[1].entry, t[0].exit.unwrap() + 1);
+    }
+
+    #[test]
+    fn with_latency_orders_fill_at_the_price_that_much_later() {
+        // A second a point; the price jumps 1% just after the first point.
+        let mut prices = vec![100.0];
+        prices.extend(vec![101.0; 9]);
+        let at = |delay: f64| {
+            let inp = Input {
+                time: true,
+                delay,
+                ..input(prices.clone())
+            };
+            let s = Strategy::one_way(
+                Side::Long,
+                vec![always()],
+                Exit {
+                    hold: 3,
+                    take: None,
+                    stop: None,
+                },
+            );
+            s.trades(&inp, &[&vec![1.0; inp.len()]], 0, 1, &Fees::Flat(0.0))
+        };
+        // At once: in at 100, so it has the whole jump.
+        assert!((at(0.0)[0].net - 100.0).abs() < 1e-9, "{:?}", at(0.0));
+        // 300 ms late: in at 100.30 (between the points), most of it.
+        assert!((at(0.3)[0].net - (101.0 / 100.3 - 1.0) * 1e4).abs() < 1e-6);
+        // A second late: in after the jump, nothing.
+        assert!(at(1.0)[0].net.abs() < 1e-9);
+        // Getting out would fill after the newest point: still open.
+        let open = {
+            let inp = Input {
+                time: true,
+                delay: 0.3,
+                ..input(prices.clone())
+            };
+            let s = Strategy::one_way(
+                Side::Long,
+                vec![always()],
+                Exit {
+                    hold: 9,
+                    take: None,
+                    stop: None,
+                },
+            );
+            s.trades(&inp, &[&vec![1.0; inp.len()]], 0, 1, &Fees::Flat(0.0))
+        };
+        assert_eq!(open[0].exit, None, "{open:?}");
     }
 
     #[test]
@@ -2258,6 +2358,10 @@ mod tests {
                 half_spread: spread / 2.0 / 1e4,
                 others: Vec::new(),
                 time: true,
+                delay: std::env::var("GRAFT_LATENCY")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.0),
             };
             let mut b = budget();
             b.formulas = 6000;

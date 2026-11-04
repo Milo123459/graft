@@ -1,6 +1,7 @@
 //! graft — graph anything in your terminal.
 
 mod backtest;
+mod book;
 mod builder;
 mod cli;
 mod data;

@@ -86,6 +86,7 @@ graft -p cpu                           # a preset: cpu, memory, load, network, d
 | Follow a file | `-f, --follow` (handles truncation/rotation) |
 | Run a command repeatedly | `-c, --cmd 'COMMAND'`, `-n, --every 2s`, `--count N` |
 | A stream a server pushes | `--stream URL` (or `--ws`, `--sse`): a WebSocket (`wss://…`; `--send MSG` goes out once connected, e.g. a subscription) or a streaming HTTP response (`https://…`: server-sent events, each event's `data:` is a record, or plain lines; with `--send` it's a POST). Reconnects when dropped. A URL whose reply ends (a REST snapshot) is asked again every `--every`: `--stream https://api.hyperliquid.xyz/info --send '{"type":"l2Book","coin":"BTC"}' --every 1s` polls Hyperliquid's order book each second. With `--once`, `--count N` records |
+| Keep an order book from its changes | `--book BIDS,ASKS[:LEVELS]`: for a stream that sends the book once and then only what changed (Lighter's `order_book/1`): `--book order_book.bids,order_book.asks` keeps the whole book (a size of 0 takes a level out; a message whose `type` says subscribed or snapshot, as on a reconnect, starts it over) and reads it out every `--every` (1s) as one line with the best 20 levels a side (`:50` for more), written the source's way, so `--series 'bid = order_book_bids_0_price'` works on it. `--record` saves those read-outs (a whole book each), and they read back as the same book |
 | Record a source | `--record ~/graft/btc.jsonl`: saves every line it reads (appended), and the next run reads the file back first in the source's own format, so a stream with no history to download builds its own, run after run. In a `--merge`'s arguments it records that source. In the viewer `record("…")`, `record(false)`, or **record…** in **⋯**; **● rec** in the legend shows it's on (tap to stop) |
 | Older data for a stream | `--history 'ARGS'`: another source with its own format (like `--source`), whose series go in before the source's own under the same names; with `{from_ms:…}` / `{now_ms}` in its command it pages back to `--history-depth 6h` (default 1h), four pages at once, saying how far it's got, and scrolling to the oldest data fetches more. In the viewer: `history_depth("24h")` (or **history depth** in **⋯**, which cycles) goes further back at once, `history("…")` / **history…** changes the source, `history(false)` drops it. Give `--history` again for more sources (`history(["…", "…"])`), each filling in series the others don't have. History is resampled like the chart |
 | Keep only recent data | `-w, --window 6h` or `--window 500` (points); older data is dropped from memory |
@@ -465,6 +466,11 @@ each search works it out from what it has:
   pays the spread and fees, and walking forward says what's left. For longer holds give
   it more data, or fewer points (24 hours of 1-second points reach about 24 minutes;
   `--resample 5s --history-depth 3d`, about 2 hours);
+- **latency**: `--latency 300ms` (`latency("300ms")` in the console, **latency** in
+  the panel, which cycles off, 100ms, 300ms, 1s): it still decides on the prices it
+  sees, but every order fills at the price that much later, between points — what a
+  standard Lighter account's 300 ms taker delay costs. The panel's title says it
+  (*fills 300ms late*);
 - **tails**: for each horizon, enough of a formula's range that events h apart come
   up about 20 times per tail (2% to 10%), and 3× that;
 - **thresholds are ranks**, not numbers: "in the lowest 5% so far". Re-fitting keeps
@@ -632,6 +638,29 @@ chart's series, not every level).
 ```sh
 graft --stream https://api.hyperliquid.xyz/info --send '{"type":"l2Book","coin":"BTC"}' --every 1s --json --time-field time \
   --series 'price:USD = (levels_0_0_px + levels_1_0_px) / 2' --select price -k book
+```
+
+**Zero fees: Lighter.** A standard Lighter account pays no fees, but its taker orders
+wait 300 ms and you still cross the spread both ways (about $4 on BTC, half a basis
+point). Its WebSocket sends the book once and then only what changed, so `--book` keeps
+it (read out every second). The chart is Lighter's own BTC book: bid, ask, mid, the
+imbalance of the 5 best levels a side and the microprice, recorded for next time,
+with Binance's order flow and 24 hours of history. Discovery pays the spread it reads
+from the bid and ask and fills every order 300 ms late, so what it keeps is what a
+standard account would. On a day of BTC priced that way, the strategies that held up
+walking forward made a quarter to half a basis point a trade, holding around half a
+minute: small, so paper-trade before believing it.
+
+```sh
+graft --stream 'wss://mainnet.zklighter.elliot.ai/stream?readonly=true' --send '{"type":"subscribe","channel":"order_book/1"}' --book order_book.bids,order_book.asks --json --time-field timestamp \
+  --series 'bid:USD = order_book_bids_0_price' --series 'ask:USD = order_book_asks_0_price' --series 'price:USD = (bid + ask) / 2' \
+  --series 'bids = order_book_bids_0_size + order_book_bids_1_size + order_book_bids_2_size + order_book_bids_3_size + order_book_bids_4_size' --series 'asks = order_book_asks_0_size + order_book_asks_1_size + order_book_asks_2_size + order_book_asks_3_size + order_book_asks_4_size' --series 'imbalance = (bids - asks) / (bids + asks)' \
+  --series 'micro:USD = (ask * order_book_bids_0_size + bid * order_book_asks_0_size) / (order_book_bids_0_size + order_book_asks_0_size)' \
+  --select price,bid,ask,imbalance,micro,bids,asks --resample 1s:last --record ~/graft/lighter-btc-book.jsonl \
+  --merge 'binance = --stream wss://data-stream.binance.vision/ws/btcusdt@kline_1s --json --time-field k.t --replace --series "price = k_c" --series "vol = k_v" --series "buys = k_V" --series "trades = k_n" --select price' \
+  --history '-c "curl -s \"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1s&limit=1000&startTime={from_ms:1000s}&endTime={now_ms}\"" --json --time-field 0 --series "price:USD = c4" --series "binance.price = c4" --series "binance.vol = c5" --series "binance.buys = c9" --series "binance.trades = c8" --select price' \
+  --history-depth 24h --hide bid,ask,imbalance,micro,bids,asks,binance.price,binance.vol,binance.buys,binance.trades --discover 0 --latency 300ms --marks-below \
+  --pane price --pane 'kind=book' --layout '1 / 2' --title 'BTC on Lighter'
 ```
 
 **It never stops inventing.** Searches run one after another (3 s each) on every core

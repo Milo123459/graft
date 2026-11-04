@@ -146,9 +146,9 @@ pub struct Cli {
     #[arg(long, value_name = "N", help_heading = "Input")]
     pub count: Option<u64>,
 
-    /// Save every line the source reads to FILE (appended, as it comes): a stream's
-    /// messages become history for next time (`--history 'FILE --json …'`). In a
-    /// `--merge`, its own lines.
+    /// Save every line the source reads to FILE (appended, as it comes), and read the
+    /// file back first on the next run: a stream builds its own history. In a
+    /// `--merge`, its own lines. With --book, the book as it's read out.
     #[arg(long, value_name = "FILE", help_heading = "Input")]
     pub record: Option<PathBuf>,
 
@@ -249,6 +249,14 @@ pub struct Cli {
     /// CSV column / JSON key holding the timestamp.
     #[arg(long, value_name = "FIELD", help_heading = "Parsing")]
     pub time_field: Option<String>,
+
+    /// A stream that sends an order book once and then only what changed (Lighter's
+    /// `order_book/1`): keep the whole book and read it out every --every as one line
+    /// with the best LEVELS (20) a side. BIDS,ASKS are where its two lists are:
+    /// `--book order_book.bids,order_book.asks` (or `…:50`). A size of 0 takes a level
+    /// out; a message whose type says subscribed or snapshot starts it over.
+    #[arg(long, value_name = "BIDS,ASKS[:LEVELS]", value_parser = parse_book, help_heading = "Parsing")]
+    pub book: Option<String>,
 
     /// strftime format for timestamps, e.g. `%d/%m/%Y %H:%M` (default: auto-detect).
     #[arg(short = 't', long, value_name = "FORMAT", help_heading = "Parsing")]
@@ -405,6 +413,12 @@ pub struct Cli {
     /// Same as `discover(FEES)`.
     #[arg(long, value_name = "FEES", num_args = 0..=1, default_missing_value = "0", value_parser = parse_fees, help_heading = "Analysis")]
     pub discover: Option<crate::discover::Fees>,
+
+    /// With --discover: how long an order takes to fill (`300ms`: a standard Lighter
+    /// account's taker orders). Every trade gets in and out at the price that much after
+    /// it decides to (between points). Same as `latency("300ms")`.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration, help_heading = "Analysis")]
+    pub latency: Option<Duration>,
 
     /// Print statistics and trends (slope, R², forecast) for each series.
     #[arg(short = 'S', long, help_heading = "Analysis")]
@@ -687,6 +701,8 @@ impl Cli {
                 .then(|| fmt_secs(self.history_depth.as_secs_f64())),
         );
         opt("--discover", self.discover.map(|f| f.to_arg()));
+        opt("--latency", self.latency.map(|l| fmt_secs(l.as_secs_f64())));
+        opt("--book", self.book.clone());
         for m in &self.send {
             opt("--send", Some(m.clone()));
         }
@@ -993,6 +1009,10 @@ fn value_name<T: ValueEnum>(v: T) -> String {
 
 fn parse_fees(s: &str) -> Result<crate::discover::Fees, String> {
     crate::discover::Fees::parse(s)
+}
+
+fn parse_book(s: &str) -> Result<String, String> {
+    crate::book::BookSpec::parse(s).map(|_| s.to_string())
 }
 
 fn fmt_secs(s: f64) -> String {

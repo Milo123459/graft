@@ -88,6 +88,8 @@ pub enum Action {
     Undiscover,
     /// Keep discovered strategy n (`None`: the one on the chart) as lines and a rule.
     DiscoverKeep(Option<usize>),
+    /// `latency("300ms")` (`None`: orders fill at once).
+    Latency(Option<f64>),
     /// Show discovered strategy n's trades on the chart.
     DiscoverPick(usize),
     /// What a series did after a rule's markers: (rule, series, after).
@@ -877,6 +879,11 @@ pub const USAGE: &[(&str, &str, &str)] = &[
         "stop discovering (closes the panel)",
     ),
     (
+        "latency",
+        r#"latency("300ms")  ·  latency(false)"#,
+        "how long discovery's orders take to fill (as --latency): every trade gets in and out at the price that much later",
+    ),
+    (
         "discover_pick",
         "discover_pick(2)",
         "show discovered strategy 2's trades on the chart",
@@ -1064,6 +1071,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "sweep",
             "discover",
             "undiscover",
+            "latency",
             "discover_pick",
             "discover_keep",
         ],
@@ -2868,6 +2876,23 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
     );
     let st = state.clone();
     engine.register_fn("undiscover", move || push(&st, Action::Undiscover));
+    let st = state.clone();
+    engine.register_fn("latency", move |d: Dynamic| -> FnResult<()> {
+        let secs =
+            if d.as_bool().is_ok_and(|b| !b) {
+                None
+            } else if let Some(s) = dyn_to_f64(&d) {
+                // A bare number is milliseconds.
+                Some(s / 1000.0)
+            } else {
+                let text = d.to_string();
+                Some(crate::time::parse_duration_secs(&text).map_err(|_| {
+                    format!("latency: '{text}' isn't a length of time, e.g. \"300ms\"")
+                })?)
+            };
+        push(&st, Action::Latency(secs.filter(|s| *s > 0.0)));
+        Ok(())
+    });
     let st = state.clone();
     engine.register_fn("discover_keep", move || {
         push(&st, Action::DiscoverKeep(None))

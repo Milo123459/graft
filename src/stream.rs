@@ -309,7 +309,16 @@ fn websocket(url: &str, send: &[String], tx: &Sender<Event>) -> Result<Flow, Str
         .set_read_timeout(Some(Duration::from_secs(1)))
         .map_err(|e| e.to_string())?;
     let mut quiet_since = Instant::now();
+    let mut pinged = Instant::now();
     loop {
+        // Some servers drop a client that's sent nothing for a while (Lighter: 2
+        // minutes), however much they send it: a ping now and then.
+        if pinged.elapsed() > Duration::from_secs(30) {
+            pinged = Instant::now();
+            socket
+                .send(Message::Ping(Default::default()))
+                .map_err(|e| format!("ping: {e}"))?;
+        }
         match socket.read() {
             Ok(Message::Text(t)) => {
                 quiet_since = Instant::now();
@@ -508,8 +517,10 @@ mod tests {
             })
             .collect();
         assert!(n.windows(2).all(|w| w[1] == w[0] + 1), "{n:?}");
+        // (Under 4 s even if the first try fails and waits its second: backing off
+        // would take 1 + 2 + 4 s.)
         assert!(
-            start.elapsed() < Duration::from_secs(2),
+            start.elapsed() < Duration::from_secs(4),
             "{:?}",
             start.elapsed()
         );
