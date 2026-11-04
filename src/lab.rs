@@ -288,7 +288,13 @@ impl Lab {
                 continue;
             };
             self.tracked[k].why = Some(r.why.clone());
+            // Not a fix of a fix: each leaves out more of its losers, until only a
+            // lucky few trades are left.
             if let Some(fix) = &r.fix
+                && self.tracked[k]
+                    .note
+                    .as_deref()
+                    .is_none_or(|n| !n.starts_with("learned from"))
                 && !self.failed.contains(&fix.strategy.key())
                 && !self
                     .tracked
@@ -321,7 +327,7 @@ impl Lab {
             }
             // Only strategies that held up where they weren't picked, and did better
             // than holding there.
-            if f.checked.n < 3 || f.checked.mean <= 0.0 || f.edge.mean <= 0.0 {
+            if f.checked.n < 5 || f.checked.mean <= 0.0 || f.edge.mean <= 0.0 {
                 continue;
             }
             self.tracked.push(new(f.clone(), None, self.runs));

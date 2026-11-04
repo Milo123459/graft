@@ -46,6 +46,8 @@ const MIN_TRADES: usize = 10;
 const MIN_T: f64 = 1.5;
 /// …and of how much better than holding the same way it did.
 const MIN_EDGE_T: f64 = 1.0;
+/// Trades walking forward a fixed version of a strategy needs to replace it.
+const MIN_CHECKED: usize = 5;
 
 /// What trading costs, besides the spread (buying at the ask, selling at the bid).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1974,10 +1976,18 @@ pub fn search(
                 f.except.push(l.cond.clone());
                 let t = trades_of(&f, 0, learn);
                 let (checked, steps, edge) = walk(&f);
-                (checked.n >= 3 && checked.mean > net.mean && edge.mean > 0.0).then_some(
+                let picked = perf(&t);
+                // The same bar as any strategy: enough trades where it's picked, and
+                // walking forward — leaving out its losers mustn't leave a lucky few.
+                (picked.n >= MIN_TRADES
+                    && picked.t >= MIN_T
+                    && checked.n >= MIN_CHECKED
+                    && checked.mean > net.mean
+                    && edge.mean > 0.0)
+                    .then_some(
                     Found {
                         strategy: f,
-                        picked: perf(&t),
+                        picked,
                         picked_edge: beat(&t, 0, learn),
                         checked,
                         steps,
