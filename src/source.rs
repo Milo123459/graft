@@ -34,10 +34,12 @@ pub enum SourceSpec {
         follow: bool,
     },
     /// A WebSocket or a streaming HTTP response (server-sent events or lines), with
-    /// messages to send once connected.
+    /// messages to send once connected. One that ends (an HTTP reply that's a
+    /// snapshot, not a stream) is fetched again `every` so often.
     Stream {
         url: String,
         send: Vec<String>,
+        every: Duration,
     },
 }
 
@@ -98,7 +100,7 @@ pub fn spawn(spec: SourceSpec) -> Receiver<Event> {
                 ssh,
             } => run_command(&cmd, every, count, ssh.as_deref(), &tx),
             SourceSpec::Remote { host, path, follow } => read_remote(&host, &path, follow, &tx),
-            SourceSpec::Stream { url, send } => crate::stream::run(&url, &send, &tx),
+            SourceSpec::Stream { url, send, every } => crate::stream::run(&url, &send, every, &tx),
         };
         if let Err(e) = result {
             let _ = tx.send(Event::Error(e));

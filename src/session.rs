@@ -25,6 +25,8 @@ pub struct Session {
     /// Why custom lines failed, last time they were worked out.
     pub line_errors: std::cell::RefCell<Vec<String>>,
     binary: bool,
+    /// `--record`: where every line read goes too.
+    record: Option<(std::path::PathBuf, std::io::LineWriter<std::fs::File>)>,
 }
 
 impl Session {
@@ -32,7 +34,7 @@ impl Session {
         let default_unit = cli.unit.as_deref().map(|u| {
             lookup_unit(u, cli.binary_units).unwrap_or_else(|| (Dim::Other(u.to_string()), 1.0))
         });
-        Ok(Self {
+        Self {
             store: {
                 let mut s = Store::new(cli.x, default_unit, cli.window);
                 s.replace = cli.replace;
@@ -57,12 +59,49 @@ impl Session {
                 .collect::<Result<_>>()?,
             line_errors: Default::default(),
             binary: cli.binary_units,
-        })
+            record: None,
+        }
+        .recording(cli.record.as_deref())
+    }
+
+    /// Save every line read to `path` from now on (appended); `None` stops.
+    pub fn set_record(&mut self, path: Option<&std::path::Path>) -> Result<()> {
+        self.record = match path {
+            Some(p) => {
+                let p = crate::cli::expand_home(p);
+                if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
+                    std::fs::create_dir_all(dir)?;
+                }
+                let f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&p)
+                    .map_err(|e| anyhow::anyhow!("--record {}: {e}", p.display()))?;
+                Some((p, std::io::LineWriter::new(f)))
+            }
+            None => None,
+        };
+        Ok(())
+    }
+
+    fn recording(mut self, path: Option<&std::path::Path>) -> Result<Self> {
+        self.set_record(path)?;
+        Ok(self)
+    }
+
+    /// Where it's saving what it reads, if it is.
+    pub fn recording_to(&self) -> Option<&std::path::Path> {
+        self.record.as_ref().map(|r| r.0.as_path())
     }
 
     /// Parse and store one line, returning the x it was placed at.
     pub fn feed(&mut self, line: &str, meta: &LineMeta) -> Result<f64, Skip> {
         self.lines += 1;
+        if let Some((_, w)) = &mut self.record {
+            use std::io::Write;
+            // A full disk shouldn't stop the chart: the line is still read.
+            let _ = writeln!(w, "{line}");
+        }
         let mut parsed = self.parser.parse(line)?;
         if self.arrival_time && parsed.x.is_none() {
             parsed.x = Some(parse::XVal::Time(meta.arrival));

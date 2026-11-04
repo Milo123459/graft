@@ -659,8 +659,8 @@ From here on the steps are a reference: read what's useful, skip the rest with E
                 "the builder for the main source: source and format, with suggestions and a preview — a stream's newest messages keep coming into it",
             ),
             (
-                "⋯ resample · history… · history depth",
-                "resample cycles a point every 1s, 5s, 15s, 1m, 5m or off (applied at once); history… opens the history source in the console to change; history depth cycles how far back it goes (1h, 6h, 24h, 3d, 7d), loading the rest at once",
+                "⋯ resample · history… · history depth · record…",
+                "resample cycles a point every 1s, 5s, 15s, 1m, 5m or off (applied at once); history… opens the history source(s) in the console to change; history depth cycles how far back it goes (1h, 6h, 24h, 3d, 7d), loading the rest at once; record… starts saving every line read to a file (record(\"…\") in the console), and stops it when it's recording (● rec in the legend says so — tap it to stop too)",
             ),
         ],
         examples: &[
@@ -683,6 +683,18 @@ From here on the steps are a reference: read what's useful, skip the rest with E
             (
                 "graft --stream 'https://example.com/v1/stream?ids=1' --json --time-field timestampUs",
                 "server-sent events (--sse): each event's data is a record; any HTTP response that keeps sending lines works too (with --send: POSTed)",
+            ),
+            (
+                r#"graft --stream https://api.hyperliquid.xyz/info --send '{"type":"l2Book","coin":"BTC"}' --every 1s --json --time-field time --series 'bid = levels_0_0_px' --series 'ask = levels_1_0_px'"#,
+                "a snapshot to poll: a URL whose reply ends (a REST API) is asked again every --every — here Hyperliquid's whole order book (20 levels a side) as it is each second. A reply that keeps coming is read as a stream",
+            ),
+            (
+                "--record ~/graft/btc.jsonl",
+                "save every line the source reads (appended), and read the file back first on the next run, in the source's own format: a stream that only sends what's new builds its own history, run after run. In a --merge's arguments it records that source",
+            ),
+            (
+                r#":record("~/graft/btc.jsonl")"#,
+                "in the viewer: start recording (what's already in the file goes in first); record(false) stops",
             ),
             (
                 "graft --ssh pi@raspberrypi -c 'vcgencmd measure_temp' --regex 'temp=(?P<temp>[0-9.]+)'",
@@ -714,11 +726,11 @@ From here on the steps are a reference: read what's useful, skip the rest with E
             ),
             (
                 r#"--history '-c "curl -s \"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1s&limit=1000&startTime={from_ms:1000s}&endTime={now_ms}\"" --json --time-field 0 --series "price = c4" --select price' --history-depth 6h"#,
-                "older data for a source that only sends what's new (a stream): another source with its own format, whose series go in before the source's own under the same names. With a window in its command it pages back to --history-depth (1h unless you say), four pages at once, saying how far it's got, and scrolling to the oldest data fetches more",
+                "older data for a source that only sends what's new (a stream): another source with its own format, whose series go in before the source's own under the same names. With a window in its command it pages back to --history-depth (1h unless you say), four pages at once, saying how far it's got, and scrolling to the oldest data fetches more. Give --history again for another source (each fills in series the others don't have)",
             ),
             (
                 r#":history_depth("24h")"#,
-                "in the viewer: further back — deeper than it has, the rest loads now (history(\"…\") sets the history source, history(false) drops it)",
+                "in the viewer: further back — deeper than it has, the rest loads now (history(\"…\") sets the history source, history([\"…\", \"…\"]) several, history(false) drops it)",
             ),
             (
                 r#":resample("5s")"#,
@@ -799,7 +811,7 @@ From here on the steps are a reference: read what's useful, skip the rest with E
             ),
             (
                 "--series 'used:GB = total - free'",
-                "a new series from others, with a unit",
+                "a new series from others, with a unit; each can use the ones before it (--series 'bids = b0 + b1' --series 'asks = a0 + a1' --series 'imbalance = (bids - asks) / (bids + asks)')",
             ),
             (
                 "--rate",
@@ -1101,6 +1113,14 @@ The next pages are recipes for real use: copy puts one on your clipboard."#,
         text: "A live BTC price pushed 5 times a second (server-sent events) with its bid and ask, resampled to a point a second, with Binance's live 1-second candles merged in for the order flow: its price, volume, taker-buy volume and number of trades (binance.price, binance.vol, binance.buys, binance.trades, hidden from the chart). --history fills in 24 hours of Binance's 1-second prices and the same volume columns (named binance.… so they join the live ones), four pages at once. Discovery waits for the history, then searches it nonstop on every core: besides the price it gets the buy share (binance.buys / binance.vol: buying against selling), the average trade size, bursts of volume and trades, and Binance's premium over this price — and combines them with everything else it invents. It paper-trades what it finds on the live price, with Upside's profit sharing at 250x. Leave it running: live trades are the only test the search never saw.",
         command: Some(
             r#"graft --stream 'https://feed-v3.veranta.xyz/v1/stream?price_feed_ids=1' --json --time-field timestampUs --series 'price:USD = priceFeeds_0_price * 1e-8' --series 'bid:USD = priceFeeds_0_bestBidPrice * 1e-8' --series 'ask:USD = priceFeeds_0_bestAskPrice * 1e-8' --select price,bid,ask --resample 1s:last --merge 'binance = --stream wss://data-stream.binance.vision/ws/btcusdt@kline_1s --json --time-field k.t --replace --series "price = k_c" --series "vol = k_v" --series "buys = k_V" --series "trades = k_n" --select price' --history '-c "curl -s "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1s&limit=1000&startTime={from_ms:1000s}&endTime={now_ms}"" --json --time-field 0 --series "price:USD = c4" --series "binance.price = c4" --series "binance.vol = c5" --series "binance.buys = c9" --series "binance.trades = c8" --select price' --history-depth 24h --hide bid,ask,binance.price,binance.vol,binance.buys,binance.trades --discover upside:250 --marks-below --title 'BTC scalping lab'"#,
+        ),
+        ..BASE
+    },
+    Step {
+        title: "recipe: an order-book lab",
+        text: "Hyperliquid's real order book, for the market you'd trade there: its snapshot (the 20 best levels a side, as they are now) polled every second gives the mid price, the size on the 5 best levels each side, their imbalance (buyers' size against sellers', -1 to 1) and the microprice (the mid tilted toward the thinner side, where the price tends to go). A second snapshot with nSigFigs 3 groups the book into $100 levels, so 4 of them reach about half a percent each way: the deep imbalance, for moves over minutes. Binance's 1-second candles add the order flow (volume, taker buys, trades), with 24 hours of their history. The book has no history to download, so --record saves every snapshot, and the next run reads the recordings back first: the longer you run it, the more book data discovery has. Until a recording reaches back far enough, the price before it is Binance's. Searches take turns on all the data and on the newest stretch where the book series exist (once there are 10 minutes of them), so the book signals get tried as soon as there's enough. Fees are Hyperliquid's taker fee, 0.045% a side.",
+        command: Some(
+            r#"graft --stream https://api.hyperliquid.xyz/info --send '{"type":"l2Book","coin":"BTC"}' --every 1s --json --time-field time --series 'price:USD = (levels_0_0_px + levels_1_0_px) / 2' --series 'bids = levels_0_0_sz + levels_0_1_sz + levels_0_2_sz + levels_0_3_sz + levels_0_4_sz' --series 'asks = levels_1_0_sz + levels_1_1_sz + levels_1_2_sz + levels_1_3_sz + levels_1_4_sz' --series 'imbalance = (bids - asks) / (bids + asks)' --series 'micro:USD = (levels_1_0_px * levels_0_0_sz + levels_0_0_px * levels_1_0_sz) / (levels_0_0_sz + levels_1_0_sz)' --select price,imbalance,micro,bids,asks --resample 1s:last --record ~/graft/hl-btc-book.jsonl --merge 'deep = --stream https://api.hyperliquid.xyz/info --send "{\"type\":\"l2Book\",\"coin\":\"BTC\",\"nSigFigs\":3}" --every 1s --json --time-field time --series "bids = levels_0_0_sz + levels_0_1_sz + levels_0_2_sz + levels_0_3_sz" --series "asks = levels_1_0_sz + levels_1_1_sz + levels_1_2_sz + levels_1_3_sz" --series "imbalance = (bids - asks) / (bids + asks)" --select imbalance,bids,asks --record ~/graft/hl-btc-deep.jsonl' --merge 'binance = --stream wss://data-stream.binance.vision/ws/btcusdt@kline_1s --json --time-field k.t --replace --series "price = k_c" --series "vol = k_v" --series "buys = k_V" --series "trades = k_n" --select price' --history '-c "curl -s \"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1s&limit=1000&startTime={from_ms:1000s}&endTime={now_ms}\"" --json --time-field 0 --series "price:USD = c4" --series "binance.price = c4" --series "binance.vol = c5" --series "binance.buys = c9" --series "binance.trades = c8" --select price' --history-depth 24h --hide imbalance,micro,bids,asks,deep.imbalance,deep.bids,deep.asks,binance.price,binance.vol,binance.buys,binance.trades --discover 0.045 --marks-below --title 'BTC order-book lab'"#,
         ),
         ..BASE
     },

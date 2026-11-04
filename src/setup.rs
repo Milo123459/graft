@@ -97,6 +97,7 @@ pub fn source_spec(cli: &Cli, interactive: bool) -> Result<SourceSpec> {
         return Ok(SourceSpec::Stream {
             url: fill(url),
             send: cli.send.iter().map(fill).collect(),
+            every: cli.every,
         });
     }
     Ok(match (&cmd, &input) {

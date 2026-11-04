@@ -43,6 +43,26 @@ pub struct PaperTrade {
     pub y_out: Option<f64>,
 }
 
+/// How many of the price's newest points have every series that starts later than it
+/// (a live order book, say, with no history behind it), when that's a stretch worth
+/// searching on its own: at least 600 points, and not nearly all of them anyway.
+pub fn recent_window(ds: &Dataset, s: &Settings) -> Option<usize> {
+    let price = discover::price_series(ds, s.series.as_deref())?;
+    let first = price.points.first()?.0;
+    let total = price.points.len();
+    let span = price.points.last()?.0 - first;
+    // Series that start well after the price (a tenth of its span in).
+    let late = ds
+        .series
+        .iter()
+        .filter(|o| o.name != price.name && o.points.len() >= 2)
+        .filter_map(|o| o.points.first().map(|p| p.0))
+        .filter(|x| *x > first + span * 0.1)
+        .max_by(f64::total_cmp)?;
+    let n = total - price.points.partition_point(|p| p.0 < late);
+    (n >= 2 * discover::MIN_POINTS && n * 10 < total * 9).then_some(n)
+}
+
 /// Its paper trades over `input`, and its live record (the ones entered after
 /// `since`).
 fn paper(t: &mut Tracked, input: &Input, fees: &discover::Fees) {
@@ -139,6 +159,10 @@ pub struct Lab {
     pub pool_size: usize,
     /// Formulas tried in all, since it started.
     pub tried: usize,
+    /// The search running is on the newest stretch only (`recent_window`)…
+    searching_recent: bool,
+    /// …and the one reported was.
+    pub recent: bool,
     pub since: Instant,
 }
 
@@ -163,6 +187,8 @@ impl Lab {
             points: FIRST_POINTS,
             pool_size: FIRST_POOL,
             tried: 0,
+            searching_recent: false,
+            recent: false,
             since: Instant::now(),
         }
     }
@@ -185,10 +211,6 @@ impl Lab {
     /// Start a search when one is due, take in a finished one, and bring the paper
     /// trades up to date. Returns news to tell (a new live trade of the best strategy).
     pub fn tick(&mut self, ds: &Dataset) -> Option<String> {
-        let settings = Settings {
-            max_points: self.points.min(self.settings.max_points),
-            ..self.settings.clone()
-        };
         if let Some(rx) = &self.worker {
             match rx.try_recv() {
                 Ok(result) => {
@@ -202,6 +224,19 @@ impl Lab {
         let due = self.last_run.is_none_or(|t| t.elapsed() >= self.every);
         if self.worker.is_none() && due {
             self.last_run = Some(Instant::now());
+            // Every other search: only the newest stretch where series that start late
+            // (a live order book with no history) have data, so they get used too.
+            let recent = (self.runs % 2 == 1)
+                .then(|| recent_window(ds, &self.settings))
+                .flatten();
+            self.searching_recent = recent.is_some();
+            let settings = Settings {
+                max_points: self
+                    .points
+                    .min(self.settings.max_points)
+                    .min(recent.unwrap_or(usize::MAX)),
+                ..self.settings.clone()
+            };
             match Input::from_dataset(ds, &settings) {
                 Ok(input) if input.len() >= discover::MIN_POINTS => {
                     let (tx, rx) = std::sync::mpsc::channel();
@@ -251,6 +286,7 @@ impl Lab {
             }
         };
         self.waiting = None;
+        self.recent = self.searching_recent;
         self.pool = report.pool.iter().map(|s| s.expr.clone()).collect();
         // How many points the next search can take: formula evaluations go through the
         // points at this rate.
@@ -260,8 +296,12 @@ impl Lab {
             .max(discover::MIN_POINTS * 10);
         // Keep as many formulas as the next search can score again in a third of its
         // time: no fixed number, it grows with the machine.
-        let n = report.input.len().max(1) as f64;
-        self.pool_size = ((rate * SEARCH_TIME.as_secs_f64() / 3.0 / n) as usize).max(150);
+        // (From full searches: a short one on the newest stretch would make it too many
+        // for the next full one.)
+        if !self.recent {
+            let n = report.input.len().max(1) as f64;
+            self.pool_size = ((rate * SEARCH_TIME.as_secs_f64() / 3.0 / n) as usize).max(150);
+        }
         self.tried += report.formulas;
         let since = report.input.x.last().copied().unwrap_or(f64::NEG_INFINITY);
         let selected_key = self
@@ -605,6 +645,27 @@ mod tests {
                 points,
             }],
         }
+    }
+
+    #[test]
+    fn the_newest_stretch_is_where_late_series_have_data() {
+        // 10,000 seconds of price; a recorded book that starts later.
+        let with_book = |from: usize| {
+            let mut ds = prices(0, 10_000);
+            let book = (from..10_000).map(|x| (x as f64, 0.5)).collect();
+            ds.series.push(Series {
+                name: "imbalance".into(),
+                unit: Default::default(),
+                points: book,
+            });
+            ds
+        };
+        let s = Settings::default();
+        assert_eq!(recent_window(&with_book(8_000), &s), Some(2_000));
+        // Too little of it yet (under 600 points), or nearly everything anyway.
+        assert_eq!(recent_window(&with_book(9_700), &s), None);
+        assert_eq!(recent_window(&with_book(500), &s), None);
+        assert_eq!(recent_window(&prices(0, 10_000), &s), None);
     }
 
     #[test]

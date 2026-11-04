@@ -175,6 +175,7 @@ enum Cmd {
     Resample,
     HistoryDepth,
     History,
+    Record,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -612,7 +613,10 @@ pub struct App {
     /// and the oldest time when it started.
     backfill: Option<(Live, f64)>,
     /// `--history`: older data under the source's own.
-    older: Option<crate::history::History>,
+    older: Vec<crate::history::History>,
+    /// What `--record` saved on earlier runs, read back: it goes just before the live
+    /// data (and the `--history` before that).
+    recorded: Option<crate::history::History>,
     /// The source had nothing older to give.
     backfill_done: bool,
     /// The open popup's area (as last drawn), and which of its buttons the arrow
@@ -773,7 +777,8 @@ impl App {
             settings_menu: false,
             show_legend: true,
             backfill: None,
-            older: None,
+            older: Vec::new(),
+            recorded: None,
             backfill_done: false,
             popup_rect: std::cell::Cell::new(None),
             popup_focus: std::cell::Cell::new(0),
@@ -812,8 +817,11 @@ impl App {
             presets: Vec::new(),
         };
         app.start_merges();
-        if let Some(args) = app.cli.history.clone() {
-            app.set_history(Some(args));
+        if let Some(p) = app.cli.record.clone() {
+            app.replay(&p);
+        }
+        if !app.cli.history.is_empty() {
+            app.set_history(app.cli.history.clone());
         }
         app.hidden.extend(app.cli.hide.iter().cloned());
         for spec in app.cli.bind.clone() {
@@ -916,7 +924,7 @@ impl App {
     fn set_resample(&mut self, r: Option<crate::cli::Resample>) {
         self.cli.resample = r;
         self.session.set_resample(r);
-        if let Some(h) = &mut self.older {
+        for h in self.older.iter_mut().chain(&mut self.recorded) {
             h.set_resample(r);
         }
         self.rebuild(true);
@@ -934,25 +942,39 @@ impl App {
         );
     }
 
-    /// `--history` (`history("…")`): older data for the source, joined before it.
-    fn set_history(&mut self, args: Option<String>) {
-        self.cli.history = args.clone();
-        self.older = None;
-        let Some(args) = args else {
+    /// Read back what `--record` saved to `path` on earlier runs.
+    fn replay(&mut self, path: &std::path::Path) {
+        match crate::history::History::replay(&self.cli, path) {
+            Ok(r) => self.recorded = r,
+            Err(e) => self.say(format!("--record: reading it back: {e:#}"), true),
+        }
+    }
+
+    /// `--history` (`history("…")`, `history(["…", "…"])`): older data for the
+    /// source, joined before it under the same names — from each source in turn.
+    fn set_history(&mut self, args: Vec<String>) {
+        self.older.clear();
+        self.cli.history.clear();
+        if args.is_empty() {
             self.rebuild(true);
             return self.say("no history", false);
-        };
+        }
         let depth = self.cli.history_depth.as_secs_f64();
-        match crate::history::History::open(&args, &self.cli, depth) {
-            Ok(h) => {
-                self.older = Some(h);
-                self.say("history: loading…", false);
-            }
-            Err(e) => {
-                self.cli.history = None;
-                self.say(format!("{e:#}"), true)
+        let mut errors = Vec::new();
+        for a in args {
+            match crate::history::History::open(&a, &self.cli, depth) {
+                Ok(h) => {
+                    self.older.push(h);
+                    self.cli.history.push(a);
+                }
+                Err(e) => errors.push(format!("{e:#}")),
             }
         }
+        match errors.is_empty() {
+            true => self.say("history: loading…", false),
+            false => self.say(errors.join(" · "), true),
+        }
+        self.rebuild(true);
     }
 
     /// `--history-depth` (`history_depth("24h")`): deeper than it has, the rest loads
@@ -960,7 +982,12 @@ impl App {
     fn set_history_depth(&mut self, secs: f64) {
         self.cli.history_depth = Duration::from_secs_f64(secs);
         let what = crate::time::fmt_duration(secs);
-        let loading = self.older.as_mut().map(|h| h.set_depth(secs));
+        let mut loading = (!self.older.is_empty()).then_some(false);
+        for h in &mut self.older {
+            // Every one goes deeper (not only until one is loading).
+            let more = h.set_depth(secs);
+            loading = loading.map(|l| l || more);
+        }
         match loading {
             Some(true) => self.say(format!("history: loading back to {what}…"), false),
             Some(false) => self.say(format!("history: {what} back"), false),
@@ -1067,14 +1094,15 @@ impl App {
         if let Some(name) = &self.cli.as_name {
             crate::sources::rename(name, &mut self.full);
         }
-        for m in &self.merge_subs {
+        for m in &mut self.merge_subs {
             let mut merged = m.merged();
             if self.full.series.is_empty() {
                 self.full.x_kind = merged.x_kind;
             }
             self.full.series.append(&mut merged.series);
         }
-        if let Some(h) = &mut self.older {
+        // What it recorded goes just before the live data, then the history.
+        for h in self.recorded.iter_mut().chain(&mut self.older) {
             h.join(&mut self.full);
         }
         self.session.add_custom_lines(&mut self.full);
@@ -1258,11 +1286,17 @@ impl App {
             return;
         };
         // History first: a search now would only see its first page.
-        if let Some(h) = self.older.as_ref().filter(|h| h.filling()) {
+        if self.older.iter().any(|h| h.filling()) {
+            let pages: usize = self.older.iter().map(|h| h.pages).sum();
             lab.waiting = Some(format!(
-                "waiting for the history to load ({} pages so far)",
-                h.pages
+                "waiting for the history to load ({pages} pages so far)"
             ));
+            return;
+        }
+        if self.recorded.as_ref().is_some_and(|r| r.filling())
+            || self.merge_subs.iter().any(|m| m.replaying())
+        {
+            lab.waiting = Some("waiting for what it recorded to be read back".into());
             return;
         }
         let before = (lab.runs, lab.report.is_some(), lab.selected);
@@ -4095,10 +4129,26 @@ impl App {
                     .unwrap_or(STEPS[0]);
                 self.set_history_depth(next);
             }
+            Cmd::Record => {
+                if self.session.recording_to().is_some() {
+                    self.apply(crate::script::Action::Record(None));
+                } else {
+                    self.console = Some(TextInput::new("record(\"~/graft-recording.jsonl\")"));
+                }
+            }
             Cmd::History => {
                 // Its arguments in the console, to change (or history(false) to drop).
-                let args = self.cli.history.clone().unwrap_or_default();
-                let code = format!("history({args:?})");
+                let code = match self.cli.history.as_slice() {
+                    [] => "history(\"\")".to_string(),
+                    [one] => format!("history({one:?})"),
+                    many => format!(
+                        "history([{}])",
+                        many.iter()
+                            .map(|a| format!("{a:?}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                };
                 self.console = Some(TextInput::new(&code));
             }
             Cmd::MarksBelow => {
@@ -4411,6 +4461,13 @@ impl App {
             head.push((t, Style::default().fg(c).add_modifier(Modifier::BOLD)));
         }
         g.push((head, None));
+        // Recording what it reads (--record): a tap stops.
+        if self.session.recording_to().is_some() {
+            g.push((
+                vec![(" ● rec ".into(), Style::default().fg(Color::LightRed))],
+                Some(Hit::Cmd(Cmd::Record)),
+            ));
+        }
         // Paused: easy to miss as a dot, and the chart looks stuck — say so, and a tap
         // resumes (the data kept coming meanwhile).
         if self.paused {
@@ -4734,17 +4791,25 @@ impl App {
             .series
             .values()
             .filter_map(|s| s.points.first().map(|p| p.0))
-            .chain(self.older.as_ref().and_then(|h| h.oldest()))
+            .chain(
+                self.older
+                    .iter()
+                    .chain(&self.recorded)
+                    .filter_map(|h| h.oldest()),
+            )
             .min_by(f64::total_cmp)
     }
 
     /// Read `--history` pages; each one finished redraws the chart.
     fn tick_history(&mut self) {
-        let Some(h) = self.older.as_mut() else {
-            return;
-        };
-        let (finished, news) = h.tick();
-        if let Some((text, error)) = news {
+        let mut finished = false;
+        let mut said = None;
+        for h in self.recorded.iter_mut().chain(&mut self.older) {
+            let (f, news) = h.tick();
+            finished |= f;
+            said = news.or(said);
+        }
+        if let Some((text, error)) = said {
             self.say(text, error);
         }
         if finished {
@@ -4798,14 +4863,19 @@ impl App {
         }
         // --history fetches the older data, when it can — not while it's still
         // loading what it started with (that says how far it's got itself).
-        if let Some(h) = self.older.as_mut().filter(|h| h.pages_back()) {
-            if h.loading() {
+        if self.older.iter().any(|h| h.pages_back()) {
+            if self.older.iter().any(|h| h.loading()) {
                 return true;
             }
-            let more = h.more();
+            let mut more = false;
+            let mut done = true;
+            for h in self.older.iter_mut().filter(|h| h.pages_back()) {
+                more |= h.more();
+                done &= h.done;
+            }
             if more {
                 self.say("history: loading older data…", false);
-            } else if !h.done {
+            } else if !done {
                 self.say("no older data from the history source", false);
             }
             return more;
@@ -6430,6 +6500,30 @@ impl App {
                 Err(e) => self.say(format!("resample: {e} (e.g. \"5s\" or \"1m:mean\")"), true),
             },
             Action::History(args) => self.set_history(args),
+            Action::Record(path) => {
+                let path = path.map(std::path::PathBuf::from);
+                // A file it saved to before: what's in it goes in first (stopping
+                // keeps what was read).
+                if let Some(p) = &path {
+                    self.replay(p);
+                }
+                match self.session.set_record(path.as_deref()) {
+                    Ok(()) => {
+                        self.cli.record = path;
+                        match self.session.recording_to() {
+                            Some(p) => {
+                                let p = p.display().to_string();
+                                self.say(
+                                    format!("recording every line it reads to {p} — record(false) stops"),
+                                    false,
+                                )
+                            }
+                            None => self.say("not recording", false),
+                        }
+                    }
+                    Err(e) => self.say(format!("{e:#}"), true),
+                }
+            }
             Action::HistoryDepth(d) => match crate::time::parse_duration_secs(&d) {
                 Ok(s) if s > 0.0 => self.set_history_depth(s),
                 _ => self.say(format!("history_depth: '{d}' isn't a length of time, e.g. 24h"), true),
@@ -7664,7 +7758,8 @@ impl App {
                     Cmd::Resample,
                 )
                 .active(self.cli.resample.is_some()),
-                b("history…", Cmd::History).active(self.older.is_some()),
+                b("history…", Cmd::History).active(!self.older.is_empty()),
+                b("record…", Cmd::Record).active(self.session.recording_to().is_some()),
                 b(
                     &format!(
                         "history depth: {}",
@@ -8139,8 +8234,13 @@ impl App {
                 let invented = r.pool.iter().filter(|s| s.invented).count();
                 push(
                     format!(
-                        "search {} · {} pts of {} · {:.1}s · {} formulas ({:.0}/s, {} in all) · {} strategies · {invented}/{} kept invented · {} · {status}",
+                        "search {}{} · {} pts of {} · {:.1}s · {} formulas ({:.0}/s, {} in all) · {} strategies · {invented}/{} kept invented · {} · {status}",
                         lab.runs,
+                        if lab.recent {
+                            " (newest stretch: where every series has data)"
+                        } else {
+                            ""
+                        },
                         r.input.len(),
                         r.input.name,
                         r.took.as_secs_f64(),
@@ -10347,7 +10447,7 @@ pub(crate) mod tests {
         ]);
         let load = |app: &mut App| {
             let end = Instant::now() + Duration::from_secs(20);
-            while app.older.as_ref().is_some_and(|h| h.loading()) && Instant::now() < end {
+            while app.older.iter().any(|h| h.loading()) && Instant::now() < end {
                 app.tick();
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -10389,7 +10489,84 @@ pub(crate) mod tests {
         );
         key(&mut app, KeyCode::Esc);
         run(&mut app, "history(false)");
-        assert!(app.older.is_none() && app.current_cli().history.is_none());
+        assert!(app.older.is_empty() && app.current_cli().history.is_empty());
+    }
+
+    #[test]
+    fn a_recording_is_read_back_on_the_next_run() {
+        // What earlier runs saved (the main source's lines, and a merge's).
+        let dir = std::env::temp_dir().join(format!("graft-rec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (main, merge) = (dir.join("main.jsonl"), dir.join("book.jsonl"));
+        let now = crate::time::now_secs().floor();
+        let old = |v: f64| {
+            format!(
+                "{{\"t\":{},\"price\":{v},\"junk\":9}}\n{{\"t\":{},\"price\":{v}}}\n",
+                now - 600.0,
+                now - 300.0
+            )
+        };
+        std::fs::write(&main, old(1.0)).unwrap();
+        std::fs::write(&merge, old(5.0)).unwrap();
+        let merge_arg = format!(
+            r#"book = -c 'echo "{{\"t\":{{now}},\"price\":6}}"' --json --time-field t --count 1 --select price --record {}"#,
+            merge.display()
+        );
+        let mut app = app(&[
+            "graft",
+            "-c",
+            r#"echo "{\"t\":{now},\"price\":2}""#,
+            "--json",
+            "--time-field",
+            "t",
+            "--count",
+            "1",
+            "--select",
+            "price",
+            "--record",
+            main.to_str().unwrap(),
+            "--merge",
+            &merge_arg,
+        ]);
+        let end = Instant::now() + Duration::from_secs(20);
+        let have = |app: &App, name: &str| app.ds.get(name).map_or(0, |s| s.points.len());
+        while (have(&app, "price") < 3 || have(&app, "book") < 3) && Instant::now() < end {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The saved points go in before the one read now, in the source's own format
+        // (its --select: the raw "junk" stays out), the merge's under its name.
+        let price = &app.ds.get("price").unwrap().points;
+        assert_eq!(price.len(), 3, "{price:?}");
+        assert_eq!((price[0].0, price[0].1), (now - 600.0, 1.0));
+        assert_eq!(price[2].1, 2.0);
+        let book = &app.ds.get("book").unwrap().points;
+        assert_eq!(
+            book.iter().map(|p| p.1).collect::<Vec<_>>(),
+            [5.0, 5.0, 6.0]
+        );
+        assert!(app.ds.get("junk").is_none());
+        // And it goes on saving: the new line is in the file for next time.
+        let lines = |p: &std::path::Path| std::fs::read_to_string(p).unwrap().lines().count();
+        assert_eq!(lines(&main), 3);
+        assert_eq!(lines(&merge), 3);
+        assert!(app.current_cli().to_args().join(" ").contains("--record"));
+        // record(false) stops saving and keeps what was read.
+        run(&mut app, "record(false)");
+        assert!(app.session.recording_to().is_none());
+        assert_eq!(app.ds.get("price").unwrap().points.len(), 3);
+        // Several histories (a recording next to an API's), and the button shows them.
+        let h =
+            |v: u32| format!(r#"-c 'echo "{{\"t\":1000,\"price\":{v}}}"' --json --time-field t"#);
+        run(&mut app, &format!("history([{:?}, {:?}])", h(7), h(8)));
+        assert_eq!(app.older.len(), 2);
+        assert_eq!(app.current_cli().history.len(), 2);
+        app.run_cmd(Cmd::History);
+        let code = app.console.as_ref().unwrap().value.clone();
+        assert!(code.starts_with("history([\"-c "), "{code}");
+        key(&mut app, KeyCode::Esc);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -10410,7 +10587,7 @@ pub(crate) mod tests {
             "--discover",
             "upside:250",
         ]);
-        assert!(app.older.is_some());
+        assert!(!app.older.is_empty());
         app.tick_lab();
         assert!(
             app.lab
@@ -10423,7 +10600,7 @@ pub(crate) mod tests {
             app.lab.as_ref().unwrap().waiting
         );
         let end = Instant::now() + Duration::from_secs(20);
-        while app.older.as_ref().is_some_and(|h| h.loading()) && Instant::now() < end {
+        while app.older.iter().any(|h| h.loading()) && Instant::now() < end {
             app.tick();
             std::thread::sleep(Duration::from_millis(5));
         }

@@ -85,8 +85,9 @@ graft -p cpu                           # a preset: cpu, memory, load, network, d
 | File / stdin | `graft FILE`, `graft -`, or pipe into `graft` |
 | Follow a file | `-f, --follow` (handles truncation/rotation) |
 | Run a command repeatedly | `-c, --cmd 'COMMAND'`, `-n, --every 2s`, `--count N` |
-| A stream a server pushes | `--stream URL` (or `--ws`, `--sse`): a WebSocket (`wss://…`; `--send MSG` goes out once connected, e.g. a subscription) or a streaming HTTP response (`https://…`: server-sent events, each event's `data:` is a record, or plain lines; with `--send` it's a POST). Reconnects when dropped. With `--once`, `--count N` records |
-| Older data for a stream | `--history 'ARGS'`: another source with its own format (like `--source`), whose series go in before the source's own under the same names; with `{from_ms:…}` / `{now_ms}` in its command it pages back to `--history-depth 6h` (default 1h), four pages at once, saying how far it's got, and scrolling to the oldest data fetches more. In the viewer: `history_depth("24h")` (or **history depth** in **⋯**, which cycles) goes further back at once, `history("…")` / **history…** changes the source, `history(false)` drops it. History is resampled like the chart |
+| A stream a server pushes | `--stream URL` (or `--ws`, `--sse`): a WebSocket (`wss://…`; `--send MSG` goes out once connected, e.g. a subscription) or a streaming HTTP response (`https://…`: server-sent events, each event's `data:` is a record, or plain lines; with `--send` it's a POST). Reconnects when dropped. A URL whose reply ends (a REST snapshot) is asked again every `--every`: `--stream https://api.hyperliquid.xyz/info --send '{"type":"l2Book","coin":"BTC"}' --every 1s` polls Hyperliquid's order book each second. With `--once`, `--count N` records |
+| Record a source | `--record ~/graft/btc.jsonl`: saves every line it reads (appended), and the next run reads the file back first in the source's own format, so a stream with no history to download builds its own, run after run. In a `--merge`'s arguments it records that source. In the viewer `record("…")`, `record(false)`, or **record…** in **⋯**; **● rec** in the legend shows it's on (tap to stop) |
+| Older data for a stream | `--history 'ARGS'`: another source with its own format (like `--source`), whose series go in before the source's own under the same names; with `{from_ms:…}` / `{now_ms}` in its command it pages back to `--history-depth 6h` (default 1h), four pages at once, saying how far it's got, and scrolling to the oldest data fetches more. In the viewer: `history_depth("24h")` (or **history depth** in **⋯**, which cycles) goes further back at once, `history("…")` / **history…** changes the source, `history(false)` drops it. Give `--history` again for more sources (`history(["…", "…"])`), each filling in series the others don't have. History is resampled like the chart |
 | Keep only recent data | `-w, --window 6h` or `--window 500` (points); older data is dropped from memory |
 | Timeframe | `-L, --last 7d` (or `--last 500` points), `--since 2026-10-15`, `--until "2026-10-20 12:00"`: what's shown **and** analysed. The viewer can change it |
 
@@ -586,6 +587,34 @@ graft --stream 'https://feed-v3.veranta.xyz/v1/stream?price_feed_ids=1' --json -
   --discover upside:250 --marks-below
 ```
 
+**The order book.** Hyperliquid's book snapshot (the 20 best levels a side, as they
+are right now) is a REST call, so `--stream` polls it every `--every 1s`: each reply is
+the whole book, with no changes to apply to an earlier copy. From it: the mid price,
+the size on the 5 best levels each side, their **imbalance** (buyers' size against
+sellers', −1 to 1) and the **microprice** (the mid tilted toward the thinner side).
+A second snapshot with `nSigFigs: 3` groups the book into $100 levels, so 4 of them
+reach about half a percent each way: the **deep imbalance**, for moves over minutes.
+Binance adds the order flow, with 24 hours of history. There's no book history to
+download, so `--record` saves every snapshot (about 140 MB a day per file; a day reads
+back in a few seconds) and the next run reads them back first:
+the longer it runs, the more book there is to learn from (until a recording reaches
+back far enough, the price before it is Binance's). Searches take turns on all the data
+and on the newest stretch where the book series exist, once there are 10 minutes of
+them, so book signals get tried as soon as there's enough. Hyperliquid's taker fee is
+0.045% a side:
+
+```sh
+graft --stream https://api.hyperliquid.xyz/info --send '{"type":"l2Book","coin":"BTC"}' --every 1s --json --time-field time \
+  --series 'price:USD = (levels_0_0_px + levels_1_0_px) / 2' \
+  --series 'bids = levels_0_0_sz + levels_0_1_sz + levels_0_2_sz + levels_0_3_sz + levels_0_4_sz' --series 'asks = levels_1_0_sz + levels_1_1_sz + levels_1_2_sz + levels_1_3_sz + levels_1_4_sz' --series 'imbalance = (bids - asks) / (bids + asks)' \
+  --series 'micro:USD = (levels_1_0_px * levels_0_0_sz + levels_0_0_px * levels_1_0_sz) / (levels_0_0_sz + levels_1_0_sz)' \
+  --select price,imbalance,micro,bids,asks --resample 1s:last --record ~/graft/hl-btc-book.jsonl \
+  --merge 'deep = --stream https://api.hyperliquid.xyz/info --send "{\"type\":\"l2Book\",\"coin\":\"BTC\",\"nSigFigs\":3}" --every 1s --json --time-field time --series "bids = levels_0_0_sz + levels_0_1_sz + levels_0_2_sz + levels_0_3_sz" --series "asks = levels_1_0_sz + levels_1_1_sz + levels_1_2_sz + levels_1_3_sz" --series "imbalance = (bids - asks) / (bids + asks)" --select imbalance,bids,asks --record ~/graft/hl-btc-deep.jsonl' \
+  --merge 'binance = --stream wss://data-stream.binance.vision/ws/btcusdt@kline_1s --json --time-field k.t --replace --series "price = k_c" --series "vol = k_v" --series "buys = k_V" --series "trades = k_n" --select price' \
+  --history '-c "curl -s \"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1s&limit=1000&startTime={from_ms:1000s}&endTime={now_ms}\"" --json --time-field 0 --series "price:USD = c4" --series "binance.price = c4" --series "binance.vol = c5" --series "binance.buys = c9" --series "binance.trades = c8" --select price' \
+  --history-depth 24h --hide imbalance,micro,bids,asks,deep.imbalance,deep.bids,deep.asks,binance.price,binance.vol,binance.buys,binance.trades --discover 0.045 --marks-below --title 'BTC order-book lab'
+```
+
 **It never stops inventing.** Searches run one after another (3 s each) on every core
 but one, scoring new formulas in parallel — hundreds of thousands a minute on a laptop;
 the panel counts them (formulas a second, and in all). How many it keeps for the next
@@ -615,7 +644,7 @@ time. `{sum}` in `--stats-template` gives the total.
 | | |
 |---|---|
 | `-s, --select 'Mem*,Cached'` / `-e, --exclude lo` | choose series (globs allowed) |
-| `--series 'used = MemTotal - MemAvailable'` | derived series (Rhai expression, unit literals allowed); `--series 'busy:% = …'` sets its unit. Computed after `--rate`/`--delta`, so ratios of rates work |
+| `--series 'used = MemTotal - MemAvailable'` | derived series (Rhai expression, unit literals allowed); `--series 'busy:% = …'` sets its unit. Computed after `--rate`/`--delta`, so ratios of rates work, and in order, so each can use the ones before it (`--series 'bids = b0 + b1' --series 'asks = a0 + a1' --series 'imbalance = (bids - asks) / (bids + asks)'`) |
 | `--rate` | counter → per-second rate |
 | `--delta` | change between points |
 | `--resample 1h:max` | bucket (mean, min, max, sum, last, count); in the viewer `resample("5s")`, `resample(false)`, or **resample** in **⋯** (cycles 1s, 5s, 15s, 1m, 5m, off) — applied at once, since the raw points are kept |

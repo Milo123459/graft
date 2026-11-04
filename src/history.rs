@@ -56,6 +56,10 @@ pub struct History {
     cache: Option<(u64, Dataset)>,
     /// Its own --resample (else it follows the chart's).
     own_resample: bool,
+    /// What it says it is in messages ("history", or "recording" for a replay).
+    what: &'static str,
+    /// Only the series its source shows (a replay: the raw fields stay out).
+    select: bool,
 }
 
 impl History {
@@ -125,9 +129,59 @@ impl History {
             filling: true,
             done: false,
             cache: None,
+            what: "history",
+            select: false,
         };
         h.fill();
         Ok(h)
+    }
+
+    /// What a source saved with `--record FILE` on earlier runs, read back in its own
+    /// format (`cli`, the source's settings) to go before what it reads now. `None`
+    /// when nothing's been saved there yet.
+    pub fn replay(cli: &Cli, path: &std::path::Path) -> Result<Option<History>> {
+        let path = crate::cli::expand_home(path);
+        if std::fs::metadata(&path).map_or(true, |m| m.len() == 0) {
+            return Ok(None);
+        }
+        let mut cli = cli.clone();
+        cli.record = None;
+        cli.cmd = None;
+        cli.stream = None;
+        cli.send.clear();
+        cli.ssh = None;
+        cli.count = None;
+        cli.history.clear();
+        cli.merge.clear();
+        cli.input = Some(path.clone());
+        let spec = SourceSpec::File {
+            path,
+            follow: false,
+        };
+        let setup = crate::setup::build(cli, spec.clone(), true)?;
+        let now = crate::time::now_secs();
+        Ok(Some(History {
+            // Spaced like its source: the chart's for the main source (changed with
+            // it), a merge's own for a merge's.
+            own_resample: false,
+            session: setup.session,
+            cmd: None,
+            span: None,
+            loading: vec![Page {
+                live: Live::new(spec),
+                end: now,
+                got: 0,
+            }],
+            next_end: None,
+            pages: 0,
+            depth: 0.0,
+            started: now,
+            filling: true,
+            done: true,
+            cache: None,
+            what: "recording",
+            select: true,
+        }))
     }
 
     /// The chart's points changed spacing: its own follow (unless it set its own).
@@ -151,6 +205,11 @@ impl History {
         }
         self.fill();
         self.loading()
+    }
+
+    /// Changes when it reads more.
+    pub fn revision(&self) -> u64 {
+        self.session.store.revision
     }
 
     /// Whether its command asks for a window (so it can page back).
@@ -247,15 +306,16 @@ impl History {
         let session = &mut self.session;
         let mut finished = Vec::new();
         let mut error = None;
+        // A replay is one local file (a day of a book is 86,400 lines): a bigger share
+        // of each frame than a page coming over the network.
+        let budget = std::time::Duration::from_millis(if self.cmd.is_some() { 10 } else { 25 });
         for (k, page) in self.loading.iter_mut().enumerate() {
             let got = &mut page.got;
-            let errors = page
-                .live
-                .pump(std::time::Duration::from_millis(10), &mut |line, meta| {
-                    if session.feed(line, meta).is_ok() {
-                        *got += 1;
-                    }
-                });
+            let errors = page.live.pump(budget, &mut |line, meta| {
+                if session.feed(line, meta).is_ok() {
+                    *got += 1;
+                }
+            });
             if let Some(e) = errors.into_iter().last() {
                 error = Some(e);
                 finished.push(k);
@@ -276,7 +336,7 @@ impl History {
         if let Some(e) = error {
             self.loading.clear();
             self.filling = false;
-            return (true, Some((format!("history: {e}"), true)));
+            return (true, Some((format!("{}: {e}", self.what), true)));
         }
         if self.session.lines > 0 && self.session.matched == 0 {
             self.loading.clear();
@@ -285,8 +345,8 @@ impl History {
                 true,
                 Some((
                     format!(
-                        "history: {} lines read, none matched its format",
-                        self.session.lines
+                        "{}: {} lines read, none matched its format",
+                        self.what, self.session.lines
                     ),
                     true,
                 )),
@@ -316,17 +376,19 @@ impl History {
             }
             self.filling = false;
             let all = if self.done { ", all it has" } else { "" };
-            return (
-                true,
-                Some((
-                    format!(
-                        "history: {} loaded ({} page{page_s}{all})",
-                        crate::time::fmt_duration(covered),
-                        self.pages,
-                    ),
-                    false,
-                )),
-            );
+            let text = match self.cmd {
+                Some(_) => format!(
+                    "history: {} loaded ({} page{page_s}{all})",
+                    crate::time::fmt_duration(covered),
+                    self.pages,
+                ),
+                None => format!(
+                    "{}: {} loaded",
+                    self.what,
+                    crate::time::fmt_duration(covered)
+                ),
+            };
+            return (true, Some((text, false)));
         }
         if self.loading() {
             return (true, None);
@@ -374,7 +436,12 @@ impl History {
     pub fn join(&mut self, full: &mut Dataset) {
         let rev = self.session.store.revision;
         if self.cache.as_ref().is_none_or(|c| c.0 != rev) {
-            self.cache = Some((rev, self.session.base_dataset()));
+            let ds = self.session.base_dataset();
+            let ds = match self.select {
+                true => self.session.select(&ds),
+                false => ds,
+            };
+            self.cache = Some((rev, ds));
         }
         let Some((_, ds)) = &self.cache else { return };
         for h in &ds.series {

@@ -105,14 +105,16 @@ pub struct Cli {
     /// …&startTime={from_ms:1000s}&endTime={now_ms}" --json --time-field 0 --series
     /// "price = c4"'`. Its series go in under the same names, before the source's first
     /// point. With a window in its command it pages back to --history-depth, and
-    /// scrolling to the oldest data fetches the window before it.
+    /// scrolling to the oldest data fetches the window before it. Give it again for
+    /// more (a recorded file for series the first doesn't have).
     #[arg(
         long,
         value_name = "ARGS",
         allow_hyphen_values = true,
+        action = ArgAction::Append,
         help_heading = "Input"
     )]
-    pub history: Option<String>,
+    pub history: Vec<String>,
 
     /// How far back --history goes at the start.
     #[arg(long, value_name = "DURATION", default_value = "1h", value_parser = parse_duration, help_heading = "Input")]
@@ -134,7 +136,8 @@ pub struct Cli {
     #[arg(long, value_name = "HOST", value_parser = parse_host, help_heading = "Input")]
     pub ssh: Option<String>,
 
-    /// Interval between --cmd runs.
+    /// Interval between --cmd runs, and between fetches of a --stream URL whose reply
+    /// ends (a REST snapshot: `--stream https://… --send '{…}' --every 1s` polls it).
     #[arg(short = 'n', long, value_name = "DURATION", default_value = "1s", value_parser = parse_duration, help_heading = "Input")]
     pub every: Duration,
 
@@ -142,6 +145,12 @@ pub struct Cli {
     /// default: 1).
     #[arg(long, value_name = "N", help_heading = "Input")]
     pub count: Option<u64>,
+
+    /// Save every line the source reads to FILE (appended, as it comes): a stream's
+    /// messages become history for next time (`--history 'FILE --json …'`). In a
+    /// `--merge`, its own lines.
+    #[arg(long, value_name = "FILE", help_heading = "Input")]
+    pub record: Option<PathBuf>,
 
     /// Keep reading the file as it grows (like `tail -f`).
     #[arg(short = 'f', long, help_heading = "Input")]
@@ -665,7 +674,13 @@ impl Cli {
         };
         opt("--cmd", self.cmd.clone());
         opt("--stream", self.stream.clone());
-        opt("--history", self.history.clone());
+        opt(
+            "--record",
+            self.record.as_ref().map(|p| p.display().to_string()),
+        );
+        for h in &self.history {
+            opt("--history", Some(h.clone()));
+        }
         opt(
             "--history-depth",
             (self.history_depth != d.history_depth)
@@ -1273,6 +1288,15 @@ pub enum Agg {
 pub struct Resample {
     pub width: f64,
     pub agg: Agg,
+}
+
+/// `~/x` → the home directory's `x` (a path typed in the console isn't expanded by a
+/// shell).
+pub fn expand_home(p: &std::path::Path) -> PathBuf {
+    match (p.strip_prefix("~"), std::env::var_os("HOME")) {
+        (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => p.to_path_buf(),
+    }
 }
 
 pub fn parse_resample(s: &str) -> Result<Resample, String> {

@@ -47,9 +47,10 @@ The user (milo123459, repo `milo123459/graft`, branch `master`):
 | `src/main.rs` | entry; `run_once` (`--once`, non-interactive output) |
 | `src/cli.rs` | clap `Cli`, `ChartKind` (Line, Scatter, Bar, Histogram, Sparkline, Stat, Candles; `next()` cycles), `to_args` (writes a Cli back as flags), `with_params()` (fills `{name}` source settings into series, units, lines, markers, alerts…) |
 | `src/setup.rs` | `source_spec` (fills params and time placeholders into the command and path), `build` (makes the Session and ChartOpts from `cli.with_params()`; `Setup.cli` keeps the raw `{name}` form) |
-| `src/session.rs`, `data.rs`, `parse.rs`, `transform.rs` | Store, parsers (a JSON array is one record per object), pipeline, `--series` derived series (`derive`: a plain name is copied directly; otherwise only the series it mentions are lined up) |
+| `src/session.rs`, `data.rs`, `parse.rs`, `transform.rs` | Store, parsers (a JSON array is one record per object), pipeline, `--series` derived series (`derive`: a plain name is copied directly; otherwise only the series it mentions are lined up; computed in order, each seeing the ones before it); `Session::set_record` (`--record`: every line fed is appended to a file) |
 | `src/source.rs`, `interactive.rs` | running commands (stdin null, stderr piped), `Live` (thread + channel, `pump` doesn't block) |
 | `src/sources.rs` | sub-sources for panes/merges, named `--source` definitions |
+| `src/history.rs` | `--history` (repeatable): another source's older data, paged back 4 pages at once, joined before the live series by name; `History::replay` reads a `--record` file back in the source's own format (the viewer's `recorded`, and each merge's `Sub`) |
 | `src/params.rs` | `--param 'interval = 1m \| *5m'`, `fill`, `fill_times` (`{now}`, `{now_ms}`, `{from:6h}`, `{from_ms:500*{interval}}`), `has_window` |
 | `src/script.rs` | Rhai host: console API (USAGE, GROUPS, `register_api`), completion (`complete_with(text, cursor, series, params, rules)`), `explain_error`, built-in indicators |
 | `src/lines.rs` | `--line` custom lines; indicator maths: `ema sma rsi macd bollinger vwap atr stoch highest lowest` |
@@ -59,10 +60,10 @@ The user (milo123459, repo `milo123459/graft`, branch `master`):
 | `src/render/panes.rs` | `Pane` spec: series, `kind=`, `lines=`, `front=`, `source=`, `title=` (takes the rest) |
 | `src/tui.rs` (10k lines) | `App`, the viewer: toolbar, legend row, popups, console, settings menu, markers menu, backfill, params, backtest/strategies/sweep commands. Tests are at the bottom (`pub(crate) mod tests`: `app()`, `screen`, `screen_sized`, `run`, `key`, `mouse`, `find`, `type_str`) |
 | `src/builder.rs` | the format builder (F); sources: file, command, stream, stdin |
-| `src/stream.rs` | `--stream URL` (`--ws`/`--sse`): WebSockets (tungstenite + rustls/ring, webpki roots) and streaming HTTP (ureq): server-sent events (`data:` = one record) or lines; `--send` messages; reconnect with backoff |
+| `src/stream.rs` | `--stream URL` (`--ws`/`--sse`): WebSockets (tungstenite + rustls/ring, webpki roots) and streaming HTTP (ureq): server-sent events (`data:` = one record) or lines; `--send` messages; reconnect with backoff; a reply that ends normally (a REST snapshot) is fetched again every `--every`, no backoff |
 | `src/formula.rs` | the formula language (`z(pct(price, 5), 50)`): parse/print, eval over lined-up columns (NaN-aware, causal), random/mutate/cross for evolution, `classics()` seeds |
 | `src/discover.rs` | the discovery engine: `Input` (price, bid/ask by name, other series), `Layout` (from the data: learn on the first half, walk forward over up to 5 stretches with thresholds re-fitted by rank (`Ranks`), horizons from where σ_h ≥ 4× round-trip cost, tails per horizon), evolve formulas (typed by `Expr::kind`, templates + compositions of fit ones, fitness = best |t| after 10% tails on the learning half − 0.04/part), theories (bar = √(2 ln tests)), strategies (exits sized from σ, costs: fee + ask/bid), dedupe by overlapping entries |
-| `src/lab.rs` | the viewer's lab: background searches every 20 s (3 s budget, pool carried over), paper-trading tracked strategies from when found, markers |
+| `src/lab.rs` | the viewer's lab: nonstop background searches (3 s budget, pool carried over, alternating with the newest stretch where late-starting series such as a recorded book exist), paper-trading tracked strategies from when found, markers |
 | `src/tutorial.rs` | tutorial steps (keys, examples, checks) |
 
 ## Features added in this session (newest last)

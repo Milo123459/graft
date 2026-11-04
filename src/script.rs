@@ -80,9 +80,11 @@ pub enum Action {
     Discover(crate::discover::Fees, Option<String>),
     /// `resample("5s")` (`None`: off).
     Resample(Option<String>),
-    /// `history("-c …")` (`None`: none), `history_depth("24h")`.
-    History(Option<String>),
+    /// `history("-c …")`, `history(["…", "…"])` (several), `history(false)`: none.
+    History(Vec<String>),
     HistoryDepth(String),
+    /// `record("file")` (`None`: stop).
+    Record(Option<String>),
     Undiscover,
     /// Keep discovered strategy n (`None`: the one on the chart) as lines and a rule.
     DiscoverKeep(Option<usize>),
@@ -776,13 +778,18 @@ pub const USAGE: &[(&str, &str, &str)] = &[
     ),
     (
         "history",
-        r#"history("-c \"curl -s …{from_ms:1000s}…{now_ms}\" --json …")  ·  history(false)"#,
-        "older data for a stream, from another source (as --history): joined before the live data",
+        r#"history("-c \"curl -s …{from_ms:1000s}…{now_ms}\" --json …")  ·  history(["…", "…"])  ·  history(false)"#,
+        "older data for a stream, from another source (as --history), or several (a recorded file too): joined before the live data under the same names",
     ),
     (
         "history_depth",
         r#"history_depth("24h")"#,
         "how far back history goes: deeper than it has, it loads the rest now",
+    ),
+    (
+        "record",
+        r#"record("~/btc-book.jsonl")  ·  record(false)"#,
+        "save every line the source reads to a file from now on (as --record): history for next time",
     ),
     (
         "marks_below",
@@ -1089,6 +1096,7 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "resample",
             "history",
             "history_depth",
+            "record",
         ],
     ),
     (
@@ -2591,13 +2599,34 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
     });
     let st = state.clone();
     engine.register_fn("history", move |r: Dynamic| -> FnResult<()> {
-        let args = match r.clone().into_immutable_string() {
+        let args = if let Ok(s) = r.clone().into_immutable_string() {
+            if s.trim().is_empty() || s == "off" {
+                Vec::new()
+            } else {
+                vec![s.to_string()]
+            }
+        } else if r.as_bool().is_ok_and(|b| !b) {
+            Vec::new()
+        } else if let Some(a) = r.clone().try_cast::<Array>() {
+            a.into_iter()
+                .map(|d| d.into_immutable_string().map(|s| s.to_string()))
+                .collect::<Result<_, _>>()
+                .map_err(|_| "history([…]) takes the sources' arguments, as strings")?
+        } else {
+            return Err("history needs a source's arguments, a list of them, or false".into());
+        };
+        push(&st, Action::History(args));
+        Ok(())
+    });
+    let st = state.clone();
+    engine.register_fn("record", move |r: Dynamic| -> FnResult<()> {
+        let path = match r.clone().into_immutable_string() {
             Ok(s) if !s.trim().is_empty() && s != "off" => Some(s.to_string()),
             Ok(_) => None,
             Err(_) if r.as_bool().is_ok_and(|b| !b) => None,
-            Err(_) => return Err("history needs a source's arguments, or false".into()),
+            Err(_) => return Err("record needs a file, e.g. \"~/book.jsonl\", or false".into()),
         };
-        push(&st, Action::History(args));
+        push(&st, Action::Record(path));
         Ok(())
     });
     let st = state.clone();

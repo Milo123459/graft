@@ -246,6 +246,8 @@ pub struct Sub {
     live: Live,
     built_rev: u64,
     pub view: SourceView,
+    /// What its `--record` file saved on earlier runs, read back to go first.
+    recorded: Option<crate::history::History>,
 }
 
 impl Sub {
@@ -272,11 +274,19 @@ impl Sub {
     }
 
     /// Everything it has read, named after it (for merging into another chart).
-    pub fn merged(&self) -> Dataset {
+    pub fn merged(&mut self) -> Dataset {
         // Its own --select / --exclude apply (its raw fields stay out of the chart).
         let mut ds = self.session.select(&self.session.full_dataset());
+        if let Some(r) = &mut self.recorded {
+            r.join(&mut ds);
+        }
         rename(&self.name, &mut ds);
         ds
+    }
+
+    /// Still reading back what it recorded before.
+    pub fn replaying(&self) -> bool {
+        self.recorded.as_ref().is_some_and(|r| r.filling())
     }
 
     /// What's wrong, if anything: an error from its command, or lines that don't fit
@@ -294,7 +304,8 @@ impl Sub {
     }
 
     pub fn revision(&self) -> u64 {
-        self.session.store.revision
+        let replayed = self.recorded.as_ref().map_or(0, |r| r.revision());
+        self.session.store.revision.wrapping_add(replayed)
     }
 
     /// Still sending data (a command that keeps running, a followed file).
@@ -308,8 +319,14 @@ impl Sub {
 
     fn start(name: &str, cli: Cli, interactive: bool) -> Result<Self> {
         let spec = crate::setup::source_spec(&cli, interactive)?;
+        // Before it starts saving there again (it appends).
+        let recorded = match &cli.record {
+            Some(p) => crate::history::History::replay(&cli, p)?,
+            None => None,
+        };
         let setup = crate::setup::build(cli, spec.clone(), true)?;
         Ok(Self {
+            recorded,
             name: name.to_string(),
             session: setup.session,
             live: Live::new(spec),
@@ -338,6 +355,7 @@ impl Sub {
             session,
             live: Live::closed(),
             built_rev: 0,
+            recorded: None,
             view: SourceView {
                 name: name.to_string(),
                 ds: Dataset::default(),
@@ -356,15 +374,23 @@ impl Sub {
         if let Some(e) = errors.into_iter().last() {
             self.view.error = Some(e);
         }
-        self.session.store.revision != self.built_rev
+        if let Some(r) = &mut self.recorded
+            && let (_, Some((text, true))) = r.tick()
+        {
+            self.view.error = Some(text);
+        }
+        self.revision() != self.built_rev
     }
 
     /// Rebuild the dataset, cut to the shared timeframe.
     pub fn rebuild(&mut self, timeframe: &Timeframe) {
         let mut full = self.session.full_dataset();
+        if let Some(r) = &mut self.recorded {
+            r.join(&mut full);
+        }
         timeframe.apply(&mut full);
         self.view.ds = self.session.select(&full);
-        self.built_rev = self.session.store.revision;
+        self.built_rev = self.revision();
         if !self.view.ds.is_empty() {
             self.view.error = None;
         }
@@ -373,7 +399,7 @@ impl Sub {
     /// Read until the source ends (for `--once`).
     pub fn load_to_end(&mut self, timeframe: &Timeframe) {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while !self.live.eof && std::time::Instant::now() < deadline {
+        while (!self.live.eof || self.replaying()) && std::time::Instant::now() < deadline {
             self.pump(Duration::from_millis(50));
         }
         self.rebuild(timeframe);

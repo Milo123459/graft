@@ -514,6 +514,7 @@ impl Builder {
                 let spec = crate::source::SourceSpec::Stream {
                     url: fill(&url),
                     send: self.cli.send.iter().map(|m| fill(m)).collect(),
+                    every: self.cli.every,
                 };
                 let (tx, rx) = mpsc::channel();
                 let (more_tx, more_rx) = mpsc::channel();
@@ -2448,6 +2449,7 @@ mod tests {
         let lines = crate::sample_stream(crate::source::SourceSpec::Stream {
             url,
             send: Vec::new(),
+            every: Duration::from_secs(1),
         });
         assert!(
             start.elapsed() < Duration::from_secs(3),

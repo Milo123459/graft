@@ -17,7 +17,7 @@ use crate::time::now_secs;
 
 /// Connect, read until the connection ends, and connect again, until the viewer stops
 /// listening.
-pub fn run(url: &str, send: &[String], tx: &Sender<Event>) -> Result<(), String> {
+pub fn run(url: &str, send: &[String], every: Duration, tx: &Sender<Event>) -> Result<(), String> {
     let mut wait = Duration::from_secs(1);
     loop {
         let started = Instant::now();
@@ -28,7 +28,19 @@ pub fn run(url: &str, send: &[String], tx: &Sender<Event>) -> Result<(), String>
         };
         match result {
             Ok(Flow::Stopped) => return Ok(()),
-            Ok(Flow::Ended) => {}
+            // It said all it had (a REST snapshot, say): ask again `every` so often,
+            // counted from when this one was asked for — polling, not a fault.
+            Ok(Flow::Ended) => {
+                wait = Duration::from_secs(1);
+                let until = started + every;
+                while Instant::now() < until {
+                    thread::sleep((until - Instant::now()).min(Duration::from_millis(200)));
+                    if tx.send(Event::SampleDone).is_err() {
+                        return Ok(());
+                    }
+                }
+                continue;
+            }
             Err(e) => {
                 if tx
                     .send(Event::Error(format!(
@@ -442,6 +454,66 @@ mod tests {
             })
             .collect();
         assert_eq!(lines, ["{\"p\":1}", "{\"p\":2}"]);
+    }
+
+    #[test]
+    fn a_snapshot_url_is_polled_every_so_often() {
+        // A REST endpoint: each POST gets the book as it is now, then the reply ends.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = bodies.clone();
+        thread::spawn(move || {
+            for (n, s) in listener.incoming().enumerate() {
+                let Ok(mut s) = s else { break };
+                let mut buf = [0u8; 2048];
+                let got = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..got]).to_string();
+                seen.lock().unwrap().push(req);
+                let body = format!("{{\"n\":{n}}}\n");
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let (tx, rx) = mpsc::channel();
+        let url = format!("http://{addr}/info");
+        thread::spawn(move || {
+            run(
+                &url,
+                &["{\"type\":\"l2Book\"}".into()],
+                Duration::from_millis(100),
+                &tx,
+            )
+        });
+        let start = Instant::now();
+        let mut lines = Vec::new();
+        while lines.len() < 4 && start.elapsed() < Duration::from_secs(5) {
+            if let Ok(Event::Line(l, _)) = rx.recv_timeout(Duration::from_secs(1)) {
+                lines.push(l);
+            }
+        }
+        // Asked again and again, a tenth of a second apart (not backing off as if
+        // it had failed: that would take 1 + 2 + 4 s).
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        let n: Vec<u64> = lines
+            .iter()
+            .map(|l| {
+                l.trim_start_matches("{\"n\":")
+                    .trim_end_matches('}')
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        assert!(n.windows(2).all(|w| w[1] == w[0] + 1), "{n:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(bodies.lock().unwrap().iter().all(|r| r.starts_with("POST")));
     }
 
     #[test]

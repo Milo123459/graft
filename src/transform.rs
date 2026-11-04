@@ -116,7 +116,8 @@ impl Pipeline {
     }
 
     /// Add derived series and apply transforms to every series.
-    /// Rate/delta, then derived series (so `busy = user / total` works on rates),
+    /// Rate/delta, then derived series (so `busy = user / total` works on rates, and
+    /// a derived series can use the ones before it),
     /// then resampling and smoothing.
     pub fn apply(&self, mut ds: Dataset, script: &ScriptHost) -> Dataset {
         let time = ds.x_kind == XKind::Time;
@@ -128,14 +129,13 @@ impl Pipeline {
                 delta(s);
             }
         }
-        let derived: Vec<Series> = self
-            .derived
-            .iter()
-            .map(|d| derive(&ds, d, script))
-            .collect();
-        ds.series
-            .retain(|s| !self.derived.iter().any(|d| d.name == s.name));
-        ds.series.extend(derived);
+        // In order, each one seeing those before it (`imbalance = (bids - asks) /
+        // (bids + asks)` after bids and asks); one named like a field replaces it.
+        for d in &self.derived {
+            let s = derive(&ds, d, script);
+            ds.series.retain(|s| s.name != d.name);
+            ds.series.push(s);
+        }
         for s in &mut ds.series {
             if let Some(r) = self.resample {
                 resample(s, r);
@@ -559,6 +559,30 @@ mod tests {
         assert!(
             Glob::new("a.b").unwrap().matches("a.b") && !Glob::new("a.b").unwrap().matches("axb")
         );
+    }
+
+    #[test]
+    fn a_derived_series_can_use_the_ones_before_it() {
+        let cli = <crate::cli::Cli as clap::Parser>::parse_from([
+            "graft",
+            "--json",
+            "--series",
+            "bids = b0 + b1",
+            "--series",
+            "asks = a0 + a1",
+            "--series",
+            "imbalance = (bids - asks) / (bids + asks)",
+        ]);
+        let script = std::rc::Rc::new(crate::script::ScriptHost::new(None, false).unwrap());
+        let mut session = crate::session::Session::new(&cli, script).unwrap();
+        let meta = crate::data::LineMeta {
+            arrival: 0.0,
+            sample: None,
+        };
+        let _ = session.feed(r#"{"b0":3,"b1":3,"a0":1,"a1":1}"#, &meta);
+        let ds = session.base_dataset();
+        let y = |n: &str| ds.get(n).unwrap().points[0].1;
+        assert_eq!((y("bids"), y("asks"), y("imbalance")), (6.0, 2.0, 0.5));
     }
 
     #[test]
