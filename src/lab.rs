@@ -49,15 +49,17 @@ pub struct PaperTrade {
 }
 
 impl PaperTrade {
-    /// What its entry says on the chart: "open" while it's still in it, "live" when it
-    /// was entered after the strategy was found (paper-traded, not replayed from the
-    /// data it was found on), else nothing.
+    /// What its entry says on the chart: "open" while it's still in it, else nothing
+    /// (one strategy is only ever in one trade, so only one entry can say it).
     pub fn label(&self) -> &'static str {
-        match (self.exit, self.live) {
-            (None, _) => "open",
-            (Some(_), true) => "live",
-            (Some(_), false) => "",
-        }
+        if self.exit.is_none() { "open" } else { "" }
+    }
+
+    /// What its exit says: the result, and "paper" when it was entered after the
+    /// strategy was found (paper-traded, not replayed from the data it was found on).
+    pub fn exit_label(&self) -> String {
+        let paper = if self.live { " paper" } else { "" };
+        format!("{:+.1}bp{paper}", self.net)
     }
 }
 
@@ -156,6 +158,9 @@ pub struct Tracked {
     pub newest: Option<Perf>,
     /// How many repairs it's been through (a fix of a fix of …).
     pub repairs: usize,
+    /// Which one it is, for good (from 1): repairs share their rules' `key`, and the
+    /// list is re-ranked, so the selection follows this.
+    pub id: usize,
 }
 
 impl Tracked {
@@ -198,6 +203,8 @@ pub struct Lab {
     pub tracked: Vec<Tracked>,
     /// The strategy whose trades are on the chart (index into `tracked`).
     pub selected: usize,
+    /// The id the next strategy tracked gets.
+    next_id: usize,
     /// The formulas to start the next search from.
     pool: Vec<Expr>,
     /// When the live results were last brought up to date, and for which data.
@@ -235,6 +242,7 @@ impl Lab {
             waiting: None,
             tracked: Vec::new(),
             selected: 0,
+            next_id: 1,
             pool: Vec::new(),
             refreshed: None,
             failed: Vec::new(),
@@ -361,10 +369,7 @@ impl Lab {
         }
         self.tried += report.formulas;
         let since = report.input.x.last().copied().unwrap_or(f64::NEG_INFINITY);
-        let selected_key = self
-            .tracked
-            .get(self.selected)
-            .map(|t| t.found.strategy.key());
+        let selected_id = self.selected_id();
         let new = |found: Found, note: Option<String>, run: usize| Tracked {
             found,
             since,
@@ -376,6 +381,7 @@ impl Lab {
             note,
             newest: None,
             repairs: 0,
+            id: 0,
         };
         // What the review made of each one, and fixes to try.
         for r in &report.reviews {
@@ -404,7 +410,7 @@ impl Lab {
                 let repairs = self.tracked[k].repairs + 1;
                 let mut t = new(fix.clone(), Some(note), self.runs);
                 t.repairs = repairs;
-                self.tracked.push(t);
+                self.track(t);
             }
         }
         for f in report.strategies.iter().take(4) {
@@ -427,12 +433,12 @@ impl Lab {
             if f.checked.n < 5 || f.checked.mean <= 0.0 || f.edge.mean <= 0.0 {
                 continue;
             }
-            self.tracked.push(new(f.clone(), None, self.runs));
+            self.track(new(f.clone(), None, self.runs));
         }
         self.report = Some(report);
         self.refreshed = None;
         self.refresh(ds);
-        self.rank(selected_key.clone());
+        self.rank(selected_id);
         // The same trades as a better one: only the better one stays.
         let mut k = 1;
         while k < self.tracked.len() {
@@ -450,7 +456,7 @@ impl Lab {
                 k += 1;
             }
         }
-        self.rank(selected_key);
+        self.rank(selected_id);
         self.trim();
     }
 
@@ -476,27 +482,37 @@ impl Lab {
         }
     }
 
+    /// Start tracking a strategy, with an id of its own.
+    fn track(&mut self, mut t: Tracked) {
+        t.id = self.next_id;
+        self.next_id += 1;
+        self.tracked.push(t);
+    }
+
+    /// The id of the strategy on the chart.
+    pub fn selected_id(&self) -> Option<usize> {
+        self.tracked.get(self.selected).map(|t| t.id)
+    }
+
+    /// Select strategy `id` again wherever it is now (else the best).
+    fn reselect(&mut self, id: Option<usize>) {
+        self.selected = id
+            .and_then(|id| self.tracked.iter().position(|t| t.id == id))
+            .unwrap_or(0);
+    }
+
     /// Best first; the selection follows its strategy.
-    fn rank(&mut self, keep: Option<String>) {
+    fn rank(&mut self, keep: Option<usize>) {
         let sd = typical_sd(&self.tracked);
         self.tracked
             .sort_by(|a, b| b.score(sd).total_cmp(&a.score(sd)));
-        self.selected = keep
-            .and_then(|k| {
-                self.tracked
-                    .iter()
-                    .position(|t| t.found.strategy.key() == k)
-            })
-            .unwrap_or(0);
+        self.reselect(keep);
     }
 
     /// Strategies that keep losing live go, each with what it learned (and it isn't
     /// picked again).
     fn retire(&mut self, now: f64) {
-        let keep = self
-            .tracked
-            .get(self.selected)
-            .map(|t| t.found.strategy.key());
+        let keep = self.selected_id();
         let mut k = 0;
         while k < self.tracked.len() {
             let t = &self.tracked[k];
@@ -536,13 +552,7 @@ impl Lab {
             self.benched.insert(0, t);
             self.benched.truncate(BENCH);
         }
-        self.selected = keep
-            .and_then(|k| {
-                self.tracked
-                    .iter()
-                    .position(|t| t.found.strategy.key() == k)
-            })
-            .unwrap_or(0);
+        self.reselect(keep);
     }
 
     /// Paper trades on the newest data (at most once a second).
@@ -661,7 +671,7 @@ impl Lab {
                 out.push(mark(
                     x,
                     p.y_out,
-                    format!("{net:+.1}bp"),
+                    p.exit_label(),
                     "•",
                     if net > 0.0 { Color::Green } else { Color::Red },
                 ));
@@ -740,6 +750,7 @@ mod tests {
             note: None,
             newest,
             repairs: 0,
+            id: 0,
         };
         let losing = Perf::of(&[-1.0, -0.5, -0.8, -1.2, 0.3, -0.9, -0.7, -1.1, -0.4]);
         let fine = Perf::of(&[1.0, 0.5, -0.8, 1.2, 0.3, 0.9, -0.7, 1.1, 0.4]);
@@ -758,6 +769,25 @@ mod tests {
         Perf::of(&[1.0, -1.0, 0.5, -0.4, 0.2, 0.3, -0.2, 0.1, 0.4, -0.3])
     }
 
+    #[test]
+    fn the_selection_stays_on_the_strategy_picked_when_others_share_its_rules() {
+        // A repair with another exit has the same rules (`key`) as the one it came
+        // from: re-ranking must keep the one tapped, not the first with those rules.
+        let mut lab = Lab::new(Settings::default());
+        lab.track(tracked(meh(), Perf::default()));
+        lab.track(tracked(
+            Perf::of(&[2.0, 1.5, 1.8, 2.2, 1.9, 2.1, 1.7, 2.0, 1.6, 2.3]),
+            Perf::default(),
+        ));
+        lab.selected = 0;
+        let id = lab.selected_id();
+        lab.rank(id);
+        assert_eq!(lab.selected, 1, "the better one went first");
+        assert_eq!(lab.selected_id(), id);
+        lab.retire(0.0);
+        assert_eq!(lab.selected_id(), id);
+    }
+
     fn tracked(checked: Perf, live: Perf) -> Tracked {
         Tracked {
             found: Found {
@@ -773,6 +803,7 @@ mod tests {
             note: None,
             newest: None,
             repairs: 0,
+            id: 0,
         }
     }
 
@@ -818,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn entries_say_live_once_found_and_open_while_in() {
+    fn entries_say_open_while_in_and_exits_say_paper_once_found() {
         let t = |exit: Option<f64>, live| PaperTrade {
             entry: 0.0,
             exit,
@@ -829,8 +860,10 @@ mod tests {
             y_out: None,
         };
         assert_eq!(t(Some(1.0), false).label(), "");
-        assert_eq!(t(Some(1.0), true).label(), "live");
+        assert_eq!(t(Some(1.0), true).label(), "");
         assert_eq!(t(None, true).label(), "open");
+        assert_eq!(t(Some(1.0), false).exit_label(), "+0.0bp");
+        assert_eq!(t(Some(1.0), true).exit_label(), "+0.0bp paper");
     }
 
     #[test]
@@ -906,6 +939,7 @@ mod tests {
             note: None,
             newest: None,
             repairs: 0,
+            id: 1,
         });
         lab.refresh(&prices(400, 400));
         assert!(lab.tracked.is_empty(), "retired after losing live");
