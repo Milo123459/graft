@@ -233,6 +233,10 @@ pub struct Input {
     /// where there's no bid or ask (history with prices only).
     pub half_spread: f64,
     pub others: Vec<Other>,
+    /// Series there for too little of the data to invent from (a book recorded only
+    /// lately): a strategy that uses one still reads it, where it has data — so one
+    /// found on the newest stretch trades on all of it, there.
+    pub rare: Vec<Other>,
     /// Whether x is time (so lengths can be told in seconds).
     pub time: bool,
     /// How long after deciding a trade's orders fill (seconds; time axes only).
@@ -288,6 +292,7 @@ impl Input {
             v.get(v.len() / 2).copied().unwrap_or(0.0)
         };
         let mut others = Vec::new();
+        let mut rare = Vec::new();
         let (mut bid, mut ask) = (None, None);
         for o in &ds.series {
             // Its own kept formulas (disc1_1…) are already among its formulas.
@@ -325,8 +330,7 @@ impl Input {
                 ask = Some((o.name.clone(), lined));
                 continue;
             }
-            // Signals have to be there for most of the data.
-            if finite.len() < lined.len() / 2 || lo == hi {
+            if lo == hi {
                 continue;
             }
             // A clock (a timestamp field): never falls and is huge.
@@ -334,11 +338,17 @@ impl Input {
             if rising + 1 >= finite.len() && lo > 1e8 {
                 continue;
             }
-            others.push(Other {
+            let other = Other {
                 name: o.name.clone(),
                 values: lined,
                 price_like,
-            });
+            };
+            // Signals to invent from have to be there for most of the data.
+            if finite.len() < other.values.len() / 2 {
+                rare.push(other);
+            } else {
+                others.push(other);
+            }
         }
         let book = match (bid, ask) {
             (Some((bn, b)), Some((an, a))) => Some((bn, b, an, a)),
@@ -377,6 +387,7 @@ impl Input {
             book,
             half_spread,
             others,
+            rare,
             time: ds.x_kind == crate::data::XKind::Time,
             delay: s.latency.max(0.0),
         })
@@ -449,7 +460,10 @@ impl Input {
     }
 
     fn other(&self, name: &str) -> Option<&Other> {
-        self.others.iter().find(|o| o.name == name)
+        self.others
+            .iter()
+            .chain(&self.rare)
+            .find(|o| o.name == name)
     }
 }
 
@@ -2314,6 +2328,7 @@ mod tests {
             book: None,
             half_spread: 0.0,
             others: Vec::new(),
+            rare: Vec::new(),
             time: false,
             delay: 0.0,
         }
@@ -2584,6 +2599,7 @@ mod tests {
                 book: None,
                 half_spread: spread / 2.0 / 1e4,
                 others: Vec::new(),
+                rare: Vec::new(),
                 time: true,
                 delay: std::env::var("GRAFT_LATENCY")
                     .ok()
@@ -2876,5 +2892,52 @@ mod tests {
         assert_eq!(names, ["confidence"], "the clock is left out");
         let spread = crate::formula::parse("gap(feed.bestAskPrice, feed.bestBidPrice)").unwrap();
         assert!(inp.classics().contains(&spread));
+    }
+
+    #[test]
+    fn a_series_there_only_lately_is_read_where_it_is_but_not_invented_from() {
+        // A price for 1000 points; a book series only for the last 300 (recorded).
+        let s = |name: &str, points| Series {
+            name: name.into(),
+            unit: Unit::default(),
+            points,
+        };
+        let ds = Dataset {
+            series: vec![
+                s(
+                    "price",
+                    (0..1000)
+                        .map(|i| (i as f64, 100.0 + (i as f64 * 0.1).sin()))
+                        .collect(),
+                ),
+                s(
+                    "imbalance",
+                    (700..1000)
+                        .map(|i| (i as f64, (i as f64 * 0.7).sin()))
+                        .collect(),
+                ),
+            ],
+            x_kind: XKind::Number,
+        };
+        let inp = Input::from_dataset(&ds, &Settings::default()).unwrap();
+        // Too little of the data to invent from…
+        assert!(inp.others.is_empty() && !inp.columns().contains(&"imbalance".to_string()));
+        // …but a strategy that uses it (found on the newest stretch) trades there.
+        let st = Strategy::one_way(
+            Side::Long,
+            vec![Cond {
+                feature: crate::formula::parse("imbalance").unwrap(),
+                above: true,
+                threshold: 0.9,
+            }],
+            Exit {
+                hold: 3,
+                take: None,
+                stop: None,
+            },
+        );
+        let t = trade(&st, &inp, 0, &Fees::Flat(0.0));
+        assert!(t.len() > 10, "{} trades", t.len());
+        assert!(t.iter().all(|t| t.entry >= 700));
     }
 }

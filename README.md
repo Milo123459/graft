@@ -576,7 +576,9 @@ changed), and a repair can be repaired again, three times at most (each fits the
 data a little closer). **Judged on the market it's trading:** once a strategy has
 traded 8 times on the newest stretch — where series that start late, like a recorded
 order book, have data, so the market you'd really trade — it's judged, repaired and
-retired on that alone, not on older history from elsewhere. Ones that keep losing
+retired on that alone, not on older history from elsewhere. A strategy found there
+that uses those series trades, and is paper-traded, wherever they have data (they're
+just not invented from when a search covers much more than they do). Ones that keep losing
 there or live are retired with what they learned, and never picked again.
 
 Tap a strategy (or `discover_pick(2)`) to draw its trades (▲/▼ in, • out with its
