@@ -61,7 +61,7 @@ The user (milo123459, repo `milo123459/graft`, branch `master`):
 | `src/builder.rs` | the format builder (F); sources: file, command, stream, stdin |
 | `src/stream.rs` | `--stream URL` (`--ws`/`--sse`): WebSockets (tungstenite + rustls/ring, webpki roots) and streaming HTTP (ureq): server-sent events (`data:` = one record) or lines; `--send` messages; reconnect with backoff |
 | `src/formula.rs` | the formula language (`z(pct(price, 5), 50)`): parse/print, eval over lined-up columns (NaN-aware, causal), random/mutate/cross for evolution, `classics()` seeds |
-| `src/discover.rs` | the discovery engine: `Input` (price, bid/ask by name, other series), evolve formulas (fitness = best |t| of forward returns after its 10% tails, first 70% only), theories (bar = √(2 ln tests)), strategies (exits sized from σ, costs: fee + ask/bid), dedupe by overlapping entries |
+| `src/discover.rs` | the discovery engine: `Input` (price, bid/ask by name, other series), `Layout` (from the data: learn on the first half, walk forward over up to 5 stretches with thresholds re-fitted by rank (`Ranks`), horizons from where σ_h ≥ 4× round-trip cost, tails per horizon), evolve formulas (typed by `Expr::kind`, templates + compositions of fit ones, fitness = best |t| after 10% tails on the learning half − 0.04/part), theories (bar = √(2 ln tests)), strategies (exits sized from σ, costs: fee + ask/bid), dedupe by overlapping entries |
 | `src/lab.rs` | the viewer's lab: background searches every 20 s (3 s budget, pool carried over), paper-trading tracked strategies from when found, markers |
 | `src/tutorial.rs` | tutorial steps (keys, examples, checks) |
 
@@ -163,7 +163,7 @@ Then in the console (`:`): `strategies(0.045)`, `sweep(0.045)`,
 dashboard (EMA30/50, RSI, MACD, volume) is the tutorial's "recipe: a trading dashboard".
 
 Findings so far: no strategy beats fees and holding robustly. The "best" SL/TP picks
-mostly fade on the held-out 30%, which is the honest answer the user has accepted.
+mostly fade walking forward, which is the honest answer the user has accepted.
 
 ## Gotchas
 

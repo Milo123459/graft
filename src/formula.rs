@@ -7,7 +7,11 @@
 //!   (`pct` is the change in bp, `z` the distance from the mean in standard
 //!   deviations, `pos` the place in the range 0–100);
 //! - `abs neg sign log`, `a + b`, `a - b`, `a * b`, `a / b`, `gap(a, b)` (a relative
-//!   to b, in bp).
+//!   to b, in bp);
+//! - patterns: `motif(x, "++-")` (1 when the last moves went up, up, down; `=` is
+//!   unchanged), `run(x)` (the streak: +3 after three rises, -2 after two falls),
+//!   `since_high(x, n)` / `since_low(x, n)` (points since the n-point high / low),
+//!   `corr(a, b, n)` (how the two moved together over n points, -1 to 1).
 //!
 //! Every value uses only points up to its own: no peeking ahead.
 
@@ -19,6 +23,8 @@ pub enum Op1 {
     Neg,
     Sign,
     Log,
+    /// The streak of moves the same way: +n after n rises, -n after n falls.
+    Run,
 }
 
 /// An operation over the last n points.
@@ -36,6 +42,8 @@ pub enum OpW {
     Pos,
     Rsi,
     Slope,
+    SinceHigh,
+    SinceLow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,13 +55,14 @@ pub enum Op2 {
     Gap,
 }
 
-const OPS1: [(Op1, &str); 4] = [
+const OPS1: [(Op1, &str); 5] = [
     (Op1::Abs, "abs"),
     (Op1::Neg, "neg"),
     (Op1::Sign, "sign"),
     (Op1::Log, "log"),
+    (Op1::Run, "run"),
 ];
-const OPSW: [(OpW, &str); 12] = [
+const OPSW: [(OpW, &str); 14] = [
     (OpW::Lag, "lag"),
     (OpW::Diff, "diff"),
     (OpW::Pct, "pct"),
@@ -66,6 +75,8 @@ const OPSW: [(OpW, &str); 12] = [
     (OpW::Pos, "pos"),
     (OpW::Rsi, "rsi"),
     (OpW::Slope, "slope"),
+    (OpW::SinceHigh, "since_high"),
+    (OpW::SinceLow, "since_low"),
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,6 +86,52 @@ pub enum Expr {
     F1(Op1, Box<Expr>),
     W(OpW, Box<Expr>, usize),
     F2(Op2, Box<Expr>, Box<Expr>),
+    /// `corr(a, b, n)`.
+    Corr(Box<Expr>, Box<Expr>, usize),
+    /// `motif(x, "++-")`: the shape of the last moves.
+    Motif(Box<Expr>, String),
+}
+
+/// What scale a formula's values are on: what can sensibly be added, compared or
+/// divided. New formulas that mix scales (a price plus an RSI), divide by something
+/// that crosses zero, or take a % change of something that isn't a level are never
+/// tried: they can't mean anything, however well they happen to fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scale {
+    /// A level of a series (the price, its average): its own units.
+    Level,
+    /// A change or spread in a series' own units (diff, slope, std).
+    Own,
+    /// A relative change (bp: pct, gap).
+    Bp,
+    /// Unitless, around zero (z, corr, sign, a ratio of like things).
+    Unitless,
+    /// 0 to 100 (rsi, pos).
+    Hundred,
+    /// 0 to 1 (a motif, how often it came up).
+    Fraction,
+    /// A number of points (since_high, run).
+    Points,
+    Number,
+}
+
+/// A formula's scale, and whether it's always above zero (so it can be divided by,
+/// or taken a % change or log of).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Kind {
+    pub scale: Scale,
+    pub positive: bool,
+}
+
+impl Kind {
+    fn of(scale: Scale, positive: bool) -> Option<Kind> {
+        Some(Kind { scale, positive })
+    }
+
+    /// Unitless or bounded: it can scale anything without changing what it measures.
+    fn pure(&self) -> bool {
+        !matches!(self.scale, Scale::Level | Scale::Own)
+    }
 }
 
 /// Where a formula gets its series: each lined up with the others, the same length.
@@ -96,20 +153,194 @@ impl Expr {
         Expr::Col(name.to_string())
     }
 
+    /// Its outermost operation (`z`, `+`, `motif`…).
+    pub fn head(&self) -> String {
+        match self {
+            Expr::Col(_) => "series".into(),
+            Expr::Num(_) => "number".into(),
+            Expr::F1(op, _) => OPS1.iter().find(|o| o.0 == *op).expect("named").1.into(),
+            Expr::W(op, _, _) => OPSW.iter().find(|o| o.0 == *op).expect("named").1.into(),
+            Expr::F2(op, _, _) => format!("{op:?}"),
+            Expr::Corr(..) => "corr".into(),
+            Expr::Motif(..) => "motif".into(),
+        }
+    }
+
+    /// Its operations, without windows or series: `slope(rsi(_, _), _)`.
+    pub fn shape(&self) -> String {
+        let text = self.to_string();
+        let mut out = String::new();
+        let mut word = String::new();
+        let flush = |w: &mut String, out: &mut String, next: char| {
+            if !w.is_empty() {
+                out.push_str(if next == '(' { w.as_str() } else { "_" });
+                w.clear();
+            }
+        };
+        for c in text.chars() {
+            if c.is_alphanumeric() || c == '_' || c == '.' || c == '"' {
+                word.push(c);
+            } else {
+                flush(&mut word, &mut out, c);
+                out.push(c);
+            }
+        }
+        flush(&mut word, &mut out, ' ');
+        out
+    }
+
+    /// What its values are (`None`: it mixes things that don't go together).
+    pub fn kind(&self) -> Option<Kind> {
+        use Scale::*;
+        match self {
+            Expr::Col(_) => Kind::of(Level, true),
+            Expr::Num(v) => Kind::of(Number, *v > 0.0),
+            Expr::F1(op, e) => {
+                let k = e.kind()?;
+                match op {
+                    Op1::Abs => Kind::of(k.scale, k.positive),
+                    // The tails of both sides are tried anyway: only useful inside.
+                    Op1::Neg if k.scale == Level => None,
+                    Op1::Neg => Kind::of(k.scale, false),
+                    // The sign of something always positive is always 1.
+                    Op1::Sign if k.positive || matches!(k.scale, Number | Hundred | Fraction) => {
+                        None
+                    }
+                    Op1::Sign => Kind::of(Unitless, false),
+                    Op1::Log if !k.positive || k.scale == Number => None,
+                    Op1::Log => Kind::of(if k.scale == Level { Level } else { Unitless }, false),
+                    Op1::Run if k.scale == Number => None,
+                    Op1::Run => Kind::of(Points, false),
+                }
+            }
+            Expr::W(op, e, _) => {
+                let k = e.kind()?;
+                if k.scale == Number {
+                    return None;
+                }
+                let own = |s: Scale| if s == Level { Own } else { s };
+                match op {
+                    OpW::Lag | OpW::Mean | OpW::Ema | OpW::Max | OpW::Min => Some(k),
+                    OpW::Diff | OpW::Slope => Kind::of(
+                        match k.scale {
+                            Hundred | Fraction | Points => Unitless,
+                            s => own(s),
+                        },
+                        false,
+                    ),
+                    OpW::Pct if !k.positive => None,
+                    OpW::Pct => Kind::of(Bp, false),
+                    OpW::Std => Kind::of(own(k.scale), true),
+                    OpW::Z => Kind::of(Unitless, false),
+                    OpW::Pos | OpW::Rsi => Kind::of(Hundred, false),
+                    OpW::SinceHigh | OpW::SinceLow => Kind::of(Points, false),
+                }
+            }
+            Expr::F2(op, a, b) => {
+                let (a, b) = (a.kind()?, b.kind()?);
+                if a.scale == Number && b.scale == Number {
+                    return None;
+                }
+                match op {
+                    Op2::Add | Op2::Sub => {
+                        let s = if a.scale == Number {
+                            b.scale
+                        } else if b.scale == Number || a.scale == b.scale {
+                            a.scale
+                        } else {
+                            return None;
+                        };
+                        // Two levels apart: a distance in their units.
+                        let s = if *op == Op2::Sub && s == Level && a.scale == b.scale {
+                            Own
+                        } else {
+                            s
+                        };
+                        Kind::of(s, *op == Op2::Add && a.positive && b.positive)
+                    }
+                    Op2::Mul => {
+                        let s = match (a.pure(), b.pure()) {
+                            (false, false) => return None,
+                            (true, true) if a.scale == Number => b.scale,
+                            (true, true) if b.scale == Number => a.scale,
+                            (true, true) => Unitless,
+                            // A level times anything is still mostly the level.
+                            _ if a.scale == Level || b.scale == Level => return None,
+                            // A change or spread, scaled or gated.
+                            _ => Own,
+                        };
+                        Kind::of(s, a.positive && b.positive)
+                    }
+                    Op2::Div => {
+                        // Dividing by something that can be zero explodes.
+                        if !b.positive {
+                            return None;
+                        }
+                        let alike =
+                            a.scale == b.scale || (!a.pure() && !b.pure()) || b.scale == Number;
+                        if b.scale == Number {
+                            Kind::of(a.scale, a.positive)
+                        } else if alike || (a.pure() && b.pure()) {
+                            Kind::of(Unitless, a.positive)
+                        } else {
+                            None
+                        }
+                    }
+                    Op2::Gap => {
+                        let level = |k: Kind| k.positive && matches!(k.scale, Level | Own);
+                        (level(a) && level(b)).then_some(Kind {
+                            scale: Bp,
+                            positive: false,
+                        })
+                    }
+                }
+            }
+            Expr::Corr(a, b, _) => {
+                let (a, b) = (a.kind()?, b.kind()?);
+                (a.scale != Number && b.scale != Number).then_some(Kind {
+                    scale: Unitless,
+                    positive: false,
+                })
+            }
+            Expr::Motif(e, _) => {
+                let k = e.kind()?;
+                (k.scale != Number).then_some(Kind {
+                    scale: Fraction,
+                    positive: false,
+                })
+            }
+        }
+    }
+
+    /// Whether it's a formula worth trying: its parts go together, and it isn't a
+    /// constant.
+    pub fn sensible(&self) -> bool {
+        self.kind().is_some_and(|k| k.scale != Scale::Number)
+    }
+
+    /// Centred on zero (so its sign says something).
+    fn centred(&self) -> bool {
+        self.kind().is_some_and(|k| {
+            !k.positive && matches!(k.scale, Scale::Unitless | Scale::Bp | Scale::Own)
+        })
+    }
+
     /// How many parts it has (simpler formulas are preferred).
     pub fn size(&self) -> usize {
         match self {
             Expr::Col(_) | Expr::Num(_) => 1,
             Expr::F1(_, e) | Expr::W(_, e, _) => 1 + e.size(),
-            Expr::F2(_, a, b) => 1 + a.size() + b.size(),
+            // A longer shape is a bigger idea.
+            Expr::Motif(e, m) => m.len().div_ceil(2) + e.size(),
+            Expr::F2(_, a, b) | Expr::Corr(a, b, _) => 1 + a.size() + b.size(),
         }
     }
 
     pub fn depth(&self) -> usize {
         match self {
             Expr::Col(_) | Expr::Num(_) => 1,
-            Expr::F1(_, e) | Expr::W(_, e, _) => 1 + e.depth(),
-            Expr::F2(_, a, b) => 1 + a.depth().max(b.depth()),
+            Expr::F1(_, e) | Expr::W(_, e, _) | Expr::Motif(e, _) => 1 + e.depth(),
+            Expr::F2(_, a, b) | Expr::Corr(a, b, _) => 1 + a.depth().max(b.depth()),
         }
     }
 
@@ -130,8 +361,8 @@ impl Expr {
         f(self);
         match self {
             Expr::Col(_) | Expr::Num(_) => {}
-            Expr::F1(_, e) | Expr::W(_, e, _) => e.walk(f),
-            Expr::F2(_, a, b) => {
+            Expr::F1(_, e) | Expr::W(_, e, _) | Expr::Motif(e, _) => e.walk(f),
+            Expr::F2(_, a, b) | Expr::Corr(a, b, _) => {
                 a.walk(f);
                 b.walk(f);
             }
@@ -156,7 +387,8 @@ impl Expr {
         };
         match self {
             Expr::Col(_) | Expr::Num(_) => false,
-            Expr::F1(_, e) | Expr::W(_, e, _) => e.lopsided(data),
+            Expr::F1(_, e) | Expr::W(_, e, _) | Expr::Motif(e, _) => e.lopsided(data),
+            Expr::Corr(a, b, _) => a.lopsided(data) || b.lopsided(data),
             Expr::F2(op, a, b) => {
                 if a.lopsided(data) || b.lopsided(data) {
                     return true;
@@ -172,11 +404,33 @@ impl Expr {
         }
     }
 
+    /// Whether it takes a % change, gap or log of something that isn't always positive
+    /// (a change from near zero explodes: meaningless).
+    pub fn ill_posed(&self, data: &dyn Columns) -> bool {
+        let positive = |e: &Expr| {
+            e.eval(data)
+                .iter()
+                .filter(|x| x.is_finite())
+                .all(|x| *x > 0.0)
+        };
+        match self {
+            Expr::Col(_) | Expr::Num(_) => false,
+            Expr::W(OpW::Pct, e, _) | Expr::F1(Op1::Log, e) => !positive(e) || e.ill_posed(data),
+            Expr::F2(Op2::Gap, a, b) => {
+                !positive(a) || !positive(b) || a.ill_posed(data) || b.ill_posed(data)
+            }
+            Expr::F1(_, e) | Expr::W(_, e, _) | Expr::Motif(e, _) => e.ill_posed(data),
+            Expr::F2(_, a, b) | Expr::Corr(a, b, _) => a.ill_posed(data) || b.ill_posed(data),
+        }
+    }
+
     /// The longest stretch of history it looks back over.
     pub fn reach(&self) -> usize {
         match self {
             Expr::Col(_) | Expr::Num(_) => 0,
             Expr::F1(_, e) => e.reach(),
+            Expr::Motif(e, m) => e.reach() + m.len(),
+            Expr::Corr(a, b, n) => a.reach().max(b.reach()) + n,
             Expr::W(op, e, n) => {
                 e.reach()
                     + match op {
@@ -196,6 +450,9 @@ impl Expr {
                 .column(c)
                 .map_or_else(|| vec![f64::NAN; rows], <[f64]>::to_vec),
             Expr::Num(v) => vec![*v; rows],
+            Expr::F1(Op1::Run, e) => run(&e.eval(data)),
+            Expr::Motif(e, m) => motif(&e.eval(data), m),
+            Expr::Corr(a, b, n) => corr(&a.eval(data), &b.eval(data), (*n).max(3)),
             Expr::F1(op, e) => {
                 let mut v = e.eval(data);
                 for x in &mut v {
@@ -220,6 +477,7 @@ impl Expr {
                                 f64::NAN
                             }
                         }
+                        Op1::Run => unreachable!("worked out above"),
                     }
                 }
                 v
@@ -241,6 +499,94 @@ impl Expr {
             }
         }
     }
+}
+
+/// The streak: +n after n rises in a row, -n after n falls (0 when unchanged).
+fn run(v: &[f64]) -> Vec<f64> {
+    let mut out = Vec::with_capacity(v.len());
+    let mut streak = 0.0f64;
+    for i in 0..v.len() {
+        if i == 0 || !v[i].is_finite() || !v[i - 1].is_finite() {
+            streak = 0.0;
+            out.push(f64::NAN);
+            continue;
+        }
+        streak = match v[i].partial_cmp(&v[i - 1]) {
+            Some(std::cmp::Ordering::Greater) => streak.max(0.0) + 1.0,
+            Some(std::cmp::Ordering::Less) => streak.min(0.0) - 1.0,
+            _ => 0.0,
+        };
+        out.push(streak);
+    }
+    out
+}
+
+/// 1 where the last moves had the pattern's shape (`+` up, `-` down, `=` unchanged,
+/// oldest first), else 0.
+fn motif(v: &[f64], pattern: &str) -> Vec<f64> {
+    let p: Vec<u8> = pattern.bytes().collect();
+    let k = p.len();
+    (0..v.len())
+        .map(|i| {
+            if k == 0 || i < k {
+                return f64::NAN;
+            }
+            let mut hit = true;
+            for (j, want) in p.iter().enumerate() {
+                // Move j of the k: from point i-k+j to i-k+j+1.
+                let (a, b) = (v[i - k + j], v[i - k + j + 1]);
+                if !a.is_finite() || !b.is_finite() {
+                    return f64::NAN;
+                }
+                let got = if b > a {
+                    b'+'
+                } else if b < a {
+                    b'-'
+                } else {
+                    b'='
+                };
+                if got != *want {
+                    hit = false;
+                }
+            }
+            f64::from(u8::from(hit))
+        })
+        .collect()
+}
+
+/// How a and b moved together over the last n points: the correlation of their
+/// point-to-point changes, -1 to 1.
+fn corr(a: &[f64], b: &[f64], n: usize) -> Vec<f64> {
+    let d = |v: &[f64], i: usize| if i == 0 { f64::NAN } else { v[i] - v[i - 1] };
+    let len = a.len().min(b.len());
+    (0..len)
+        .map(|i| {
+            if i < n {
+                return f64::NAN;
+            }
+            let (mut sx, mut sy, mut sxx, mut syy, mut sxy) = (0.0, 0.0, 0.0, 0.0, 0.0);
+            for j in i + 1 - n..=i {
+                let (x, y) = (d(a, j), d(b, j));
+                if !x.is_finite() || !y.is_finite() {
+                    return f64::NAN;
+                }
+                sx += x;
+                sy += y;
+                sxx += x * x;
+                syy += y * y;
+                sxy += x * y;
+            }
+            let nf = n as f64;
+            let cov = sxy / nf - sx / nf * sy / nf;
+            let vx = sxx / nf - (sx / nf).powi(2);
+            let vy = syy / nf - (sy / nf).powi(2);
+            if vx <= 0.0 || vy <= 0.0 {
+                0.0
+            } else {
+                (cov / (vx * vy).sqrt()).clamp(-1.0, 1.0)
+            }
+        })
+        .collect()
 }
 
 /// Rolling sums over the last n finite values; `None` until all n are finite.
@@ -349,7 +695,7 @@ fn window(op: OpW, v: &[f64], n: usize) -> Vec<f64> {
                 })
                 .collect()
         }
-        OpW::Max | OpW::Min | OpW::Pos => {
+        OpW::Max | OpW::Min | OpW::Pos | OpW::SinceHigh | OpW::SinceLow => {
             let n = n.max(2);
             let (mut hi, mut lo): (VecDeque<usize>, VecDeque<usize>) =
                 (VecDeque::new(), VecDeque::new());
@@ -385,6 +731,8 @@ fn window(op: OpW, v: &[f64], n: usize) -> Vec<f64> {
                     match op {
                         OpW::Max => h,
                         OpW::Min => l,
+                        OpW::SinceHigh => (i - hi[0]) as f64,
+                        OpW::SinceLow => (i - lo[0]) as f64,
                         _ if h > l => (x - l) / (h - l) * 100.0,
                         _ => 50.0,
                     }
@@ -447,7 +795,7 @@ fn is_word(s: &str) -> bool {
             .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
         && !OPS1.iter().any(|o| o.1 == s)
         && !OPSW.iter().any(|o| o.1 == s)
-        && s != "gap"
+        && !["gap", "corr", "motif"].contains(&s)
 }
 
 impl std::fmt::Display for Expr {
@@ -465,6 +813,8 @@ impl std::fmt::Display for Expr {
                 write!(f, "{name}({e}, {n})")
             }
             Expr::F2(Op2::Gap, a, b) => write!(f, "gap({a}, {b})"),
+            Expr::Corr(a, b, n) => write!(f, "corr({a}, {b}, {n})"),
+            Expr::Motif(e, m) => write!(f, "motif({e}, \"{m}\")"),
             Expr::F2(op, a, b) => {
                 let sym = match op {
                     Op2::Add => "+",
@@ -626,9 +976,34 @@ impl Parser<'_> {
                     self.expect(b')')?;
                     return Ok(Expr::f2(Op2::Gap, arg, b));
                 }
-                let Some(op) = OPSW.iter().find(|o| o.1 == word) else {
-                    return Err(format!("formula: there's no function called {word}"));
+                if word == "motif" {
+                    self.expect(b'"')?;
+                    let from = self.i;
+                    while self.s.get(self.i).is_some_and(|c| b"+-=".contains(c)) {
+                        self.i += 1;
+                    }
+                    let m = String::from_utf8_lossy(&self.s[from..self.i]).into_owned();
+                    if m.is_empty() || self.s.get(self.i) != Some(&b'"') {
+                        return Err(
+                            "formula: motif(x, \"++-\") takes a shape of + (up), - (down) and = (unchanged)"
+                                .into(),
+                        );
+                    }
+                    self.i += 1;
+                    self.expect(b')')?;
+                    return Ok(Expr::Motif(Box::new(arg), m));
+                }
+                let corr_b = if word == "corr" {
+                    let b = self.sum()?;
+                    self.expect(b',')?;
+                    Some(b)
+                } else {
+                    None
                 };
+                let op = OPSW.iter().find(|o| o.1 == word);
+                if op.is_none() && corr_b.is_none() {
+                    return Err(format!("formula: there's no function called {word}"));
+                }
                 self.space();
                 let n_start = self.i;
                 while self.s.get(self.i).is_some_and(u8::is_ascii_digit) {
@@ -638,7 +1013,11 @@ impl Parser<'_> {
                     .parse()
                     .map_err(|_| format!("formula: {word}(…, n) needs a whole number of points"))?;
                 self.expect(b')')?;
-                Ok(Expr::w(op.0, arg, n.max(1)))
+                match (corr_b, op) {
+                    (Some(b), _) => Ok(Expr::Corr(Box::new(arg), Box::new(b), n.max(3))),
+                    (None, Some(op)) => Ok(Expr::w(op.0, arg, n.max(1))),
+                    (None, None) => unreachable!("checked above"),
+                }
             }
         }
     }
@@ -711,10 +1090,34 @@ impl Maker {
         }
     }
 
+    /// A shape of 2 to 6 moves.
+    fn shape(&self, rng: &mut Rng) -> String {
+        (0..2 + rng.below(5))
+            .map(|_| *rng.pick(&['+', '+', '-', '-', '=']))
+            .collect()
+    }
+
+    /// A pattern: a shape of the price's moves (or something's), a streak, or how two
+    /// series move together.
+    fn pattern(&self, rng: &mut Rng) -> Expr {
+        match rng.below(4) {
+            0 | 1 => Expr::Motif(Box::new(self.leaf(rng)), self.shape(rng)),
+            2 => Expr::F1(Op1::Run, Box::new(self.leaf(rng))),
+            _ => Expr::Corr(
+                Box::new(self.leaf(rng)),
+                Box::new(Expr::w(OpW::Lag, self.leaf(rng), self.window(rng))),
+                self.window(rng).max(5),
+            ),
+        }
+    }
+
     /// Any formula up to `depth` deep.
     fn any(&self, rng: &mut Rng, depth: usize) -> Expr {
         if depth <= 1 || rng.chance(0.25) {
             return self.leaf(rng);
+        }
+        if rng.chance(0.1) {
+            return self.pattern(rng);
         }
         match rng.below(10) {
             0..=5 => {
@@ -732,9 +1135,130 @@ impl Maker {
         }
     }
 
+    /// A window at least `k` rungs longer than `n` (or the longest).
+    fn longer(&self, n: usize, k: usize) -> usize {
+        let i = self.windows.iter().position(|w| *w >= n).unwrap_or(0);
+        self.windows[(i + k).min(self.windows.len() - 1)]
+    }
+
+    /// Something scale-free about a series: a shallow random formula, made comparable
+    /// over time.
+    fn signal(&self, rng: &mut Rng) -> Expr {
+        for _ in 0..20 {
+            let inner = if rng.chance(0.5) {
+                self.leaf(rng)
+            } else {
+                self.any(rng, 3)
+            };
+            let e = Expr::w(*rng.pick(&SCALE_FREE), inner, self.window(rng));
+            if e.sensible() {
+                return e;
+            }
+        }
+        Expr::w(OpW::Pct, self.leaf(rng), self.window(rng))
+    }
+
+    /// A formula in a shape traders use, with random parts: momentum against
+    /// volatility, a divergence, a signal taken only with the trend, mean reversion
+    /// that depends on how calm it is, an acceleration, two timeframes against each
+    /// other, a pattern in context.
+    pub fn template(&self, rng: &mut Rng) -> Expr {
+        let p = || Expr::col(&self.cols[0]);
+        let n = self.window(rng);
+        let m = self.longer(n, 1 + rng.below(3));
+        let returns = || Expr::w(OpW::Pct, p(), 1);
+        let x = match rng.below(8) {
+            // How far it went, in its usual steps.
+            0 => Expr::f2(
+                Op2::Div,
+                Expr::w(OpW::Pct, p(), n),
+                Expr::w(OpW::Std, returns(), m),
+            ),
+            // The price's trend and a signal's trend disagree.
+            1 => {
+                let k = self.window(rng);
+                let sig = Expr::w(*rng.pick(&[OpW::Rsi, OpW::Pos, OpW::Z]), self.leaf(rng), k);
+                Expr::f2(
+                    Op2::Sub,
+                    Expr::w(OpW::Z, Expr::w(OpW::Slope, p(), n), m),
+                    Expr::w(OpW::Z, Expr::w(OpW::Slope, sig, n), m),
+                )
+            }
+            // A signal, only with the trend.
+            2 => Expr::f2(
+                Op2::Mul,
+                Expr::w(OpW::Z, self.signal(rng), n),
+                Expr::F1(Op1::Sign, Box::new(Expr::w(OpW::Slope, p(), m))),
+            ),
+            // Stretched from normal, weighted by how calm or wild it is.
+            3 => Expr::f2(
+                Op2::Mul,
+                Expr::w(OpW::Z, p(), n),
+                Expr::w(OpW::Pos, Expr::w(OpW::Std, returns(), n), m),
+            ),
+            // Speeding up or slowing down.
+            4 => Expr::w(OpW::Diff, Expr::w(OpW::Pct, p(), n), self.window(rng)),
+            // Where it is in a short range against a long one.
+            5 => Expr::f2(
+                Op2::Sub,
+                Expr::w(OpW::Pos, p(), n),
+                Expr::w(OpW::Pos, p(), m),
+            ),
+            // Another series' surprise, in the direction the price is going.
+            6 => Expr::f2(
+                Op2::Mul,
+                Expr::w(OpW::Z, self.leaf(rng), n),
+                Expr::F1(Op1::Sign, Box::new(Expr::w(OpW::Pct, p(), m))),
+            ),
+            // How often a shape came up lately, signed by where the price stands.
+            _ => Expr::f2(
+                Op2::Mul,
+                Expr::w(OpW::Mean, self.pattern(rng), n),
+                Expr::w(OpW::Z, p(), m),
+            ),
+        };
+        // Sometimes smoothed or standardised once more.
+        match rng.below(4) {
+            0 => Expr::w(OpW::Ema, x, *rng.pick(&[2, 3, 5])),
+            1 => Expr::w(OpW::Z, x, self.longer(m, 1)),
+            _ => x,
+        }
+    }
+
+    /// Two formulas that work, combined: their sum or product when both are
+    /// standardised (together, or each one only matters when the other is high), one
+    /// taken only when the other's sign agrees, how one follows the other, or how fast
+    /// one is changing.
+    pub fn compose(&self, a: &Expr, b: &Expr, rng: &mut Rng) -> Expr {
+        let n = self.window(rng);
+        let z = |e: &Expr| Expr::w(OpW::Z, e.clone(), n);
+        match rng.below(5) {
+            0 => Expr::f2(Op2::Add, z(a), z(b)),
+            1 => Expr::f2(Op2::Mul, z(a), z(b)),
+            2 => {
+                let gate = if b.centred() { b.clone() } else { z(b) };
+                Expr::f2(Op2::Mul, z(a), Expr::F1(Op1::Sign, Box::new(gate)))
+            }
+            3 => Expr::Corr(Box::new(a.clone()), Box::new(b.clone()), n.max(5)),
+            _ => Expr::w(OpW::Z, Expr::w(OpW::Diff, a.clone(), self.window(rng)), n),
+        }
+    }
+
     /// A new formula, usually something comparable over time at the top.
     pub fn random(&self, rng: &mut Rng) -> Expr {
-        let depth = 2 + rng.below(3);
+        if rng.chance(0.3) {
+            return self.template(rng);
+        }
+        let depth = 2 + rng.below(4);
+        // Patterns as they are, or smoothed (how often the shape came up lately).
+        if rng.chance(0.25) {
+            let p = self.pattern(rng);
+            return if rng.chance(0.4) {
+                Expr::w(OpW::Mean, p, self.window(rng).max(5))
+            } else {
+                p
+            };
+        }
         if rng.chance(0.75) {
             let op = *rng.pick(&SCALE_FREE);
             Expr::w(op, self.any(rng, depth - 1), self.window(rng))
@@ -788,12 +1312,45 @@ impl Maker {
                     let op = *rng.pick(&[Op2::Add, Op2::Sub, Op2::Mul, Op2::Div, Op2::Gap]);
                     Expr::F2(op, a.clone(), b.clone())
                 }
+                // A shape a move longer, shorter, or with one move changed.
+                Expr::Motif(inner, m) if rng.chance(0.8) => {
+                    let mut m: Vec<char> = m.chars().collect();
+                    match rng.below(3) {
+                        0 if m.len() < 8 => m.insert(0, *rng.pick(&['+', '-', '='])),
+                        1 if m.len() > 2 => {
+                            m.remove(0);
+                        }
+                        _ => {
+                            let i = rng.below(m.len());
+                            m[i] = *rng.pick(&['+', '-', '=']);
+                        }
+                    }
+                    Expr::Motif(inner.clone(), m.into_iter().collect())
+                }
+                Expr::Corr(a, b, n) if rng.chance(0.6) => {
+                    let i = self.windows.iter().position(|w| w >= n).unwrap_or(0);
+                    let j = (i + 1).min(self.windows.len() - 1);
+                    let n = if rng.chance(0.5) {
+                        self.windows[i.saturating_sub(1)]
+                    } else {
+                        self.windows[j]
+                    };
+                    Expr::Corr(a.clone(), b.clone(), n.max(5))
+                }
                 Expr::Col(_) => self.leaf(rng),
                 _ => self.any(rng, 3),
             };
         }
         match e {
             Expr::Col(_) | Expr::Num(_) => e.clone(),
+            Expr::Motif(inner, m) => {
+                Expr::Motif(Box::new(self.mutate_at(inner, target, k, rng)), m.clone())
+            }
+            Expr::Corr(a, b, n) => {
+                let a = self.mutate_at(a, target, k, rng);
+                let b = self.mutate_at(b, target, k, rng);
+                Expr::Corr(Box::new(a), Box::new(b), *n)
+            }
             Expr::F1(op, inner) => Expr::F1(*op, Box::new(self.mutate_at(inner, target, k, rng))),
             Expr::W(op, inner, n) => {
                 Expr::W(*op, Box::new(self.mutate_at(inner, target, k, rng)), *n)
@@ -823,8 +1380,10 @@ fn nth(e: &Expr, target: usize) -> &Expr {
         *k += 1;
         match e {
             Expr::Col(_) | Expr::Num(_) => None,
-            Expr::F1(_, i) | Expr::W(_, i, _) => go(i, target, k),
-            Expr::F2(_, a, b) => go(a, target, k).or_else(|| go(b, target, k)),
+            Expr::F1(_, i) | Expr::W(_, i, _) | Expr::Motif(i, _) => go(i, target, k),
+            Expr::F2(_, a, b) | Expr::Corr(a, b, _) => {
+                go(a, target, k).or_else(|| go(b, target, k))
+            }
         }
     }
     go(e, target, &mut 0).unwrap_or(e)
@@ -840,6 +1399,12 @@ fn replace(e: &Expr, target: usize, with: &Expr, k: &mut usize) -> Expr {
         Expr::Col(_) | Expr::Num(_) => e.clone(),
         Expr::F1(op, i) => Expr::F1(*op, Box::new(replace(i, target, with, k))),
         Expr::W(op, i, n) => Expr::W(*op, Box::new(replace(i, target, with, k)), *n),
+        Expr::Motif(i, m) => Expr::Motif(Box::new(replace(i, target, with, k)), m.clone()),
+        Expr::Corr(a, b, n) => {
+            let a = replace(a, target, with, k);
+            let b = replace(b, target, with, k);
+            Expr::Corr(Box::new(a), Box::new(b), *n)
+        }
         Expr::F2(op, a, b) => {
             let a = replace(a, target, with, k);
             let b = replace(b, target, with, k);
@@ -928,6 +1493,10 @@ mod tests {
             "a * (b * c) - (d - e)",
             "mean(sign(diff(price, 1)), 15)",
             "neg(abs(slope(price, 8)))",
+            "motif(price, \"++-=\")",
+            "mean(motif(price, \"--\"), 13) + run(price)",
+            "corr(price, lag(volume, 3), 21)",
+            "since_high(price, 55) - since_low(price, 55)",
         ] {
             let e = parse(text).unwrap();
             assert_eq!(e.to_string(), text);
@@ -951,6 +1520,10 @@ mod tests {
             "std(price, 4)",
             "slope(price, 4)",
             "max(price, 4)",
+            "motif(price, \"+-\")",
+            "run(price)",
+            "since_high(price, 6)",
+            "corr(price, lag(price, 2), 6)",
         ] {
             let full = parse(text).unwrap().eval(&data);
             // The same values when the future isn't there yet.
@@ -970,10 +1543,91 @@ mod tests {
                 .filter(|v| v.is_finite())
                 .all(|v| (0.0..=100.0).contains(v))
         );
+        let x = Cols(vec![("x".into(), vec![1.0, 2.0, 3.0, 2.0, 2.0, 5.0])]);
+        let m = parse("motif(x, \"+-=\")").unwrap().eval(&x);
+        assert_eq!(
+            &m[3..],
+            [0.0, 1.0, 0.0],
+            "up, down, unchanged ends at point 4"
+        );
+        assert_eq!(
+            &parse("run(x)").unwrap().eval(&x)[1..],
+            [1.0, 2.0, -1.0, 0.0, 1.0]
+        );
+        assert_eq!(parse("since_high(x, 4)").unwrap().eval(&x)[4], 2.0);
+        assert!(parse("motif(x, \"up\")").is_err());
         let slope = parse("slope(x, 3)")
             .unwrap()
             .eval(&Cols(vec![("x".into(), vec![1.0, 3.0, 5.0, 7.0])]));
         assert!((slope[3] - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn shapes_ignore_windows_and_series() {
+        let a = parse("slope(rsi(price, 55), 2)").unwrap();
+        let b = parse("slope(rsi(volume, 13), 8)").unwrap();
+        assert_eq!(a.shape(), b.shape());
+        assert_eq!(a.shape(), "slope(rsi(_, _), _)");
+        assert_eq!(a.head(), "slope");
+        assert_ne!(a.shape(), parse("slope(z(price, 55), 2)").unwrap().shape());
+    }
+
+    #[test]
+    fn nonsense_never_gets_tried() {
+        let ok = |t: &str| parse(t).unwrap().sensible();
+        // Mixed scales, dividing by something that crosses zero, a % change of
+        // something that isn't a level, the sign of something always positive.
+        for bad in [
+            "price + rsi(price, 14)",
+            "pct(z(price, 20), 5)",
+            "pct(price, 5) / z(price, 20)",
+            "sign(rsi(price, 14))",
+            "price * price",
+            "price * z(price, 20)",
+            "motif(price, \"++\") / price",
+            "log(diff(price, 3))",
+            "gap(z(price, 5), price)",
+            "3 + 4",
+        ] {
+            assert!(!ok(bad), "{bad}");
+        }
+        for good in [
+            "pct(price, 15) / std(pct(price, 1), 50)",
+            "z(slope(price, 8), 50) - z(slope(rsi(price, 14), 8), 50)",
+            "z(pct(volume, 5), 20) * sign(slope(price, 50))",
+            "z(price, 20) * pos(std(pct(price, 1), 20), 100)",
+            "pos(price, 8) - pos(price, 89)",
+            "gap(ema(price, 3), ema(price, 12))",
+            "mean(motif(price, \"++-\"), 13) * z(price, 34)",
+            "rsi(price, 14) - 50",
+        ] {
+            assert!(ok(good), "{good}");
+        }
+        // The usual indicators make sense too.
+        for c in classics("price", None, &[("volume".into(), false)], 5000) {
+            assert!(c.sensible(), "{c}");
+        }
+    }
+
+    #[test]
+    fn makes_deep_formulas_that_make_sense() {
+        let m = Maker::new(vec!["price".into(), "volume".into()], 5000);
+        let mut rng = Rng::new(9);
+        let mut deep = 0;
+        for _ in 0..300 {
+            let t = m.template(&mut rng);
+            assert!(t.sensible(), "{t}");
+            assert_eq!(parse(&t.to_string()).unwrap(), t, "{t}");
+            let (a, b) = (m.template(&mut rng), m.random(&mut rng));
+            let c = m.compose(&a, &b, &mut rng);
+            if a.sensible() && b.sensible() {
+                assert!(c.sensible(), "{a} · {b} → {c}");
+            }
+            if c.depth() >= 6 {
+                deep += 1;
+            }
+        }
+        assert!(deep > 100, "{deep} deep ones");
     }
 
     #[test]

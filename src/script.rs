@@ -645,7 +645,7 @@ pub const USAGE: &[(&str, &str, &str)] = &[
     (
         "formula",
         r#"formula("z(pct(price, 5), 50)")"#,
-        "a formula over series (the language discover() writes): lag diff pct mean ema std max min z pos rsi slope, abs neg sign log, + - * /, gap",
+        "a formula over series (the language discover() writes): lag diff pct mean ema std max min z pos rsi slope since_high since_low, abs neg sign log run, + - * /, gap(a, b), corr(a, b, n), motif(x, \"++-\")",
     ),
     (
         "change_bp",

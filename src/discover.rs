@@ -4,20 +4,33 @@
 //! price series (and, if the chart has them, bid and ask series, plus any other series
 //! as possible signals), and:
 //!
+//! 0. **lays the search out from the data** ([`Layout`]): the horizons it looks at
+//!    (from the shortest where the typical move is several times what a round trip
+//!    costs), the tails of each formula's range it tests (wider for longer horizons, so
+//!    there are enough events), and how it validates: it learns on the first half and
+//!    walks forward over the second, in as many stretches as the longest horizon
+//!    allows;
 //! 1. **invents formulas** (`formula.rs`): starting from the usual indicators and
 //!    random formulas over the series, it keeps changing and combining the fittest. A
 //!    formula is fit when the price moves one way after its extremes (its lowest or
-//!    highest 10%), judged only on the first 70% of the data. The best formulas carry
-//!    over to the next search, so it keeps improving as data streams in;
-//! 2. tests **theories**: when a formula is in a tail of its range (lowest or highest
-//!    5% / 15%), what does the price do over the next h points? Each test uses events
-//!    at least h apart (so the t-statistic isn't inflated by overlap). Found on the
-//!    first 70%, checked on the last 30%;
+//!    highest 10%), judged only on the learning half. The best formulas carry over to
+//!    the next search, so it keeps improving as data streams in;
+//! 2. tests **theories**: when a formula is in a tail of its range, what does the price
+//!    do over the next h points? Each test uses events at least h apart (so the
+//!    t-statistic isn't inflated by overlap). Found on the learning half, then checked
+//!    walking forward: on each later stretch, with the tail's threshold re-fitted on
+//!    everything before it;
 //! 3. turns the promising theories into **strategies** (enter in the theory's
 //!    direction; exit after h points, or at a take-profit / stop-loss sized from the
 //!    typical move), adds one filter from another formula where it helps, and trades
 //!    them with costs: the fee on each side, buying at the ask and selling at the bid
-//!    when there are bid and ask series. Picked on the first 70%, ranked by the last 30%.
+//!    when there are bid and ask series. Picked on the learning half, checked walking
+//!    forward like the theories, ranked by both and by how many stretches it made
+//!    money in.
+//!
+//! A strategy's thresholds are ranks, not fixed numbers: "in the lowest 5% of its range
+//! so far". Each walk-forward step re-fits them on the data before it, as trading it
+//! from then on would; what's paper-traded is fitted on all of it.
 //!
 //! The viewer reruns it as data arrives and paper-trades what it found from then on:
 //! the live results are the only ones the search never saw.
@@ -25,11 +38,9 @@
 use crate::data::Dataset;
 use crate::formula::{Expr, Maker, Rng};
 
-/// The share of the data strategies are picked on (the rest checks them).
-pub const TRAIN: f64 = 0.7;
 /// Fewer points than this and there's nothing to learn from yet.
 pub const MIN_POINTS: usize = 300;
-/// Trades a strategy needs on the first 70% to be considered…
+/// Trades a strategy needs on the learning half to be considered…
 const MIN_TRADES: usize = 10;
 /// …and the t-statistic of its returns after costs there.
 const MIN_T: f64 = 1.5;
@@ -268,7 +279,13 @@ impl Input {
         let mut others = Vec::new();
         let (mut bid, mut ask) = (None, None);
         for o in &ds.series {
-            if o.name == price.name || o.points.len() < 2 {
+            // Its own kept formulas (disc1_1…) are already among its formulas.
+            let kept = o.name.strip_prefix("disc").is_some_and(|r| {
+                r.split_once('_').is_some_and(|(a, b)| {
+                    a.chars().all(|c| c.is_ascii_digit()) && b.chars().all(|c| c.is_ascii_digit())
+                })
+            });
+            if o.name == price.name || o.points.len() < 2 || kept {
                 continue;
             }
             let lined = line_up(&o.points, &x);
@@ -517,10 +534,18 @@ impl Perf {
         }
     }
 
-    /// `+1.20bp × 23 (t 2.1, 61% won)`.
+    /// `+1.20bp × 23 (t 2.1, 61% won)` (no t for fewer than 5: it means nothing yet).
     pub fn brief(&self) -> String {
         if self.n == 0 {
             return "no trades".into();
+        }
+        if self.n < 5 {
+            return format!(
+                "{:+.2}bp × {} ({:.0}% won)",
+                self.mean,
+                self.n,
+                self.win * 100.0
+            );
         }
         format!(
             "{:+.2}bp × {} (t {:.1}, {:.0}% won)",
@@ -590,14 +615,14 @@ pub struct Theory {
     pub tail: f64,
     /// Points ahead.
     pub ahead: usize,
-    /// The price's change that many points later (bp), on the first 70%…
+    /// The price's change that many points later (bp), on the learning half…
     pub found: Perf,
-    /// …and on the last 30%.
+    /// …and walking forward over the rest.
     pub checked: Perf,
 }
 
 impl Theory {
-    /// Whether the last 30% agreed (the same direction, t of 2 or more).
+    /// Whether the walk-forward agreed (the same direction, t of 2 or more).
     pub fn held(&self) -> bool {
         self.checked.n >= 5
             && self.checked.mean.signum() == self.found.mean.signum()
@@ -607,7 +632,7 @@ impl Theory {
     pub fn describe(&self, input: &Input) -> String {
         let side = if self.cond.above { "top" } else { "bottom" };
         format!(
-            "{} ({} {:.0}%) → {} later {:+.2}bp (t {:.1}, {} times) · last 30%: {:+.2}bp (t {:.1}, {}) {}",
+            "{} ({} {:.0}%) → {} later {:+.2}bp (t {:.1}, {} times) · walking forward: {:+.2}bp (t {:.1}, {}) {}",
             self.cond.describe(),
             side,
             self.tail * 100.0,
@@ -669,33 +694,67 @@ pub struct Exit {
     pub stop: Option<f64>,
 }
 
+/// When to trade: long when all `long` conditions hold, short when all `short` ones do
+/// (either can be empty: a one-way strategy), never when an `except` one holds (a
+/// condition it learned it loses in).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Strategy {
-    pub side: Side,
-    /// All must hold to enter.
-    pub conds: Vec<Cond>,
+    pub long: Vec<Cond>,
+    pub short: Vec<Cond>,
+    pub except: Vec<Cond>,
     pub exit: Exit,
 }
 
 /// A trade a strategy made: in at point `entry`, out at `exit` (`None`: still open, at
-/// the newest point), and its return after costs (bp).
+/// the newest point), its move after the spread and its result after costs (bp).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Trade {
     pub entry: usize,
     pub exit: Option<usize>,
+    pub side: Side,
+    pub gross: f64,
     pub net: f64,
 }
 
+fn join_conds(c: &[Cond]) -> String {
+    c.iter()
+        .map(Cond::describe)
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
 impl Strategy {
-    /// `▲ long when chg15 < -3.2bp and vol50 > 1.1bp · out after 15 points, TP 4.0bp,
-    /// SL 3.0bp`.
+    pub fn one_way(side: Side, conds: Vec<Cond>, exit: Exit) -> Strategy {
+        let (long, short) = match side {
+            Side::Long => (conds, Vec::new()),
+            Side::Short => (Vec::new(), conds),
+        };
+        Strategy {
+            long,
+            short,
+            except: Vec::new(),
+            exit,
+        }
+    }
+
+    /// Every condition, in the order `trades` takes their values: long, short, except.
+    pub fn conds(&self) -> impl Iterator<Item = &Cond> {
+        self.long.iter().chain(&self.short).chain(&self.except)
+    }
+
+    /// `▲ long when z(price, 15) > 2.2 · ▼ short when z(price, 15) < -2.2 · except when
+    /// std(pct(price, 1), 50) > 3.1 · out after 15 points, TP 4.0bp, SL 3.0bp`.
     pub fn describe(&self, input: &Input) -> String {
-        let when = self
-            .conds
-            .iter()
-            .map(Cond::describe)
-            .collect::<Vec<_>>()
-            .join(" and ");
+        let mut parts = Vec::new();
+        if !self.long.is_empty() {
+            parts.push(format!("▲ long when {}", join_conds(&self.long)));
+        }
+        if !self.short.is_empty() {
+            parts.push(format!("▼ short when {}", join_conds(&self.short)));
+        }
+        if !self.except.is_empty() {
+            parts.push(format!("except when {}", join_conds(&self.except)));
+        }
         let mut out = format!("out after {}", input.points_text(self.exit.hold));
         if let Some(t) = self.exit.take {
             out += &format!(", TP {t:.1}bp");
@@ -703,29 +762,31 @@ impl Strategy {
         if let Some(s) = self.exit.stop {
             out += &format!(", SL {s:.1}bp");
         }
-        format!("{} when {when} · {out}", self.side_text())
-    }
-
-    pub fn side_text(&self) -> &'static str {
-        match self.side {
-            Side::Long => "▲ long",
-            Side::Short => "▼ short",
-        }
+        parts.push(out);
+        parts.join(" · ")
     }
 
     /// The same strategy, whatever its exits: for spotting repeats.
     pub fn key(&self) -> String {
-        let mut c: Vec<String> = self
-            .conds
-            .iter()
-            .map(|c| format!("{}{}", c.feature, if c.above { ">" } else { "<" }))
-            .collect();
-        c.sort();
-        format!("{:?} {}", self.side, c.join(" "))
+        let list = |c: &[Cond]| {
+            let mut v: Vec<String> = c
+                .iter()
+                .map(|c| format!("{}{}", c.feature, if c.above { ">" } else { "<" }))
+                .collect();
+            v.sort();
+            v.join(" ")
+        };
+        format!(
+            "L[{}] S[{}] X[{}]",
+            list(&self.long),
+            list(&self.short),
+            list(&self.except)
+        )
     }
 
     /// Trades entered in [from, to): one at a time, each ending at its exit (or still
-    /// open at the end of the data). `values[k]` are the values of `conds[k]`'s feature.
+    /// open at the end of the data). `values` are the conditions' features, in the
+    /// order of `conds()`.
     pub fn trades(
         &self,
         input: &Input,
@@ -737,15 +798,29 @@ impl Strategy {
         let liquidation = fees.liquidation();
         let max_take = fees.max_take();
         let n = input.len();
-        let long = self.side == Side::Long;
+        let (nl, ns) = (self.long.len(), self.short.len());
+        let (lv, rest) = values.split_at(nl.min(values.len()));
+        let (sv, xv) = rest.split_at(ns.min(rest.len()));
+        let all = |c: &[Cond], v: &[&[f64]], i: usize| {
+            !c.is_empty() && c.iter().zip(v).all(|(c, v)| c.holds(v[i]))
+        };
         let mut out = Vec::new();
         let mut i = from;
         while i < to.min(n) {
-            let enter = self.conds.iter().zip(values).all(|(c, v)| c.holds(v[i]));
-            if !enter {
+            let side = if self.except.iter().zip(xv).any(|(c, v)| c.holds(v[i])) {
+                None
+            } else if all(&self.long, lv, i) {
+                Some(Side::Long)
+            } else if all(&self.short, sv, i) {
+                Some(Side::Short)
+            } else {
+                None
+            };
+            let Some(side) = side else {
                 i += 1;
                 continue;
-            }
+            };
+            let long = side == Side::Long;
             let entry = if long {
                 input.buy_at(i)
             } else {
@@ -779,6 +854,8 @@ impl Strategy {
                     out.push(Trade {
                         entry: i,
                         exit: Some(j),
+                        side,
+                        gross: r,
                         net: fees.net(r),
                     });
                     i = j + 1;
@@ -786,10 +863,13 @@ impl Strategy {
                 None => {
                     // Still open at the newest point.
                     if i + 1 < n {
+                        let r = ret(n - 1);
                         out.push(Trade {
                             entry: i,
                             exit: None,
-                            net: fees.net(ret(n - 1)),
+                            side,
+                            gross: r,
+                            net: fees.net(r),
                         });
                     }
                     break;
@@ -800,14 +880,115 @@ impl Strategy {
     }
 }
 
+/// What it learned a strategy loses in: entering when `cond` holds, its trades did
+/// this badly (`removed`) and the rest this well (`kept`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Lesson {
+    pub cond: Cond,
+    pub removed: Perf,
+    pub kept: Perf,
+}
+
+/// The condition (a feature above or below a threshold) that best tells a strategy's
+/// losing trades from its winners: leaving out the trades entered while it held must
+/// clearly help what's left (t up by `gain`), keep at least half of them, and leave
+/// out trades that lost on average.
+pub fn adverse(
+    trades: &[Trade],
+    features: &[Expr],
+    values: &[Vec<f64>],
+    skip: &[&Expr],
+    gain: f64,
+) -> Option<Lesson> {
+    let closed: Vec<&Trade> = trades.iter().filter(|t| t.exit.is_some()).collect();
+    if closed.len() < 8 {
+        return None;
+    }
+    let base = Perf::of(&closed.iter().map(|t| t.net).collect::<Vec<_>>());
+    let mut best: Option<Lesson> = None;
+    for (f, v) in features.iter().zip(values) {
+        if skip.contains(&f) {
+            continue;
+        }
+        let at: Vec<(f64, f64)> = closed
+            .iter()
+            .map(|t| (v[t.entry], t.net))
+            .filter(|p| p.0.is_finite())
+            .collect();
+        if at.len() < closed.len() * 3 / 4 {
+            continue;
+        }
+        let mut xs: Vec<f64> = at.iter().map(|p| p.0).collect();
+        xs.sort_by(f64::total_cmp);
+        let mut tried_th = Vec::new();
+        for q in 1..10 {
+            let th = xs[xs.len() * q / 10];
+            if tried_th.contains(&th) {
+                continue;
+            }
+            tried_th.push(th);
+            for above in [true, false] {
+                let bad = |x: f64| if above { x > th } else { x < th };
+                let (out, kept): (Pairs, Pairs) = at.iter().partition(|p| bad(p.0));
+                if kept.len() * 2 < closed.len() || out.len() < 3 {
+                    continue;
+                }
+                let removed = Perf::of(&out.iter().map(|p| p.1).collect::<Vec<_>>());
+                let kept = Perf::of(&kept.iter().map(|p| p.1).collect::<Vec<_>>());
+                if removed.mean >= 0.0 || kept.t < base.t + gain {
+                    continue;
+                }
+                if best.as_ref().is_none_or(|b| kept.t > b.kept.t) {
+                    best = Some(Lesson {
+                        cond: Cond {
+                            feature: f.clone(),
+                            above,
+                            threshold: th,
+                        },
+                        removed,
+                        kept,
+                    });
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Points of (a feature's value, a trade's result).
+type Pairs<'a> = Vec<&'a (f64, f64)>;
+
+/// Why a strategy isn't paying (from its trades where it wasn't picked), and a fixed
+/// version when it found a condition it loses in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Review {
+    pub key: String,
+    pub why: String,
+    pub fix: Option<Found>,
+}
+
 /// A strategy and how it did.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Found {
     pub strategy: Strategy,
-    /// On the first 70% (where it was picked)…
+    /// On the learning half (where it was picked)…
     pub picked: Perf,
-    /// …and on the last 30%.
+    /// …and walking forward over the rest: all of it, and each stretch.
     pub checked: Perf,
+    pub steps: Vec<Perf>,
+}
+
+impl Found {
+    /// The walk-forward stretches it made money in, of those it traded in.
+    pub fn consistency(&self) -> Option<(usize, usize)> {
+        let of = self.steps.iter().filter(|p| p.n > 0).count();
+        let up = self
+            .steps
+            .iter()
+            .filter(|p| p.n > 0 && p.mean > 0.0)
+            .count();
+        (of > 0).then_some((up, of))
+    }
 }
 
 /// What a search found.
@@ -818,29 +999,218 @@ pub struct Report {
     pub formulas: usize,
     pub tests: usize,
     pub tried: usize,
-    /// The |t| theories needed on the first 70% to be listed: the strongest that luck
-    /// alone would give out of that many tests.
+    /// How it used the data: what it learned on, how it checked, the horizons and
+    /// tails.
+    pub layout: Layout,
+    /// The |t| theories needed on the learning half to be listed: the strongest that
+    /// luck alone would give out of that many tests.
     pub bar: f64,
     /// The average spread (bp), where there are bid and ask series.
     pub spread: f64,
     /// The costs it traded with.
     pub fees: Fees,
-    /// Holding over the first 70% and the last 30% (bp).
+    /// Holding over the learning half and the rest (bp).
     pub hold: [f64; 2],
     /// The best theories (held ones first).
     pub theories: Vec<Theory>,
-    /// The best strategies, ranked by the last 30%.
+    /// The best strategies, ranked by the weaker of the learning half and the
+    /// walk-forward.
     pub strategies: Vec<Found>,
     /// The fittest formulas (to start the next search from).
     pub pool: Vec<Scored>,
+    /// What it made of the strategies being paper-traded.
+    pub reviews: Vec<Review>,
     pub took: std::time::Duration,
 }
 
+/// What each part of a formula costs its fitness (in t): a bigger formula has to
+/// predict better to be kept. Small, since the walk-forward catches formulas that only
+/// fit the past, so deep formulas can win when they're really better.
+const SIZE_COST: f64 = 0.04;
 /// Formulas kept from one search to the next.
 const POOL: usize = 150;
 /// The best of them, tried as entries and filters for strategies.
 const FEATURES: usize = 40;
-const TAILS: [f64; 2] = [0.05, 0.15];
+
+// ───────────── how a search lays out the data ─────────────
+
+/// How a search uses the data: worked out from the data (its length, how much the
+/// price moves, what trading costs) each time it runs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Layout {
+    /// Formulas are invented, theories found and strategies picked on [0, learn): the
+    /// first half. For an edge that's really there, t grows with √trades, so the
+    /// weaker of the picked and checked t (what strategies are ranked by) is largest
+    /// when both halves are the same size.
+    pub learn: usize,
+    /// Then they're checked walking forward: on each stretch [cuts[k], cuts[k + 1]),
+    /// with their thresholds re-fitted on everything before it. As many stretches
+    /// (up to 5) as leave each one 30 spans of the longest horizon.
+    pub cuts: Vec<usize>,
+    /// Horizons (points ahead): from the shortest where the typical move is 4× what a
+    /// round trip costs, each about 3× the last; at most 1/60 of the learning half.
+    pub aheads: Vec<usize>,
+    /// The typical move (bp, one standard deviation) over each horizon.
+    pub moves: Vec<f64>,
+    /// The tails of a formula's range tried at each horizon (0.05: its lowest or
+    /// highest 5%): enough of the learning half that events h apart come up about 20
+    /// times per tail, between 2% and 10%, and 3× that.
+    pub tails: Vec<[f64; 2]>,
+    /// What a round trip costs (bp): the spread and fees, or with profit sharing the
+    /// move whose kept share pays the spread.
+    pub cost: f64,
+    /// No horizon the data allows moves enough to pay for that (so the longest are
+    /// used, and edges have to be large).
+    pub short_of_costs: bool,
+}
+
+impl Layout {
+    pub fn of(input: &Input, fees: &Fees) -> Layout {
+        let n = input.len();
+        let learn = n / 2;
+        let p = &input.price;
+        let spread = input.half_spread * 2.0 * 1e4;
+        let cost = match *fees {
+            Fees::Flat(f) => spread + 2.0 * f * 100.0,
+            Fees::Share { staked, .. } => spread / Fees::keep(0.0, staked),
+        };
+        // The typical move over h points, from spans that don't overlap.
+        let move_over = |h: usize| -> f64 {
+            let r: Vec<f64> = (0..learn.saturating_sub(h))
+                .step_by(h.max(1))
+                .map(|i| (p[i + h] / p[i] - 1.0) * 1e4)
+                .filter(|r| r.is_finite())
+                .collect();
+            Perf::of(&r).sd
+        };
+        let longest = (learn / 60).max(2);
+        // 2, 3, 4, 6, 9, 13, 20, 30, 45 … up to the longest the data allows.
+        let mut ladder = vec![2usize];
+        while let Some(&h) = ladder.last() {
+            let next = (h * 3).div_ceil(2);
+            if next > longest {
+                break;
+            }
+            ladder.push(next);
+        }
+        let moves: Vec<f64> = ladder.iter().map(|&h| move_over(h)).collect();
+        let first = ladder
+            .iter()
+            .zip(&moves)
+            .position(|(_, m)| *m >= 4.0 * cost);
+        let short_of_costs = first.is_none();
+        let start = first.unwrap_or(ladder.len().saturating_sub(1));
+        // About 3× apart (every third rung) from the start; closer together when the
+        // data runs out first, and shorter ones only when there aren't 4 above it.
+        let room = ladder.len() - start;
+        let mut picked: Vec<usize> = if room >= 10 {
+            (start..ladder.len()).step_by(3).take(4).collect()
+        } else {
+            let mut v: Vec<usize> = (0..4).map(|k| start + (room - 1) * k / 3).collect();
+            v.dedup();
+            v
+        };
+        let mut down = start;
+        while picked.len() < 4 && down > 0 {
+            down -= 1;
+            picked.insert(0, down);
+        }
+        let aheads: Vec<usize> = picked.iter().map(|&k| ladder[k]).collect();
+        let moves: Vec<f64> = picked.iter().map(|&k| moves[k]).collect();
+        let tails = aheads
+            .iter()
+            .map(|&h| {
+                let t = (20.0 * h as f64 / learn.max(1) as f64).clamp(0.02, 0.1);
+                [t, (3.0 * t).min(0.3)]
+            })
+            .collect();
+        let h_max = aheads.last().copied().unwrap_or(2);
+        let stretches = ((n - learn) / (30 * h_max)).clamp(1, 5);
+        let cuts = (0..=stretches)
+            .map(|k| learn + (n - learn) * k / stretches)
+            .collect();
+        Layout {
+            learn,
+            cuts,
+            aheads,
+            moves,
+            tails,
+            cost,
+            short_of_costs,
+        }
+    }
+
+    /// The walk-forward stretches, as (from, to).
+    pub fn stretches(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.cuts.windows(2).map(|w| (w[0], w[1]))
+    }
+
+    /// `learned on the first half (12,000 points), checked walking forward over 4
+    /// stretches · horizons 5s 15s 45s 2m · tails 2–30%`.
+    pub fn describe(&self, input: &Input) -> String {
+        let hs: Vec<String> = self.aheads.iter().map(|h| input.points_text(*h)).collect();
+        let lo = self.tails.iter().map(|t| t[0]).fold(1.0, f64::min);
+        let hi = self.tails.iter().map(|t| t[1]).fold(0.0, f64::max);
+        format!(
+            "learned on the first half ({} points), checked walking forward over {} stretch{} · horizons {}{} · tails {:.0}–{:.0}%",
+            self.learn,
+            self.cuts.len() - 1,
+            if self.cuts.len() == 2 { "" } else { "es" },
+            hs.join(" "),
+            if self.short_of_costs {
+                " (none moves 4× the costs yet)"
+            } else {
+                ""
+            },
+            lo * 100.0,
+            hi * 100.0
+        )
+    }
+}
+
+/// Sorted finite values of features over [0, to), kept for re-fitting thresholds.
+#[derive(Default)]
+struct Ranks {
+    sorted: std::collections::HashMap<(String, usize), Vec<f64>>,
+}
+
+impl Ranks {
+    fn of(&mut self, feature: &Expr, v: &[f64], to: usize) -> &[f64] {
+        self.sorted
+            .entry((feature.to_string(), to))
+            .or_insert_with(|| {
+                let mut s: Vec<f64> = v[..to.min(v.len())]
+                    .iter()
+                    .copied()
+                    .filter(|x| x.is_finite())
+                    .collect();
+                s.sort_by(f64::total_cmp);
+                s
+            })
+    }
+
+    /// `c` with its threshold at the same rank among the values before `to` as it had
+    /// among those before `learn`.
+    fn refit(&mut self, c: &Cond, v: &[f64], learn: usize, to: usize) -> Cond {
+        if to == learn {
+            return c.clone();
+        }
+        let base = self.of(&c.feature, v, learn);
+        if base.is_empty() {
+            return c.clone();
+        }
+        let q = base.partition_point(|x| *x < c.threshold) as f64 / base.len() as f64;
+        let now = self.of(&c.feature, v, to);
+        if now.is_empty() {
+            return c.clone();
+        }
+        let at = ((now.len() - 1) as f64 * q).round() as usize;
+        Cond {
+            threshold: now[at.min(now.len() - 1)],
+            ..c.clone()
+        }
+    }
+}
 
 /// How long a search may spend evolving formulas.
 #[derive(Debug, Clone, Copy)]
@@ -851,7 +1221,7 @@ pub struct Budget {
     pub seed: u64,
 }
 
-/// A formula and how well it predicts (on the first 70% only).
+/// A formula and how well it predicts (on the learning half only).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scored {
     pub expr: Expr,
@@ -864,30 +1234,35 @@ pub struct Scored {
 /// The parts of a search that look at the data.
 struct Lab<'a> {
     input: &'a Input,
-    split: usize,
+    learn: usize,
     aheads: Vec<usize>,
     fwd: Vec<Vec<f64>>,
 }
 
 impl Lab<'_> {
-    /// How strongly the price moves after the formula's tails, on the first 70%; `None`
-    /// for formulas that can't be used (mostly missing, constant, or drifting so the
-    /// last 30% isn't in the range the first 70% had).
+    /// How strongly the price moves after the formula's tails, on the learning half;
+    /// `None` for formulas that can't be used (mostly missing, constant, or drifting so
+    /// the rest isn't in the range the learning half had).
     fn fitness(&self, e: &Expr) -> Option<f64> {
-        if e.reach() * 4 > self.split || e.lopsided(self.input) {
+        if e.reach() * 4 > self.learn || e.lopsided(self.input) || e.ill_posed(self.input) {
             return None;
         }
         let v = e.eval(self.input);
-        let finite = v[..self.split].iter().filter(|x| x.is_finite()).count();
-        if finite * 2 < self.split {
+        // The price in disguise (an average of it, a lagged copy…): its tails are price
+        // levels ("below 77,189"), which only fit the past.
+        if level_like(&v, &self.input.price, self.learn) {
             return None;
         }
-        let q = quantiles(&v, 0, self.split, &[0.1, 0.9])?;
+        let finite = v[..self.learn].iter().filter(|x| x.is_finite()).count();
+        if finite * 2 < self.learn {
+            return None;
+        }
+        let q = quantiles(&v, 0, self.learn, &[0.1, 0.9])?;
         if q[0] >= q[1] {
             return None;
         }
         // Drifting (like the price itself): its tails would mean something else later.
-        let later: Vec<f64> = v[self.split..]
+        let later: Vec<f64> = v[self.learn..]
             .iter()
             .copied()
             .filter(|x| x.is_finite())
@@ -907,7 +1282,7 @@ impl Lab<'_> {
                     on,
                     &self.fwd[k],
                     0,
-                    self.split.saturating_sub(h),
+                    self.learn.saturating_sub(h),
                     h,
                 ));
                 if p.n >= 12 {
@@ -915,8 +1290,51 @@ impl Lab<'_> {
                 }
             }
         }
-        Some(best - 0.12 * e.size() as f64)
+        Some(best - SIZE_COST * e.size() as f64)
     }
+}
+
+/// With profit sharing: targets just past the ROI tiers (keep 90% past 500% ROI, 95%
+/// past 1,500%), held up to 10× the horizon, out at liquidation otherwise — wins kept
+/// almost whole, losses free of fees.
+fn tier_exits(fees: &Fees, h: usize) -> Vec<Exit> {
+    let Fees::Share { leverage, .. } = *fees else {
+        return Vec::new();
+    };
+    [500.0, 1500.0]
+        .into_iter()
+        .map(|roi| Exit {
+            hold: 10 * h,
+            take: Some(roi / leverage * 100.0 * 1.01),
+            stop: None,
+        })
+        .collect()
+}
+
+/// Whether `v` moves with the price's level (correlation above 0.9 over [0, to)).
+fn level_like(v: &[f64], price: &[f64], to: usize) -> bool {
+    let (mut n, mut sx, mut sy, mut sxx, mut syy, mut sxy) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    let base = price.first().copied().unwrap_or(0.0);
+    let vb = v.iter().copied().find(|x| x.is_finite()).unwrap_or(0.0);
+    for i in 0..to.min(v.len()) {
+        if !v[i].is_finite() {
+            continue;
+        }
+        let (x, y) = (v[i] - vb, price[i] - base);
+        n += 1.0;
+        sx += x;
+        sy += y;
+        sxx += x * x;
+        syy += y * y;
+        sxy += x * y;
+    }
+    if n < 10.0 {
+        return false;
+    }
+    let cov = sxy / n - sx / n * sy / n;
+    let vx = sxx / n - (sx / n).powi(2);
+    let vy = syy / n - (sy / n).powi(2);
+    vx > 0.0 && vy > 0.0 && (cov / (vx * vy).sqrt()).abs() > 0.9
 }
 
 /// The share of the smaller of two sorted lists of points that's in the other (within
@@ -953,7 +1371,12 @@ fn evolve(lab: &Lab, pool: &[Expr], budget: Budget) -> (Vec<Scored>, usize) {
     let mut pop: Vec<Scored> = Vec::new();
     let mut tried = 0;
     let mut add = |e: Expr, pop: &mut Vec<Scored>, tried: &mut usize| {
-        if e.depth() > 6 || e.size() > 16 || !seen.insert(e.to_string()) {
+        // Classics as they are; anything new has to make sense (its parts go together).
+        if e.depth() > 9
+            || e.size() > 30
+            || !(e.sensible() || classics.contains(&e))
+            || !seen.insert(e.to_string())
+        {
             return;
         }
         *tried += 1;
@@ -978,8 +1401,23 @@ fn evolve(lab: &Lab, pool: &[Expr], budget: Budget) -> (Vec<Scored>, usize) {
     for _ in 0..POOL {
         add(maker.random(&mut rng), &mut pop, &mut tried);
     }
+    // The fittest, but varied: at most 3 of a shape (the same operations with other
+    // windows or series) and a sixth of the pool with the same outer operation, so one
+    // idea (RSI of RSI…) can't crowd out the rest.
     let by_fitness = |pop: &mut Vec<Scored>| {
         pop.sort_by(|a, b| b.fitness.total_cmp(&a.fitness));
+        let mut shapes: std::collections::HashMap<String, usize> = Default::default();
+        let mut heads: std::collections::HashMap<String, usize> = Default::default();
+        pop.retain(|s| {
+            let shape = shapes.entry(s.expr.shape()).or_default();
+            let head = heads.entry(s.expr.head()).or_default();
+            if *shape >= 3 || *head >= POOL / 6 {
+                return false;
+            }
+            *shape += 1;
+            *head += 1;
+            true
+        });
         pop.truncate(POOL);
     };
     by_fitness(&mut pop);
@@ -995,8 +1433,13 @@ fn evolve(lab: &Lab, pool: &[Expr], budget: Budget) -> (Vec<Scored>, usize) {
         };
         for _ in 0..40 {
             let a = pick(&mut rng, &pop);
-            let child = match rng.below(10) {
+            let child = match rng.below(12) {
                 0..=3 => maker.mutate(&a, &mut rng),
+                // Built on two that work.
+                8 | 9 => {
+                    let b = pick(&mut rng, &pop);
+                    maker.compose(&a, &b, &mut rng)
+                }
                 4..=7 => {
                     let b = pick(&mut rng, &pop);
                     let c = maker.cross(&a, &b, &mut rng);
@@ -1018,21 +1461,33 @@ fn evolve(lab: &Lab, pool: &[Expr], budget: Budget) -> (Vec<Scored>, usize) {
 
 /// Search `input` for theories and strategies, evolving formulas from `pool` for at
 /// most `budget`.
-pub fn search(input: Input, fees: Fees, pool: &[Expr], budget: Budget) -> Result<Report, String> {
+/// What the lab brings to a search: the strategies it's paper-trading (to review), and
+/// the ones that failed live (not to be picked again).
+#[derive(Debug, Clone, Default)]
+pub struct Feedback {
+    pub review: Vec<Strategy>,
+    pub failed: Vec<String>,
+}
+
+pub fn search(
+    input: Input,
+    fees: Fees,
+    pool: &[Expr],
+    budget: Budget,
+    feedback: &Feedback,
+) -> Result<Report, String> {
     let started = std::time::Instant::now();
     let n = input.len();
     if n < MIN_POINTS {
         return Err(format!("{n} of the {MIN_POINTS} points it needs so far"));
     }
-    let split = (n as f64 * TRAIN) as usize;
-    let aheads: Vec<usize> = [5, 15, 50, 150]
-        .into_iter()
-        .filter(|h| h * 8 <= split)
-        .collect();
+    let layout = Layout::of(&input, &fees);
+    let learn = layout.learn;
+    let aheads = layout.aheads.clone();
     let fwd: Vec<Vec<f64>> = aheads.iter().map(|h| forward(&input.price, *h)).collect();
     let lab = Lab {
         input: &input,
-        split,
+        learn,
         aheads: aheads.clone(),
         fwd,
     };
@@ -1051,88 +1506,130 @@ pub fn search(input: Input, fees: Fees, pool: &[Expr], budget: Budget) -> Result
     }
     let values: Vec<Vec<f64>> = features.iter().map(|f| f.eval(&input)).collect();
     let spread = input.half_spread * 2.0 * 1e4;
+    let ranks: std::cell::RefCell<Ranks> = Default::default();
 
-    // Theories: each feature's tails, each horizon.
+    // Theories: each feature's tails, each horizon (with its own tails).
     let mut theories: Vec<Theory> = Vec::new();
     let mut tests = formulas * 2 * aheads.len();
     for (f, v) in features.iter().zip(&values) {
-        let Some(q) = quantiles(
-            v,
-            0,
-            split,
-            &[TAILS[0], TAILS[1], 1.0 - TAILS[1], 1.0 - TAILS[0]],
-        ) else {
-            continue;
-        };
-        for (above, tail, threshold) in [
-            (false, TAILS[0], q[0]),
-            (false, TAILS[1], q[1]),
-            (true, TAILS[1], q[2]),
-            (true, TAILS[0], q[3]),
-        ] {
-            let cond = Cond {
-                feature: f.clone(),
-                above,
-                threshold,
+        for (k, &h) in aheads.iter().enumerate() {
+            let [t1, t2] = layout.tails[k];
+            let Some(q) = quantiles(v, 0, learn, &[t1, t2, 1.0 - t2, 1.0 - t1]) else {
+                continue;
             };
-            for (k, &h) in aheads.iter().enumerate() {
+            for (above, tail, threshold) in [
+                (false, t1, q[0]),
+                (false, t2, q[1]),
+                (true, t2, q[2]),
+                (true, t1, q[3]),
+            ] {
+                let cond = Cond {
+                    feature: f.clone(),
+                    above,
+                    threshold,
+                };
                 tests += 1;
                 let on = |i: usize| cond.holds(v[i]);
-                let found = Perf::of(&events(on, &fwd[k], 0, split.saturating_sub(h), h));
+                let found = Perf::of(&events(on, &fwd[k], 0, learn.saturating_sub(h), h));
                 if found.n < 12 {
                     continue;
                 }
-                let checked = Perf::of(&events(on, &fwd[k], split, n, h));
+                // Walking forward: each stretch with the threshold re-fitted on
+                // everything before it.
+                let mut later = Vec::new();
+                for (from, to) in layout.stretches() {
+                    let c = ranks.borrow_mut().refit(&cond, v, learn, from);
+                    later.extend(events(|i| c.holds(v[i]), &fwd[k], from, to, h));
+                }
                 theories.push(Theory {
                     cond: cond.clone(),
                     tail,
                     ahead: h,
                     found,
-                    checked,
+                    checked: Perf::of(&later),
                 });
             }
         }
     }
     // The strongest |t| luck alone would give out of this many tests: theories must
-    // beat it on the first 70% to be listed.
+    // beat it on the learning half to be listed.
     let bar = (2.0 * (tests.max(2) as f64).ln()).sqrt().max(3.0);
 
-    // Strategies from theories that look like something (on the first 70%).
-    let index_of = |f: &Expr| {
-        features
-            .iter()
-            .position(|g| g == f)
-            .expect("a known feature")
+    // Strategies from theories that look like something (on the learning half).
+    let index_of = |f: &Expr| features.iter().position(|g| g == f);
+    // A strategy's features, computed here if it isn't one of ours (one under review).
+    let extra: std::cell::RefCell<Vec<(Expr, Vec<f64>)>> = Default::default();
+    let vals_of = |s: &Strategy| -> Vec<Vec<f64>> {
+        s.conds()
+            .map(|c| match index_of(&c.feature) {
+                Some(k) => values[k].clone(),
+                None => {
+                    let mut ex = extra.borrow_mut();
+                    if let Some(v) = ex.iter().find(|e| e.0 == c.feature) {
+                        return v.1.clone();
+                    }
+                    let v = c.feature.eval(&input);
+                    ex.push((c.feature.clone(), v.clone()));
+                    v
+                }
+            })
+            .collect()
+    };
+    let trades_of = |s: &Strategy, from: usize, to: usize| -> Vec<Trade> {
+        let vals = vals_of(s);
+        let refs: Vec<&[f64]> = vals.iter().map(Vec::as_slice).collect();
+        s.trades(&input, &refs, from, to, &fees)
+    };
+    let perf = |t: &[Trade]| -> Perf {
+        Perf::of(
+            &t.iter()
+                .filter(|t| t.exit.is_some())
+                .map(|t| t.net)
+                .collect::<Vec<_>>(),
+        )
+    };
+    let run = |s: &Strategy, from: usize, to: usize| perf(&trades_of(s, from, to));
+    // A strategy with its thresholds re-fitted on [0, to): at the same ranks.
+    let refit = |s: &Strategy, to: usize| -> Strategy {
+        let vals = vals_of(s);
+        let mut r = ranks.borrow_mut();
+        let mut v = vals.iter();
+        let mut fit = |cs: &[Cond]| -> Vec<Cond> {
+            cs.iter()
+                .map(|c| r.refit(c, v.next().expect("a value per condition"), learn, to))
+                .collect()
+        };
+        let long = fit(&s.long);
+        let short = fit(&s.short);
+        let except = fit(&s.except);
+        Strategy {
+            long,
+            short,
+            except,
+            exit: s.exit,
+        }
+    };
+    // Walking forward: each stretch traded with the thresholds re-fitted on everything
+    // before it. All of it, and each stretch.
+    let walk = |s: &Strategy| -> (Perf, Vec<Perf>) {
+        let mut all = Vec::new();
+        let mut each = Vec::new();
+        for (from, to) in layout.stretches() {
+            let t = trades_of(&refit(s, from), from, to);
+            each.push(perf(&t));
+            all.extend(t);
+        }
+        (perf(&all), each)
     };
     let mut seeds: Vec<&Theory> = theories.iter().filter(|t| t.found.t.abs() >= 2.0).collect();
     seeds.sort_by(|a, b| b.found.t.abs().total_cmp(&a.found.t.abs()));
     seeds.truncate(120);
     let mut tried = 0;
     let mut candidates: Vec<Found> = Vec::new();
-    let run = |s: &Strategy, from: usize, to: usize| -> Perf {
-        let vals: Vec<&[f64]> = s
-            .conds
-            .iter()
-            .map(|c| values[index_of(&c.feature)].as_slice())
-            .collect();
-        let nets: Vec<f64> = s
-            .trades(&input, &vals, from, to, &fees)
-            .into_iter()
-            .filter(|t| t.exit.is_some())
-            .map(|t| t.net)
-            .collect();
-        Perf::of(&nets)
-    };
-    for th in &seeds {
-        let side = if th.found.mean > 0.0 {
-            Side::Long
-        } else {
-            Side::Short
-        };
-        // Exits sized from the typical move over the horizon.
-        let typical = th.found.sd.max(0.01);
-        let h = th.ahead;
-        let exits = [
+    // Exits sized from the typical move over the horizon.
+    let exits = |typical: f64, h: usize| {
+        let typical = typical.max(0.01);
+        [
             Exit {
                 hold: h,
                 take: None,
@@ -1159,16 +1656,17 @@ pub fn search(input: Input, fees: Fees, pool: &[Expr], budget: Budget) -> Result
                 take: Some(3.0 * typical),
                 stop: Some(0.5 * typical),
             },
-        ];
+        ]
+        .into_iter()
+        .chain(tier_exits(&fees, h))
+        .collect::<Vec<_>>()
+    };
+    let mut best_exit = |make: &dyn Fn(Exit) -> Strategy, typical: f64, h: usize| {
         let mut best: Option<Found> = None;
-        for exit in exits {
-            let s = Strategy {
-                side,
-                conds: vec![th.cond.clone()],
-                exit,
-            };
+        for exit in exits(typical, h) {
+            let s = make(exit);
             tried += 1;
-            let picked = run(&s, 0, split);
+            let picked = run(&s, 0, learn);
             // It has to make money after costs where it was picked, and not by a fluke.
             if picked.n < MIN_TRADES || picked.t < MIN_T {
                 continue;
@@ -1178,82 +1676,103 @@ pub fn search(input: Input, fees: Fees, pool: &[Expr], budget: Budget) -> Result
                     strategy: s,
                     picked,
                     checked: Perf::default(),
+                    steps: Vec::new(),
                 });
             }
         }
-        if let Some(b) = best
-            && !candidates.iter().any(|c| c.strategy == b.strategy)
-        {
-            candidates.push(b);
+        best
+    };
+    for th in &seeds {
+        let side = if th.found.mean > 0.0 {
+            Side::Long
+        } else {
+            Side::Short
+        };
+        // One way: in the theory's direction.
+        let one = best_exit(
+            &|exit| Strategy::one_way(side, vec![th.cond.clone()], exit),
+            th.found.sd,
+            th.ahead,
+        );
+        // Both ways: the same formula's other extreme, when the price moves the other
+        // way after it (momentum or reversion either way).
+        let mirror = theories.iter().find(|m| {
+            m.cond.feature == th.cond.feature
+                && m.cond.above != th.cond.above
+                && m.tail == th.tail
+                && m.ahead == th.ahead
+                && m.found.mean.signum() == -th.found.mean.signum()
+                && m.found.t.abs() >= 1.5
+        });
+        let both = mirror.and_then(|m| {
+            let (up, down): (&Theory, &Theory) = if side == Side::Long { (th, m) } else { (m, th) };
+            best_exit(
+                &|exit| Strategy {
+                    long: vec![up.cond.clone()],
+                    short: vec![down.cond.clone()],
+                    except: Vec::new(),
+                    exit,
+                },
+                (th.found.sd + m.found.sd) / 2.0,
+                th.ahead,
+            )
+        });
+        for b in [one, both].into_iter().flatten() {
+            if !candidates.iter().any(|c| c.strategy == b.strategy) {
+                candidates.push(b);
+            }
         }
     }
-    // A filter from another feature, for the best of them.
+    // What the best of them lose in: the condition that tells their losing trades from
+    // their winners on the learning half (anything the formulas measure), left out.
     candidates.sort_by(|a, b| b.picked.t.total_cmp(&a.picked.t));
-    let terciles: Vec<Option<Vec<f64>>> = values
-        .iter()
-        .map(|v| quantiles(v, 0, split, &[1.0 / 3.0, 2.0 / 3.0]))
-        .collect();
-    let mut filtered = Vec::new();
+    let mut lessons = Vec::new();
     for base in candidates.iter().take(15) {
-        let mut best: Option<Found> = None;
-        for (k, f) in features.iter().enumerate() {
-            if base.strategy.conds.iter().any(|c| &c.feature == f) {
-                continue;
-            }
-            let Some(q) = &terciles[k] else { continue };
-            for (above, threshold) in [(false, q[0]), (true, q[1])] {
-                let mut s = base.strategy.clone();
-                s.conds.push(Cond {
-                    feature: f.clone(),
-                    above,
-                    threshold,
-                });
-                tried += 1;
-                let picked = run(&s, 0, split);
-                // Worth it only when clearly better, with enough trades left.
-                if picked.n < MIN_TRADES
-                    || picked.t < base.picked.t + 0.75
-                    || best.as_ref().is_some_and(|b| picked.t <= b.picked.t)
-                {
-                    continue;
-                }
-                best = Some(Found {
+        tried += 1;
+        let t = trades_of(&base.strategy, 0, learn);
+        let own: Vec<&Expr> = base.strategy.conds().map(|c| &c.feature).collect();
+        if let Some(l) = adverse(&t, &features, &values, &own, 0.75) {
+            let mut s = base.strategy.clone();
+            s.except.push(l.cond.clone());
+            let picked = run(&s, 0, learn);
+            if picked.n >= MIN_TRADES && picked.t > base.picked.t {
+                lessons.push(Found {
                     strategy: s,
                     picked,
                     checked: Perf::default(),
+                    steps: Vec::new(),
                 });
             }
         }
-        filtered.extend(best);
     }
-    candidates.extend(filtered);
-    // Check the most promising on the last 30%, and rank by that.
+    candidates.extend(lessons);
+    // Not the ones that already failed live.
+    candidates.retain(|c| !feedback.failed.contains(&c.strategy.key()));
+    // Check the most promising walking forward, and rank by that too.
     candidates.sort_by(|a, b| b.picked.t.total_cmp(&a.picked.t));
     candidates.truncate(40);
     for c in &mut candidates {
-        c.checked = run(&c.strategy, split, n);
+        (c.checked, c.steps) = walk(&c.strategy);
     }
     let rank = |c: &Found| {
         if c.checked.n == 0 {
-            f64::MIN
+            return f64::MIN;
+        }
+        let base = c.checked.t.min(c.picked.t);
+        // Up in fewer than half the stretches it traded in: one lucky stretch.
+        if c.consistency()
+            .is_some_and(|(up, of)| of >= 2 && up * 2 < of)
+        {
+            base - 1.0
         } else {
-            c.checked.t.min(c.picked.t)
+            base
         }
     };
     candidates.sort_by(|a, b| rank(b).total_cmp(&rank(a)));
     // One per idea: the same entries with other exits, or other formulas that enter at
     // the same moments, are left out.
-    let entries = |s: &Strategy| -> Vec<usize> {
-        let vals: Vec<&[f64]> = s
-            .conds
-            .iter()
-            .map(|c| values[index_of(&c.feature)].as_slice())
-            .collect();
-        s.trades(&input, &vals, 0, n, &fees)
-            .iter()
-            .map(|t| t.entry)
-            .collect()
-    };
+    let entries =
+        |s: &Strategy| -> Vec<usize> { trades_of(s, 0, n).iter().map(|t| t.entry).collect() };
     let mut strategies: Vec<(Found, Vec<usize>)> = Vec::new();
     for c in candidates {
         if strategies.len() >= 12 {
@@ -1271,9 +1790,83 @@ pub fn search(input: Input, fees: Fees, pool: &[Expr], budget: Budget) -> Result
         }
         strategies.push((c, at));
     }
-    let strategies: Vec<Found> = strategies.into_iter().map(|s| s.0).collect();
+    // What's paper-traded from now on: the thresholds re-fitted on all of the data.
+    let strategies: Vec<Found> = strategies
+        .into_iter()
+        .map(|(mut f, _)| {
+            f.strategy = refit(&f.strategy, n);
+            f
+        })
+        .collect();
 
-    // The theories to show: strong on the first 70%, those that held first.
+    // Reviews of what's being paper-traded: after the learning half (where it wasn't picked
+    // — and for an older one, also the newest data), why it isn't paying, and a fix
+    // when there's a condition it loses in.
+    let reviews: Vec<Review> = feedback
+        .review
+        .iter()
+        .map(|s| {
+            let all = trades_of(s, 0, n);
+            let later: Vec<Trade> = all.iter().filter(|t| t.entry >= learn).copied().collect();
+            let closed: Vec<&Trade> = later.iter().filter(|t| t.exit.is_some()).collect();
+            let gross = Perf::of(&closed.iter().map(|t| t.gross).collect::<Vec<_>>());
+            let net = perf(&later);
+            let before = perf(&all.iter().filter(|t| t.entry < learn).copied().collect::<Vec<_>>());
+            let own: Vec<&Expr> = s.conds().map(|c| &c.feature).collect();
+            // A lesson from every trade it made, so there are enough to learn from.
+            let lesson = adverse(&all, &features, &values, &own, 0.5);
+            let fix = lesson.as_ref().and_then(|l| {
+                let mut f = s.clone();
+                f.except.push(l.cond.clone());
+                let picked = run(&f, 0, learn);
+                let (checked, steps) = walk(&f);
+                (checked.n >= 3 && checked.mean > net.mean).then_some(Found {
+                    strategy: f,
+                    picked,
+                    checked,
+                    steps,
+                })
+            });
+            let why = if closed.len() < 5 {
+                "too few trades on the newest data to tell yet".to_string()
+            } else if net.mean > 0.0 && net.t >= 1.0 {
+                format!(
+                    "working: {:+.2}bp a trade on the newest data, {:+.2}bp before costs",
+                    net.mean, gross.mean
+                )
+            } else if gross.mean > 0.0 {
+                format!(
+                    "right about the direction ({:+.2}bp a trade before costs) but costs take {:.2}bp of it",
+                    gross.mean,
+                    gross.mean - net.mean
+                )
+            } else if before.mean > 0.0 {
+                format!(
+                    "the edge faded: {:+.2}bp a trade on the older data, {:+.2}bp before costs on the newest — it fitted the past",
+                    before.mean, gross.mean
+                )
+            } else {
+                format!("it doesn't predict here: {:+.2}bp a trade before costs", gross.mean)
+            };
+            let why = match &lesson {
+                Some(l) => format!(
+                    "{why}; it loses when {} ({} trades, {:+.2}bp each; the rest {:+.2}bp)",
+                    l.cond.describe(),
+                    l.removed.n,
+                    l.removed.mean,
+                    l.kept.mean
+                ),
+                None => why,
+            };
+            Review {
+                key: s.key(),
+                why,
+                fix,
+            }
+        })
+        .collect();
+
+    // The theories to show: strong on the learning half, those that held first.
     let mut shown: Vec<Theory> = theories
         .into_iter()
         .filter(|t| t.found.t.abs() >= bar)
@@ -1286,8 +1879,8 @@ pub fn search(input: Input, fees: Fees, pool: &[Expr], budget: Budget) -> Result
     // One per idea: not the same formula's side twice, nor two that pick the same
     // moments (`slope(price, 8)` and `gap(slope(price, 8), price)`).
     let fires = |c: &Cond| -> Vec<usize> {
-        let v = &values[index_of(&c.feature)];
-        (0..split).filter(|&i| c.holds(v[i])).collect()
+        let v = &values[index_of(&c.feature).expect("a theory's own feature")];
+        (0..learn).filter(|&i| c.holds(v[i])).collect()
     };
     let mut theories_out: Vec<(Theory, Vec<usize>)> = Vec::new();
     for t in shown {
@@ -1310,7 +1903,8 @@ pub fn search(input: Input, fees: Fees, pool: &[Expr], budget: Budget) -> Result
 
     let hold = |a: usize, b: usize| (input.price[b] / input.price[a] - 1.0) * 1e4;
     Ok(Report {
-        hold: [hold(0, split), hold(split, n - 1)],
+        hold: [hold(0, learn), hold(learn, n - 1)],
+        layout,
         formulas,
         tests,
         tried,
@@ -1319,6 +1913,7 @@ pub fn search(input: Input, fees: Fees, pool: &[Expr], budget: Budget) -> Result
         fees,
         theories: theories_out,
         strategies,
+        reviews,
         pool: evolved,
         took: started.elapsed(),
         input,
@@ -1327,7 +1922,7 @@ pub fn search(input: Input, fees: Fees, pool: &[Expr], budget: Budget) -> Result
 
 /// A strategy's trades over `input`, entering only after point `from`.
 pub fn trade(s: &Strategy, input: &Input, from: usize, fees: &Fees) -> Vec<Trade> {
-    let values: Vec<Vec<f64>> = s.conds.iter().map(|c| c.feature.eval(input)).collect();
+    let values: Vec<Vec<f64>> = s.conds().map(|c| c.feature.eval(input)).collect();
     let refs: Vec<&[f64]> = values.iter().map(Vec::as_slice).collect();
     s.trades(input, &refs, from, input.len(), fees)
 }
@@ -1337,6 +1932,15 @@ mod tests {
     use super::*;
     use crate::data::{Series, XKind};
     use crate::units::Unit;
+
+    /// A condition that always holds (with values of 1).
+    fn always() -> Cond {
+        Cond {
+            feature: Expr::Num(1.0),
+            above: true,
+            threshold: 0.0,
+        }
+    }
 
     fn budget() -> Budget {
         Budget {
@@ -1403,16 +2007,16 @@ mod tests {
     #[test]
     fn costs_come_off_every_trade() {
         let inp = input(vec![100.0; 50]);
-        let s = Strategy {
-            side: Side::Long,
-            conds: vec![],
-            exit: Exit {
+        let s = Strategy::one_way(
+            Side::Long,
+            vec![always()],
+            Exit {
                 hold: 5,
                 take: None,
                 stop: None,
             },
-        };
-        let t = s.trades(&inp, &[], 0, 50, &Fees::Flat(0.045));
+        );
+        let t = s.trades(&inp, &[&vec![1.0; inp.len()]], 0, 50, &Fees::Flat(0.045));
         assert!(t.iter().all(|t| (t.net + 9.0).abs() < 1e-9), "{t:?}");
         // Back to back: the next starts after the last ends.
         assert_eq!(t[1].entry, t[0].exit.unwrap() + 1);
@@ -1446,16 +2050,16 @@ mod tests {
         let mut p = vec![100.0; 10];
         p[3] = 99.5; // -50bp
         let inp = input(p);
-        let s = Strategy {
-            side: Side::Long,
-            conds: vec![],
-            exit: Exit {
+        let s = Strategy::one_way(
+            Side::Long,
+            vec![always()],
+            Exit {
                 hold: 8,
                 take: None,
                 stop: None,
             },
-        };
-        let t = s.trades(&inp, &[], 0, 1, &f);
+        );
+        let t = s.trades(&inp, &[&vec![1.0; inp.len()]], 0, 1, &f);
         assert_eq!(t[0].exit, Some(3));
         assert!((t[0].net + 40.0).abs() < 1e-9, "{t:?}");
     }
@@ -1497,7 +2101,7 @@ mod tests {
             };
             let mut b = budget();
             b.formulas = 6000;
-            let r = search(inp, fees, &[], b).unwrap();
+            let r = search(inp, fees, &[], b, &Feedback::default()).unwrap();
             eprintln!(
                 "\n=== {} · {} pts · {} formulas · bar {:.1} · hold {:+.1}bp / {:+.1}bp · {:?}",
                 fees.short(),
@@ -1507,6 +2111,12 @@ mod tests {
                 r.hold[0],
                 r.hold[1],
                 r.took
+            );
+            eprintln!(
+                "{} · moves {:?} · cost {:.2}bp",
+                r.layout.describe(&r.input),
+                r.layout.moves,
+                r.layout.cost
             );
             for s in r.strategies.iter().take(5) {
                 eprintln!(
@@ -1556,23 +2166,30 @@ mod tests {
             "ask".into(),
             vec![100.01; 20],
         ));
-        let s = Strategy {
-            side: Side::Short,
-            conds: vec![],
-            exit: Exit {
+        let s = Strategy::one_way(
+            Side::Short,
+            vec![always()],
+            Exit {
                 hold: 3,
                 take: None,
                 stop: None,
             },
-        };
-        let t = s.trades(&inp, &[], 0, 20, &Fees::Flat(0.0));
+        );
+        let t = s.trades(&inp, &[&vec![1.0; inp.len()]], 0, 20, &Fees::Flat(0.0));
         // Sold at 99.99, bought back at 100.01: about 2bp lost.
         assert!((t[0].net + 2.0).abs() < 0.01, "{:?}", t[0]);
     }
 
     #[test]
     fn finds_a_planted_edge_and_checks_it() {
-        let report = search(input(bouncy(12_000)), Fees::Flat(0.0), &[], budget()).unwrap();
+        let report = search(
+            input(bouncy(12_000)),
+            Fees::Flat(0.0),
+            &[],
+            budget(),
+            &Feedback::default(),
+        )
+        .unwrap();
         let best = &report.strategies[0];
         for s in &report.strategies {
             eprintln!(
@@ -1594,9 +2211,76 @@ mod tests {
             );
         }
         eprintln!("{} formulas, {:?}", report.formulas, report.took);
-        assert_eq!(best.strategy.side, Side::Long, "{:?}", best.strategy);
+        assert!(!best.strategy.long.is_empty(), "{:?}", best.strategy);
         assert!(best.checked.mean > 0.0 && best.checked.t > 2.0, "{best:?}");
         assert!(report.theories.iter().any(Theory::held));
+    }
+
+    #[test]
+    fn the_layout_comes_from_the_data() {
+        let p = bouncy(12_000);
+        let free = Layout::of(&input(p.clone()), &Fees::Flat(0.0));
+        assert_eq!(free.learn, 6_000);
+        assert_eq!(free.aheads[0], 2, "nothing to pay: from the shortest");
+        assert!(
+            free.aheads.windows(2).all(|w| w[1] >= w[0] * 2),
+            "{:?}",
+            free.aheads
+        );
+        assert!(*free.aheads.last().unwrap() <= 6_000 / 60);
+        assert!(free.cuts.len() > 2, "several stretches: {:?}", free.cuts);
+        assert_eq!(*free.cuts.last().unwrap(), 12_000);
+        // Paying more: longer horizons, where the typical move covers it.
+        let dear = Layout::of(&input(p.clone()), &Fees::Flat(0.01));
+        let sum = |l: &Layout| l.aheads.iter().sum::<usize>();
+        assert!(
+            sum(&dear) > sum(&free),
+            "{:?} {:?}",
+            dear.aheads,
+            free.aheads
+        );
+        assert!(
+            dear.aheads
+                .iter()
+                .zip(&dear.moves)
+                .any(|(h, m)| *h > 2 && *m >= 4.0 * dear.cost),
+            "{:?} {:?} {}",
+            dear.aheads,
+            dear.moves,
+            dear.cost
+        );
+        // Longer horizons get wider tails (enough events), within 2–30%.
+        assert!(free.tails.windows(2).all(|w| w[1][0] >= w[0][0]));
+        assert!(free.tails.iter().all(|t| t[0] >= 0.02 && t[1] <= 0.3));
+        // Less data: fewer stretches, shorter horizons.
+        let small = Layout::of(&input(p[..600].to_vec()), &Fees::Flat(0.0));
+        assert!(small.cuts.len() <= free.cuts.len());
+        assert!(small.aheads.last() <= free.aheads.last());
+        // Way too dear: says so.
+        let silly = Layout::of(&input(p), &Fees::Flat(5.0));
+        assert!(silly.short_of_costs);
+        assert!(silly.describe(&input(bouncy(600))).contains("4× the costs"));
+    }
+
+    #[test]
+    fn thresholds_are_refitted_at_the_same_rank() {
+        // A feature that drifts up: its lowest 10% so far moves up with it.
+        let v: Vec<f64> = (0..1000).map(|i| i as f64).collect();
+        let f = Expr::Col("price".into());
+        let c = Cond {
+            feature: f,
+            above: false,
+            threshold: 50.0,
+        };
+        let mut r = Ranks::default();
+        let same = r.refit(&c, &v, 500, 500);
+        assert_eq!(same.threshold, 50.0);
+        let later = r.refit(&c, &v, 500, 1000);
+        assert!(
+            (later.threshold - 100.0).abs() <= 1.0,
+            "{}",
+            later.threshold
+        );
     }
 
     #[test]
@@ -1610,7 +2294,14 @@ mod tests {
             let r = ((seed >> 33) % 1000) as f64 / 1000.0 - 0.5;
             p.push(p[i - 1] * (1.0 + r * 0.0004));
         }
-        let report = search(input(p), Fees::Flat(0.045), &[], budget()).unwrap();
+        let report = search(
+            input(p),
+            Fees::Flat(0.045),
+            &[],
+            budget(),
+            &Feedback::default(),
+        )
+        .unwrap();
         // Paying 9bp a round trip on noise: nothing makes money where it was picked.
         assert!(report.strategies.is_empty(), "{:?}", report.strategies);
         // Thousands of formulas tested on noise: the bar for a theory is that high.

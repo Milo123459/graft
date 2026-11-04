@@ -437,50 +437,103 @@ liquidated at −85% ROI (a 34bp move against you at 250x, 17bp at 500x).
 in at the ask, out at the bid (where there's no bid and ask, e.g. in history from
 elsewhere, the average spread around the price).
 
+**0. The layout comes from the data.** Nothing about how the data is used is fixed;
+each search works it out from what it has:
+
+- **learning and checking**: it learns on the first half and **walks forward** over
+  the second, in as many stretches (up to 5) as leave each one 30 spans of the longest
+  horizon. Each stretch is traded with the thresholds re-fitted on everything before
+  it — as trading it from then on would — so every point of the second half is
+  out-of-sample. Why half: for an edge that's really there, t grows with √trades, so
+  the weaker of the two t's (what strategies are ranked by) is largest when both
+  halves are the same size;
+- **horizons**: from the shortest where the typical move is 4× what a round trip costs
+  (spread and fees; with profit sharing the move whose kept share pays the spread),
+  each about 3× the last, at most 1/60 of the learning half. Expensive markets and
+  quiet ones look further ahead; if nothing the data allows moves enough, the panel
+  says so;
+- **tails**: for each horizon, enough of a formula's range that events h apart come
+  up about 20 times per tail (2% to 10%), and 3× that;
+- **thresholds are ranks**, not numbers: "in the lowest 5% so far". Re-fitting keeps
+  the rank, so a rule still means the same thing when the market drifts.
+
+The panel's second line shows the layout, e.g. *learned on the first half (12000
+points), checked walking forward over 2 stretches · horizons 18 s 27 s 62 s 2.3 min ·
+tails 3–30%*.
+
 **1. Formulas.** Signals are formulas in a small language over the series:
 `pct(price, 5)` (the change over 5 points, in bp), `z(…, 50)` (how many standard
 deviations from the 50-point average), `pos` (place in the range, 0–100), `lag diff
-mean ema std max min rsi slope`, `abs neg sign log`, `+ - * /` and `gap(a, b)` (a
-relative to b, in bp). Every value uses only points up to its own. The search starts
-from the usual indicators (as formulas) and 150 random ones, then evolves them:
-mutations (another window, another operation, a part replaced) and crossovers (a part
-of one swapped into another), keeping the fittest. A formula's **fitness** is how
-clearly the price moved one way after its extremes — its lowest and highest 10% — on
-the **first 70%** of the data only (the best |t| over 5, 15, 50 and 150 points ahead,
-less a little per part, so simpler wins ties). Formulas that drift out of the range
-they had (like the price itself: "price above 78,000" means something else tomorrow),
-or that add things of wildly different sizes, are thrown out. The best 150 carry over
-to the next search, so it keeps improving as data arrives.
+mean ema std max min rsi slope since_high since_low`, `abs neg sign log run`
+(`run`: the streak of moves one way), `+ - * /`, `gap(a, b)` (a relative to b, in bp),
+`corr(a, b, n)` and `motif(price, "++-")` (1 where the last moves had that shape). Every
+value uses only points up to its own.
+
+Every formula has a **kind** — a level (the price), a change in its units, bp,
+unitless around zero (z, corr), 0–100 (rsi, pos), 0–1 (a motif), a count of points —
+and whether it's always positive. New formulas whose parts don't go together are
+never tried, however well they'd happen to fit: a price plus an RSI, a level times
+anything, dividing by something that crosses zero, a % change or log of something
+that isn't a level, the sign of something always positive.
+
+The search starts from the usual indicators, 150 random formulas and **templates** —
+shapes traders use, with random parts: momentum in units of volatility
+(`pct(price, n) / std(pct(price, 1), m)`), a divergence between the price's trend and a
+signal's, a signal taken only with the trend (`z(…) * sign(slope(price, m))`), mean
+reversion weighted by how wild it is, acceleration, a short range against a long one,
+another series' surprise in the price's direction, a pattern in context. Then it
+evolves them: mutations (another window, another operation, a part replaced),
+crossovers (a part of one swapped into another), and **compositions** of two that
+already work — `z(A) + z(B)`, `z(A) * z(B)` (each matters only when the other is
+high), A only when B's sign agrees, `corr(A, B)`, how fast A changes — so deep
+formulas grow out of ones with a record rather than out of chance. A formula's
+**fitness** is how clearly the price moved one way after its extremes — its lowest and
+highest 10% — on the learning half only (the best |t| over the horizons, less 0.04 a
+part: deep formulas win when they really are better, and the walk-forward catches the
+ones that only fit the past). Formulas that drift out of the range they had (like the
+price itself: "price above 78,000" means something else tomorrow), that move with the
+price's level, or that add things of wildly different sizes, are thrown out. The best
+150 carry over to the next search, so it keeps improving as data arrives.
 
 **2. Theories** are its findings, each a statement you can check: *when this formula
-is in its lowest (or highest) 5% (or 15%), the price over the next h points moves this
-much on average*. For each of the fittest 40 formulas (plus the usual indicators), each
-tail and each h:
+is in its lowest (or highest) few %, the price over the next h points moves this much
+on average*. For each of the fittest 40 formulas (plus the usual indicators), each
+horizon and its tails:
 
-- the moments it holds on the first 70% are taken **at least h points apart**, so no
-  two overlap (overlapping windows would count the same move many times and inflate
-  the evidence);
+- the moments it holds on the learning half are taken **at least h points apart**, so
+  no two overlap (overlapping windows would count the same move many times and
+  inflate the evidence);
 - the price's change h points after each gives an average and a **t-statistic**: the
   average divided by its standard error (t = mean ÷ (sd ÷ √n)). Around 2 is "probably
   not luck" for one test — but it tests thousands, and the strongest of thousands of
   pure-noise tests has a |t| near √(2 ln N) (about 4.5 for 20,000). That's the **bar**:
   a theory is listed only above it;
-- then it's checked on the **last 30%**, which it never saw: **✓ held** when the move
-  there is the same way with t ≥ 2, else **✗ faded**.
+- then it's checked **walking forward** over the second half, which it never saw:
+  **✓ held** when the move there is the same way with t ≥ 2, else **✗ faded**.
 
 A theory is about the move, before costs — e.g. on 6 hours of BTC 1-second prices:
-*z(price, 15) > 1.53 (top 15%) → 5 s later +0.51bp (t 7.4, 761 times) · last 30%:
-+0.43bp (t 6.9) ✓ held* — real short-term momentum, but half a basis point.
+*z(price, 15) > 1.53 (top 15%) → 5 s later +0.51bp (t 7.4, 761 times) · walking
+forward: +0.43bp (t 6.9) ✓ held* — real short-term momentum, but half a basis point.
 
-**3. Strategies** trade the theories that cleared t 2 on the first 70%: in their
-direction, out after h points or at a take-profit / stop-loss sized from the usual move
-(several ways, including small stops with big targets, which profit sharing favours);
-the best 15 get one filter from another formula where that clearly helps. Every trade
-pays the costs above. A strategy must make money on the first 70% (t ≥ 1.5, at least 10
-trades) to be checked on the last 30%, and they're ranked by both. The best are then
-**paper-traded live** from the moment they're found — the only record the search
-never saw, so trust it most. The panel shows each one's first 70%, last 30% and live
-record (and, with leverage, the ROI a trade), ranked by the last 30% and live together.
+**3. Strategies** trade the theories that cleared t 2 on the learning half: in their
+direction — long, short, or both ways when the formula's other extreme moves the price
+the other way — out after h points or at a take-profit / stop-loss sized from the
+usual move (several ways, including small stops with big targets, and with profit
+sharing targets just past the ROI tiers); the best 15 learn one condition they lose in
+(**except when …**: what tells their losing trades from their winners). Every trade
+pays the costs above. A strategy must make money on the learning half (t ≥ 1.5, at
+least 10 trades) to be checked walking forward; it's ranked by the weaker of the two,
+less when it made money in fewer than half the stretches (one lucky stretch). What's
+then **paper-traded live**, from the moment it's found, has its thresholds re-fitted
+on all the data — the live record is the only one the search never saw, so trust it
+most. The panel shows each one's record where it was picked, walking forward (up in
+how many stretches) and live (and, with leverage, the ROI a trade).
+
+**4. Learning from what it trades.** Each search reviews the strategies being
+paper-traded: whether costs eat an edge that's there, whether it faded (it fitted the
+past) or never predicted, and what it loses in; a strategy with a fix is tried again
+with that condition left out (✎ in the panel). Ones that keep losing live are retired
+with what they learned, and never picked again.
 
 Tap a strategy (or `discover_pick(2)`) to draw its trades (▲/▼ in, • out with its
 result); **theories** switches the panel to them. **keep** (`discover_keep()`) turns a

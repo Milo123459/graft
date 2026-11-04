@@ -1287,36 +1287,68 @@ impl App {
         while taken(k, self) {
             k += 1;
         }
-        let mut conds = Vec::new();
-        let mut names = Vec::new();
-        for (j, c) in s.conds.iter().enumerate() {
-            let name = format!("disc{k}_{}", j + 1);
-            let line = crate::lines::CustomLine::parse(&format!(
-                "{name} = formula({:?})",
-                c.feature.to_string()
-            ))?;
-            self.session.custom.push(line);
-            self.hidden.insert(name.clone());
+        // Each formula a hidden line; each condition on it.
+        let mut names: Vec<String> = Vec::new();
+        let mut text_of = |c: &crate::discover::Cond, me: &mut Self| -> Result<String, String> {
+            let f = c.feature.to_string();
+            let j = match names.iter().position(|n| {
+                me.session
+                    .custom
+                    .iter()
+                    .any(|l| &l.name == n && l.expr == format!("formula({f:?})"))
+            }) {
+                Some(j) => j,
+                None => {
+                    let name = format!("disc{k}_{}", names.len() + 1);
+                    let line =
+                        crate::lines::CustomLine::parse(&format!("{name} = formula({f:?})"))?;
+                    me.session.custom.push(line);
+                    me.hidden.insert(name.clone());
+                    names.push(name);
+                    names.len() - 1
+                }
+            };
             let th = format!("{:.8}", c.threshold);
             let th = th.trim_end_matches('0').trim_end_matches('.');
-            conds.push(format!("{name} {} {th}", if c.above { ">" } else { "<" }));
-            names.push(name);
-        }
-        let long = s.side == crate::discover::Side::Long;
-        let label = format!("disc{k} {}", if long { "long" } else { "short" });
-        let spec = format!(
-            "{} => {label} | {}",
-            conds.join(" && "),
-            if long { "▲ lime" } else { "▼ red" }
-        );
-        let rule = crate::marks::MarkRule::parse(&spec)?;
-        self.mark_rules.push(rule);
+            Ok(format!(
+                "{} {} {th}",
+                names[j],
+                if c.above { ">" } else { "<" }
+            ))
+        };
+        let s = s.clone();
+        // Told as it was tested (exits and all), worked out before the chart changes.
         let exit = s.describe(&report.input);
         let exit = exit.split(" · ").last().unwrap_or("").to_string();
+        let mut except = Vec::new();
+        for c in &s.except {
+            except.push(format!("!({})", text_of(c, self)?));
+        }
+        let mut labels = Vec::new();
+        for (conds, side, style) in [(&s.long, "long", "▲ lime"), (&s.short, "short", "▼ red")]
+        {
+            if conds.is_empty() {
+                continue;
+            }
+            let mut parts = Vec::new();
+            for c in conds {
+                parts.push(text_of(c, self)?);
+            }
+            parts.extend(except.iter().cloned());
+            let label = format!("disc{k} {side}");
+            let rule = crate::marks::MarkRule::parse(&format!(
+                "{} => {label} | {style}",
+                parts.join(" && ")
+            ))?;
+            self.mark_rules.push(rule);
+            labels.push(format!("\"{label}\""));
+        }
+        let label = labels.join(" and ");
+        let first = labels.first().cloned().unwrap_or_default();
         let hold = s.exit.hold;
         self.rebuild(true);
         Ok(format!(
-            "kept as the marker rule \"{label}\" (lines {}, hidden) — it was tested as: {exit}. Try backtest(\"{label}\", {hold}), or notify on it from the markers menu (K)",
+            "kept as the marker rules {label} (lines {}, hidden) — it was tested as: {exit}. Try backtest({first}, {hold}), or notify on it from the markers menu (K)",
             names.join(", ")
         ))
     }
@@ -7910,7 +7942,8 @@ impl App {
                     style: Style,
                     hit: Option<Hit>,
                     rows: &mut Vec<(Line<'static>, Option<Hit>)>| {
-            for (k, l) in wrap(&text, w).into_iter().enumerate() {
+            // Room for the indent of the lines after the first.
+            for (k, l) in wrap(&text, w - 2).into_iter().enumerate() {
                 let l = if k == 0 { l } else { format!("  {l}") };
                 rows.push((Line::styled(l, style), hit));
             }
@@ -7947,6 +7980,7 @@ impl App {
                     None,
                     &mut rows,
                 );
+                push(r.layout.describe(&r.input), dim, None, &mut rows);
             }
         }
         let Some(report) = &lab.report else {
@@ -7955,7 +7989,7 @@ impl App {
         if self.lab_theories {
             push(
                 format!(
-                    "theories: |t| ≥ {:.1} on the first 70% (stronger than luck gives from {} tests), checked on the last 30%",
+                    "theories: |t| ≥ {:.1} on the learning half (stronger than luck gives from {} tests), checked walking forward",
                     report.bar, report.tests
                 ),
                 Style::default().add_modifier(Modifier::BOLD),
@@ -7985,7 +8019,7 @@ impl App {
             }
             push(
                 format!(
-                    "holding: first 70% {:+.1}bp, last 30% {:+.1}bp",
+                    "holding: learning half {:+.1}bp, the rest {:+.1}bp",
                     report.hold[0], report.hold[1]
                 ),
                 dim,
@@ -7997,73 +8031,107 @@ impl App {
         if lab.tracked.is_empty() {
             push(
                 format!(
-                    "no strategy has made money after costs ({}) on both the first 70% and the last 30% yet — it keeps looking as data comes in",
+                    "no strategy has made money after costs ({}) on both the learning half and walking forward yet — it keeps looking as data comes in",
                     report.fees.explain(report.spread)
                 ),
                 plain,
                 None,
                 &mut rows,
             );
-            return rows;
-        }
-        push(
-            "strategies: picked on the first 70%, checked on the last 30%, then paper-traded live · tap one for its trades".into(),
+        } else {
+            push(
+            "strategies: picked on the learning half, checked walking forward, then paper-traded live · tap one for its trades".into(),
             Style::default().add_modifier(Modifier::BOLD),
             None,
             &mut rows,
         );
-        for (i, t) in lab.tracked.iter().enumerate() {
-            let hit = Some(Hit::Lab(LabHit::Pick(i)));
-            let mut head = Style::default().fg(Color::White);
-            if i == lab.selected {
-                head = head.fg(Color::Yellow).add_modifier(Modifier::BOLD);
-            }
-            let mark = if i == lab.selected { "▸" } else { " " };
-            push(
-                format!(
-                    "{mark}{} {}",
-                    i + 1,
-                    t.found.strategy.describe(&report.input)
-                ),
-                head,
-                hit,
-                &mut rows,
-            );
-            let live = if t.live.n == 0 {
-                "live: no trades yet".to_string()
-            } else {
-                format!("live {}", t.live.brief())
-            };
-            let open = t
-                .open
-                .map_or(String::new(), |o| format!(" · in a trade {o:+.1}bp"));
-            // With leverage: what that is on the margin.
-            let roi = report
-                .fees
-                .roi(if t.live.n > 0 {
-                    t.live.mean
+            for (i, t) in lab.tracked.iter().enumerate() {
+                let hit = Some(Hit::Lab(LabHit::Pick(i)));
+                let mut head = Style::default().fg(Color::White);
+                if i == lab.selected {
+                    head = head.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+                }
+                let mark = if i == lab.selected { "▸" } else { " " };
+                push(
+                    format!(
+                        "{mark}{} {}",
+                        i + 1,
+                        t.found.strategy.describe(&report.input)
+                    ),
+                    head,
+                    hit,
+                    &mut rows,
+                );
+                let live = if t.live.n == 0 {
+                    "live: no trades yet".to_string()
                 } else {
-                    t.found.checked.mean
-                })
-                .map_or(String::new(), |r| format!(" · {r:+.1}% ROI a trade"));
-            let color = if t.live.n == 0 {
-                Color::Gray
-            } else if t.live.mean > 0.0 {
-                Color::LightGreen
-            } else {
-                Color::LightRed
-            };
+                    format!("live {}", t.live.brief())
+                };
+                let open = t
+                    .open
+                    .map_or(String::new(), |o| format!(" · in a trade {o:+.1}bp"));
+                // With leverage: what that is on the margin.
+                let roi = report
+                    .fees
+                    .roi(if t.live.n > 0 {
+                        t.live.mean
+                    } else {
+                        t.found.checked.mean
+                    })
+                    .map_or(String::new(), |r| format!(" · {r:+.1}% ROI a trade"));
+                let color = if t.live.n == 0 {
+                    Color::Gray
+                } else if t.live.mean > 0.0 {
+                    Color::LightGreen
+                } else {
+                    Color::LightRed
+                };
+                let steps = t
+                    .found
+                    .consistency()
+                    .filter(|c| c.1 > 1)
+                    .map_or(String::new(), |(up, of)| {
+                        format!(", up in {up} of {of} stretches")
+                    });
+                push(
+                    format!(
+                        "↳ picked {} · walking forward {}{steps} · {live}{open}{roi} · found in search {}",
+                        t.found.picked.brief(),
+                        t.found.checked.brief(),
+                        t.run
+                    ),
+                    Style::default().fg(color),
+                    hit,
+                    &mut rows,
+                );
+                if let Some(note) = &t.note {
+                    push(
+                        format!("  ✎ {note}"),
+                        Style::default().fg(Color::Cyan),
+                        hit,
+                        &mut rows,
+                    );
+                }
+                if let Some(why) = &t.why {
+                    push(
+                        format!("  ? {why}"),
+                        Style::default().fg(Color::Gray),
+                        hit,
+                        &mut rows,
+                    );
+                }
+            }
+        }
+        if !lab.lessons.is_empty() {
             push(
-                format!(
-                    "↳ first 70% {} · last 30% {} · {live}{open}{roi} · found in search {}",
-                    t.found.picked.brief(),
-                    t.found.checked.brief(),
-                    t.run
-                ),
-                Style::default().fg(color),
-                hit,
+                "learned (retired after losing live, not picked again):".into(),
+                Style::default().add_modifier(Modifier::BOLD),
+                None,
                 &mut rows,
             );
+            for l in &lab.lessons {
+                push(format!("• {l}"), dim, None, &mut rows);
+            }
         }
         rows
     }
@@ -9938,14 +10006,17 @@ pub(crate) mod tests {
             eprintln!("{s}");
         }
         assert!(s.contains("discover · fee 0% a side"), "{s}");
-        assert!(s.contains("first 70%") && s.contains("last 30%"), "{s}");
+        assert!(s.contains("picked") && s.contains("walking forward"), "{s}");
         assert!(s.contains("keep 1") && s.contains("theories"), "{s}");
         // The other view: theories.
         let (x, y) = find(&app, "theories");
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
         assert!(app.lab_theories);
         let s = screen_sized(&app, 46, 44);
-        assert!(s.contains("held") || s.contains("nothing stood out"), "{s}");
+        assert!(
+            s.contains("walking forward:") || s.contains("nothing stood out"),
+            "{s}"
+        );
         run(&mut app, "discover_pick(1)");
         assert!(!app.lab_theories);
         // Kept: formulas become hidden lines, entries a marker rule.
@@ -9956,7 +10027,7 @@ pub(crate) mod tests {
             .map(|n| n.text.clone())
             .unwrap_or_default();
         assert!(
-            note.starts_with("kept as the marker rule \"disc1 "),
+            note.starts_with("kept as the marker rules \"disc1 "),
             "{note}"
         );
         assert!(

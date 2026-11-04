@@ -1,17 +1,38 @@
 //! The viewer's discovery lab: reruns the search (`discover.rs`) in the background as
 //! data streams in, and paper-trades what it found from the moment it found it.
+//!
+//! It learns from what it trades: each search reviews the strategies being
+//! paper-traded (why one isn't paying: costs, an edge that faded, a condition it loses
+//! in) and tries a fixed version where it found one. A strategy that keeps losing live
+//! is retired with its lesson, and isn't picked again.
 
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use crate::data::Dataset;
-use crate::discover::{self, Budget, Found, Input, Perf, Report, Settings, Side};
+use crate::discover::{self, Budget, Feedback, Found, Input, Perf, Report, Settings, Side};
 use crate::formula::Expr;
 
 /// How long each search may evolve formulas.
 const SEARCH_TIME: Duration = Duration::from_secs(3);
 /// Strategies paper-traded at once.
 const TRACKED: usize = 8;
+/// Live trades before a losing strategy is retired.
+const RETIRE_AFTER: usize = 8;
+
+/// One of a tracked strategy's trades, for the record and the chart.
+#[derive(Debug, Clone, Copy)]
+pub struct PaperTrade {
+    pub entry: f64,
+    pub exit: Option<f64>,
+    pub side: Side,
+    pub net: f64,
+    /// Entered after the strategy was found.
+    pub live: bool,
+    /// The price at the entry and the exit.
+    pub y_in: f64,
+    pub y_out: Option<f64>,
+}
 
 /// A strategy being paper-traded since it was found.
 #[derive(Debug, Clone)]
@@ -24,14 +45,16 @@ pub struct Tracked {
     pub live: Perf,
     /// The trade it's in now (its return so far, bp).
     pub open: Option<f64>,
-    /// Every trade over the data: (entry x, exit x, return bp, live).
-    pub trades: Vec<(f64, Option<f64>, f64, bool)>,
-    /// The price at each trade's entry and exit (for drawing them).
-    pub prices: Vec<(f64, Option<f64>)>,
+    /// Every trade over the data.
+    pub trades: Vec<PaperTrade>,
+    /// Why it isn't paying (or that it is), from the latest search's review.
+    pub why: Option<String>,
+    /// How it came about, when it's a fix of another.
+    pub note: Option<String>,
 }
 
 impl Tracked {
-    /// Its record where it wasn't picked (the last 30%, then live), as one t-statistic.
+    /// Its record where it wasn't picked (walking forward, then live), as one t-statistic.
     pub fn score(&self) -> f64 {
         let (c, l) = (&self.found.checked, &self.live);
         let n = (c.n + l.n) as f64;
@@ -64,6 +87,10 @@ pub struct Lab {
     pool: Vec<Expr>,
     /// When the live results were last brought up to date, and for which data.
     refreshed: Option<(Instant, f64, usize)>,
+    /// Strategies that failed live (keys): not picked again.
+    failed: Vec<String>,
+    /// What it learned retiring them, newest first.
+    pub lessons: Vec<String>,
 }
 
 impl Lab {
@@ -80,6 +107,8 @@ impl Lab {
             selected: 0,
             pool: Vec::new(),
             refreshed: None,
+            failed: Vec::new(),
+            lessons: Vec::new(),
         }
     }
 
@@ -119,6 +148,14 @@ impl Lab {
                     let (tx, rx) = std::sync::mpsc::channel();
                     let fees = self.settings.fees;
                     let pool = self.pool.clone();
+                    let feedback = Feedback {
+                        review: self
+                            .tracked
+                            .iter()
+                            .map(|t| t.found.strategy.clone())
+                            .collect(),
+                        failed: self.failed.clone(),
+                    };
                     self.runs += 1;
                     let budget = Budget {
                         time: SEARCH_TIME,
@@ -126,7 +163,7 @@ impl Lab {
                         seed: 0x9e37_79b9_7f4a_7c15 ^ (self.runs as u64) ^ input.len() as u64,
                     };
                     std::thread::spawn(move || {
-                        let _ = tx.send(discover::search(input, fees, &pool, budget));
+                        let _ = tx.send(discover::search(input, fees, &pool, budget, &feedback));
                     });
                     self.worker = Some(rx);
                 }
@@ -160,33 +197,77 @@ impl Lab {
             .tracked
             .get(self.selected)
             .map(|t| t.found.strategy.key());
-        for f in report.strategies.iter().take(4) {
-            // Found again: its record on the newest data, but it keeps its live record.
-            if let Some(t) = self
+        let new = |found: Found, note: Option<String>, run: usize| Tracked {
+            found,
+            since,
+            run,
+            live: Perf::default(),
+            open: None,
+            trades: Vec::new(),
+            why: None,
+            note,
+        };
+        // What the review made of each one, and fixes to try.
+        for r in &report.reviews {
+            let Some(k) = self
                 .tracked
-                .iter_mut()
-                .find(|t| t.found.strategy == f.strategy)
+                .iter()
+                .position(|t| t.found.strategy.key() == r.key)
+            else {
+                continue;
+            };
+            self.tracked[k].why = Some(r.why.clone());
+            if let Some(fix) = &r.fix
+                && !self.failed.contains(&fix.strategy.key())
+                && !self
+                    .tracked
+                    .iter()
+                    .any(|t| t.found.strategy.key() == fix.strategy.key())
             {
-                t.found = f.clone();
+                let lesson = fix
+                    .strategy
+                    .except
+                    .last()
+                    .map_or(String::new(), discover::Cond::describe);
+                let note = format!("learned from #{}: not when {lesson}", k + 1);
+                self.tracked.push(new(fix.clone(), Some(note), self.runs));
+            }
+        }
+        for f in report.strategies.iter().take(4) {
+            // Found again (the same rules and exit, the thresholds maybe re-fitted): its
+            // record on the newest data. It keeps trading with the thresholds it had,
+            // so its live record stays what it really did.
+            if let Some(t) = self.tracked.iter_mut().find(|t| {
+                t.found.strategy.key() == f.strategy.key()
+                    && t.found.strategy.exit == f.strategy.exit
+            }) {
+                t.found.picked = f.picked;
+                t.found.checked = f.checked;
+                t.found.steps = f.steps.clone();
                 continue;
             }
             // Only strategies that held up where they weren't picked.
             if f.checked.n < 3 || f.checked.mean <= 0.0 {
                 continue;
             }
-            self.tracked.push(Tracked {
-                found: f.clone(),
-                since,
-                run: self.runs,
-                live: Perf::default(),
-                open: None,
-                trades: Vec::new(),
-                prices: Vec::new(),
-            });
+            self.tracked.push(new(f.clone(), None, self.runs));
         }
         self.report = Some(report);
         self.refreshed = None;
         self.refresh(ds);
+        self.rank(selected_key.clone());
+        // The same trades as a better one: only the better one stays.
+        let mut k = 1;
+        while k < self.tracked.len() {
+            let entries = |t: &Tracked| t.trades.iter().map(|p| p.entry).collect::<Vec<_>>();
+            let mine = entries(&self.tracked[k]);
+            let same = (0..k).any(|j| overlap_x(&entries(&self.tracked[j]), &mine) > 0.7);
+            if same && Some(self.tracked[k].found.strategy.key()) != selected_key {
+                self.tracked.remove(k);
+            } else {
+                k += 1;
+            }
+        }
         self.rank(selected_key);
         // Too many: the worst go (never the one on the chart).
         while self.tracked.len() > TRACKED {
@@ -215,6 +296,44 @@ impl Lab {
             .unwrap_or(0);
     }
 
+    /// Strategies that keep losing live go, each with what it learned (and it isn't
+    /// picked again).
+    fn retire(&mut self) {
+        let keep = self
+            .tracked
+            .get(self.selected)
+            .map(|t| t.found.strategy.key());
+        let mut k = 0;
+        while k < self.tracked.len() {
+            let t = &self.tracked[k];
+            let losing = t.live.n >= RETIRE_AFTER && t.live.mean < 0.0 && t.live.t < -0.5;
+            if !losing {
+                k += 1;
+                continue;
+            }
+            let t = self.tracked.remove(k);
+            let input = self.report.as_ref().map(|r| &r.input);
+            let what = input.map_or(t.found.strategy.key(), |i| t.found.strategy.describe(i));
+            self.failed.push(t.found.strategy.key());
+            self.lessons.insert(
+                0,
+                format!(
+                    "retired {what}: live {}{}",
+                    t.live.brief(),
+                    t.why.map(|w| format!(" — {w}")).unwrap_or_default()
+                ),
+            );
+            self.lessons.truncate(5);
+        }
+        self.selected = keep
+            .and_then(|k| {
+                self.tracked
+                    .iter()
+                    .position(|t| t.found.strategy.key() == k)
+            })
+            .unwrap_or(0);
+    }
+
     /// Paper trades on the newest data (at most once a second).
     fn refresh(&mut self, ds: &Dataset) -> Option<String> {
         if self.tracked.is_empty() {
@@ -231,46 +350,47 @@ impl Lab {
         let mut news = None;
         for (k, t) in self.tracked.iter_mut().enumerate() {
             let trades = discover::trade(&t.found.strategy, &input, 0, &self.settings.fees);
-            let before = t.trades.iter().filter(|r| r.3).count();
-            t.prices = trades
-                .iter()
-                .map(|r| (input.price[r.entry], r.exit.map(|e| input.price[e])))
-                .collect();
+            let before = t.trades.iter().filter(|r| r.live).count();
             t.trades = trades
                 .iter()
-                .map(|r| {
-                    (
-                        input.x[r.entry],
-                        r.exit.map(|e| input.x[e]),
-                        r.net,
-                        input.x[r.entry] > t.since,
-                    )
+                .map(|r| PaperTrade {
+                    entry: input.x[r.entry],
+                    exit: r.exit.map(|e| input.x[e]),
+                    side: r.side,
+                    net: r.net,
+                    live: input.x[r.entry] > t.since,
+                    y_in: input.price[r.entry],
+                    y_out: r.exit.map(|e| input.price[e]),
                 })
                 .collect();
             let live: Vec<f64> = t
                 .trades
                 .iter()
-                .filter(|r| r.3 && r.1.is_some())
-                .map(|r| r.2)
+                .filter(|r| r.live && r.exit.is_some())
+                .map(|r| r.net)
                 .collect();
             t.live = Perf::of(&live);
             t.open = t
                 .trades
                 .last()
-                .filter(|r| r.1.is_none() && r.3)
-                .map(|r| r.2);
-            let now = t.trades.iter().filter(|r| r.3).count();
-            if k == 0 && now > before && t.trades.last().is_some_and(|r| r.1.is_none()) {
-                let side = match t.found.strategy.side {
+                .filter(|r| r.exit.is_none() && r.live)
+                .map(|r| r.net);
+            let now = t.trades.iter().filter(|r| r.live).count();
+            if k == 0
+                && now > before
+                && let Some(last) = t.trades.last().filter(|r| r.exit.is_none())
+            {
+                let side = match last.side {
                     Side::Long => "▲ long",
                     Side::Short => "▼ short",
                 };
                 news = Some(format!(
                     "discover: the best strategy went {side} at {}",
-                    crate::discover::fmt_num(*input.price.last().unwrap_or(&0.0))
+                    crate::discover::fmt_num(last.y_in)
                 ));
             }
         }
+        self.retire();
         news
     }
 
@@ -284,7 +404,6 @@ impl Lab {
             return Vec::new();
         };
         let series = Some(report.input.name.clone());
-        let long = t.found.strategy.side == Side::Long;
         let mark = |x: f64, y: Option<f64>, label: String, symbol: &str, color: Color| {
             crate::render::Mark {
                 series: series.clone(),
@@ -300,24 +419,25 @@ impl Lab {
             }
         };
         let mut out = Vec::new();
-        for (k, &(entry, exit, net, live)) in t.trades.iter().enumerate() {
-            let (y_in, y_out) = t.prices.get(k).copied().unwrap_or((f64::NAN, None));
+        for p in &t.trades {
+            let long = p.side == Side::Long;
             let color = if long {
                 Color::LightGreen
             } else {
                 Color::LightRed
             };
             out.push(mark(
-                entry,
-                Some(y_in).filter(|v| v.is_finite()),
-                if live { "live".into() } else { String::new() },
+                p.entry,
+                Some(p.y_in).filter(|v| v.is_finite()),
+                if p.live { "live".into() } else { String::new() },
                 if long { "▲" } else { "▼" },
                 color,
             ));
-            if let Some(x) = exit {
+            if let Some(x) = p.exit {
+                let net = p.net;
                 out.push(mark(
                     x,
-                    y_out,
+                    p.y_out,
                     format!("{net:+.1}bp"),
                     "•",
                     if net > 0.0 { Color::Green } else { Color::Red },
@@ -326,4 +446,32 @@ impl Lab {
         }
         out
     }
+}
+
+/// The share of the smaller of two sorted lists of times found in the other (within a
+/// few points' time: the same moments).
+fn overlap_x(a: &[f64], b: &[f64]) -> f64 {
+    let small = a.len().min(b.len());
+    if small == 0 {
+        return 0.0;
+    }
+    let step = {
+        let mut d: Vec<f64> = a.windows(2).map(|w| w[1] - w[0]).collect();
+        d.sort_by(f64::total_cmp);
+        d.get(d.len() / 2).copied().unwrap_or(1.0)
+    };
+    let tol = step.clamp(1e-9, 5.0) * 3.0;
+    let (mut i, mut j, mut both) = (0, 0, 0);
+    while i < a.len() && j < b.len() {
+        if (a[i] - b[j]).abs() <= tol {
+            both += 1;
+            i += 1;
+            j += 1;
+        } else if a[i] < b[j] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    both as f64 / small as f64
 }
