@@ -724,7 +724,7 @@ pub const USAGE: &[(&str, &str, &str)] = &[
     (
         "chart",
         r#"chart("bar")"#,
-        "line scatter bar histogram sparkline stat candles",
+        "line scatter bar histogram sparkline stat candles book",
     ),
     (
         "front",
@@ -1279,6 +1279,7 @@ fn arg_choices_first(func: &str) -> &'static [&'static str] {
             "sparkline",
             "stat",
             "candles",
+            "book",
         ],
         "lines" => &["live", "avg", "median", "p95", "line"],
         "trend" => &["avg", "median", "p95", "fit", "off"],

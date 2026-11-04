@@ -6193,7 +6193,7 @@ impl App {
             }
             Action::Chart(k) => match ChartKind::from_str(&k, true) {
                 Ok(kind) => self.set_kind(kind),
-                Err(_) => self.say(format!("chart: there's no chart type '{k}' — line, scatter, bar, histogram, sparkline, stat or candles"), true),
+                Err(_) => self.say(format!("chart: there's no chart type '{k}' — line, scatter, bar, histogram, sparkline, stat, candles or book"), true),
             },
             Action::Front(names) => match self.opts.panes.as_mut() {
                 Some(p) => {
@@ -7936,6 +7936,7 @@ impl App {
             plots: Some(&self.plots),
             pane_focus: self.opts.panes.as_ref().map(|p| p.focus),
             sources: Some(&self.sub_views),
+            full: Some(&self.full),
         };
         self.chart_rect.set(chart);
         let opts = self.view_opts();
@@ -8813,9 +8814,14 @@ pub(crate) mod tests {
         assert!(s.contains("node1 58.8 GB"), "{s}");
         assert!(s.contains("▼ -1.97 GB"), "{s}");
         assert!(s.contains(" forecast ") && s.contains(" ● node1 "), "{s}");
-        for _ in 0..7 {
+        // Every chart type in turn (a book with no levels says what it needs), and round
+        // to the line again.
+        for _ in 0..ChartKind::value_variants().len() {
             key(&mut app, KeyCode::Char('t'));
-            screen(&app);
+            let s = screen(&app);
+            if app.opts.kind == ChartKind::Book {
+                assert!(s.contains("no order book"), "{s}");
+            }
         }
         assert_eq!(app.opts.kind, ChartKind::Line);
         // Phone-sized screens still render (toolbar wraps, stats columns drop).
@@ -8848,6 +8854,59 @@ pub(crate) mod tests {
         key(&mut app, KeyCode::Char('2'));
         assert!(app.hidden.contains("node2"));
         assert_eq!(key(&mut app, KeyCode::Char('q')), Transition::Quit);
+    }
+
+    #[test]
+    fn a_book_pane_shows_the_book_where_you_tap() {
+        // Hyperliquid's l2Book snapshots, a minute apart, the price going up by 10.
+        let path = std::env::temp_dir().join(format!("graft-book-{}.jsonl", std::process::id()));
+        let lines: Vec<String> = (0..3)
+            .map(|k| {
+                let mid = 100.0 + 10.0 * k as f64;
+                let level = |p: f64| format!(r#"{{"px":"{p}","sz":"2.5","n":3}}"#);
+                let bids: Vec<String> = (0..5).map(|i| level(mid - 1.0 - i as f64)).collect();
+                let asks: Vec<String> = (0..5).map(|i| level(mid + 1.0 + i as f64)).collect();
+                format!(
+                    r#"{{"coin":"BTC","time":{},"levels":[[{}],[{}]]}}"#,
+                    1_790_000_000_000u64 + 60_000 * k,
+                    bids.join(","),
+                    asks.join(",")
+                )
+            })
+            .collect();
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let mut app = app(&[
+            "graft",
+            path.to_str().unwrap(),
+            "--json",
+            "--time-field",
+            "time",
+            "--series",
+            "price:USD = (levels_0_0_px + levels_1_0_px) / 2",
+            "--select",
+            "price",
+            "--pane",
+            "price",
+            "--pane",
+            "kind=book",
+            "--layout",
+            "1 / 2",
+        ]);
+        // At a phone's width: the newest book, read from the raw fields --select leaves
+        // out of the chart.
+        let s = screen_sized(&app, 46, 30);
+        assert!(s.contains("bid 119") && s.contains("ask 121"), "{s}");
+        // Tap the heatmap at its left edge: the ladder shows the book back then.
+        let heat = *app.plots.borrow().last().unwrap();
+        let (x, y) = (heat.rect.x, heat.rect.y + 1);
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), x, y);
+        assert!(app.cursor.is_some());
+        let s = screen_sized(&app, 46, 30);
+        assert!(s.contains("bid 99") && s.contains("ask 101"), "{s}");
+        // copy cmd says how.
+        assert!(app.current_cli().to_args().join(" ").contains("kind=book"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //! interactive viewer and, via an off-screen buffer, by `--once`.
 
 pub mod ansi;
+pub mod book;
 pub mod panes;
 pub mod svg;
 
@@ -265,6 +266,8 @@ pub struct Overlay<'a> {
     pub pane_focus: Option<usize>,
     /// Data for panes with a `source=` of their own.
     pub sources: Option<&'a [SourceView]>,
+    /// Every series read, before `--select` (the `book` chart finds its levels here).
+    pub full: Option<&'a Dataset>,
 }
 
 /// Most rows the markers strip takes (the rest share the last one).
@@ -2749,6 +2752,8 @@ impl ChartWidget<'_> {
         };
         let (ds, opts) = pane_view(&src.ds, &base, pane);
         let mut overlay = self.overlay;
+        // Its own source's fields, not the main one's.
+        overlay.full = None;
         let overlaps = match (overlay.view, ds.x_range()) {
             (Some((a, b)), Some((lo, hi))) => lo <= b && hi >= a,
             (Some(_), None) => false,
@@ -2809,6 +2814,7 @@ impl Widget for ChartWidget<'_> {
                 | ChartKind::Bar
                 | ChartKind::Stat
                 | ChartKind::Candles
+                | ChartKind::Book
         ) && !self.opts.trends.is_empty()
         {
             let (ds, opts) = with_trend_series(self.ds, self.opts, self.overlay.hidden);
@@ -2823,6 +2829,7 @@ impl Widget for ChartWidget<'_> {
             ChartKind::Histogram => self.render_histogram(area, buf),
             ChartKind::Sparkline => self.render_sparklines(area, buf),
             ChartKind::Stat => self.render_stat_tiles(area, buf),
+            ChartKind::Book => self.render_book(area, buf),
         }
     }
 }
@@ -2830,12 +2837,14 @@ impl Widget for ChartWidget<'_> {
 /// Render a chart into an off-screen buffer.
 #[cfg(test)]
 pub fn render_to_buffer(ds: &Dataset, opts: &ChartOpts, width: u16, height: u16) -> Buffer {
-    render_with_sources(ds, opts, width, height, &[])
+    render_with_sources(ds, None, opts, width, height, &[])
 }
 
-/// Render a chart whose panes may show other sources.
+/// Render a chart whose panes may show other sources (`full`: every series read,
+/// before `--select`, for a book's levels).
 pub fn render_with_sources(
     ds: &Dataset,
+    full: Option<&Dataset>,
     opts: &ChartOpts,
     width: u16,
     height: u16,
@@ -2845,6 +2854,7 @@ pub fn render_with_sources(
     let mut buf = Buffer::empty(area);
     let overlay = Overlay {
         sources: Some(sources),
+        full,
         ..Overlay::default()
     };
     ChartWidget::new(ds, opts, overlay).render(area, &mut buf);

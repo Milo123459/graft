@@ -602,7 +602,7 @@ the longer it runs, the more book there is to learn from (until a recording reac
 back far enough, the price before it is Binance's). Searches take turns on all the data
 and on the newest stretch where the book series exist, once there are 10 minutes of
 them, so book signals get tried as soon as there's enough. Hyperliquid's taker fee is
-0.045% a side:
+0.045% a side. The pane under the price draws the book itself (`kind=book`, below):
 
 ```sh
 graft --stream https://api.hyperliquid.xyz/info --send '{"type":"l2Book","coin":"BTC"}' --every 1s --json --time-field time \
@@ -613,7 +613,25 @@ graft --stream https://api.hyperliquid.xyz/info --send '{"type":"l2Book","coin":
   --merge 'deep = --stream https://api.hyperliquid.xyz/info --send "{\"type\":\"l2Book\",\"coin\":\"BTC\",\"nSigFigs\":3}" --every 1s --json --time-field time --series "bids = levels_0_0_sz + levels_0_1_sz + levels_0_2_sz + levels_0_3_sz" --series "asks = levels_1_0_sz + levels_1_1_sz + levels_1_2_sz + levels_1_3_sz" --series "imbalance = (bids - asks) / (bids + asks)" --select imbalance,bids,asks --record ~/graft/hl-btc-deep.jsonl' \
   --merge 'binance = --stream wss://data-stream.binance.vision/ws/btcusdt@kline_1s --json --time-field k.t --replace --series "price = k_c" --series "vol = k_v" --series "buys = k_V" --series "trades = k_n" --select price' \
   --history '-c "curl -s \"https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1s&limit=1000&startTime={from_ms:1000s}&endTime={now_ms}\"" --json --time-field 0 --series "price:USD = c4" --series "binance.price = c4" --series "binance.vol = c5" --series "binance.buys = c9" --series "binance.trades = c8" --select price' \
-  --history-depth 24h --hide imbalance,micro,bids,asks,deep.imbalance,deep.bids,deep.asks,binance.price,binance.vol,binance.buys,binance.trades --discover 0.045 --marks-below --title 'BTC order-book lab'
+  --history-depth 24h --hide imbalance,micro,bids,asks,deep.imbalance,deep.bids,deep.asks,binance.price,binance.vol,binance.buys,binance.trades --discover 0.045 --marks-below \
+  --pane price --pane 'kind=book' --layout '1 / 2' --title 'BTC order-book lab'
+```
+
+**Seeing the book.** `-k book` (or a pane with `kind=book`, or `chart("book")` in the
+console, or **t** / the chart-type button until it says book) draws an order book from
+its levels: a price and a size field per level with the same name up to the last part
+(Hyperliquid's `levels.0.3.px` / `levels.0.3.sz`, Binance's `bids.3.0` / `bids.3.1`),
+found among everything the source reads, even fields `--select` leaves off the chart.
+The left side is the size resting at each price over time — green bids, red asks,
+brighter for more — with the mid price as a white line, so walls of size and where the
+price went through them show up; the right side is a ladder of the book now, or at the
+moment you tap on the left. The top line has the best bid and ask, the spread and the
+imbalance. It covers the book read in this run (a recording's replay brings back the
+chart's series, not every level).
+
+```sh
+graft --stream https://api.hyperliquid.xyz/info --send '{"type":"l2Book","coin":"BTC"}' --every 1s --json --time-field time \
+  --series 'price:USD = (levels_0_0_px + levels_1_0_px) / 2' --select price -k book
 ```
 
 **It never stops inventing.** Searches run one after another (3 s each) on every core
@@ -655,7 +673,7 @@ time. `{sum}` in `--stats-template` gives the total.
 
 | | |
 |---|---|
-| `-k line\|scatter\|bar\|histogram\|sparkline\|stat\|candles` | chart type (bar = latest values; stat = a tile per series with the value in big digits, its change, trend, target ETA and a sparkline — good as a pane above a chart; candles = candlesticks from series named open/high/low/close or o/h/l/c, else the first four, with any other series as lines over them) |
+| `-k line\|scatter\|bar\|histogram\|sparkline\|stat\|candles\|book` | chart type (bar = latest values; stat = a tile per series with the value in big digits, its change, trend, target ETA and a sparkline — good as a pane above a chart; candles = candlesticks from series named open/high/low/close or o/h/l/c, else the first four, with any other series as lines over them; book = an order book, see below) |
 | `--split` | one panel per series, each with its own y axis |
 | `--pane 'node1 kind=bar lines=live,avg'` | panes: several charts in one view (repeat `--pane`); each picks series (`*` = all), `kind=`, `lines=`, `front=` (series drawn on top of the others, e.g. an RSI over its 70/30 lines; `--front` without panes, `front("rsi14")` in the console), `source=` (another preset, saved profile or recent chart, with its own command and format) and `title=` (last: the rest of the spec; `{name}` fills in a source setting) |
 | `--layout '(1 \| 2) / 3'` | how panes are arranged: `\|` side by side, `/` stacked, `\|60%` sizes (default: two side by side, more in a grid) |

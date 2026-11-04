@@ -41,7 +41,7 @@ impl Pane {
             if let Some(v) = word.strip_prefix("kind=") {
                 pane.kind = Some(
                     <ChartKind as clap::ValueEnum>::from_str(v, true)
-                        .map_err(|_| format!("pane: unknown chart type '{v}' (line, scatter, bar, histogram, sparkline, stat, candles)"))?,
+                        .map_err(|_| format!("pane: unknown chart type '{v}' (line, scatter, bar, histogram, sparkline, stat, candles, book)"))?,
                 );
             } else if let Some(v) = word.strip_prefix("source=") {
                 pane.source = (!v.is_empty()).then(|| v.to_string());

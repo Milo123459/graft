@@ -395,7 +395,7 @@ fn run_once(
                 sub.view
             })
             .collect();
-        let buf = render::render_with_sources(&ds, opts, width, height, &views);
+        let buf = render::render_with_sources(&ds, Some(&full), opts, width, height, &views);
         out.write_all(render::ansi::to_ansi(&buf, color).as_bytes())?;
     }
     // A stats template or JSON format implies --stats.

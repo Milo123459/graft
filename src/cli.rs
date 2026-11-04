@@ -1032,6 +1032,9 @@ pub enum ChartKind {
     Stat,
     /// Candlesticks from open/high/low/close series; other series drawn as lines over them.
     Candles,
+    /// An order book from its levels' price and size fields (levels.0.0.px /
+    /// levels.0.0.sz …): resting size by price over time, and a ladder.
+    Book,
 }
 
 impl ChartKind {
@@ -1043,7 +1046,8 @@ impl ChartKind {
             Self::Histogram => Self::Sparkline,
             Self::Sparkline => Self::Stat,
             Self::Stat => Self::Candles,
-            Self::Candles => Self::Line,
+            Self::Candles => Self::Book,
+            Self::Book => Self::Line,
         }
     }
 
@@ -1056,6 +1060,7 @@ impl ChartKind {
             Self::Sparkline => "sparkline",
             Self::Stat => "stat",
             Self::Candles => "candles",
+            Self::Book => "book",
         }
     }
 }
