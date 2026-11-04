@@ -12,6 +12,11 @@ Run before every commit: `cargo fmt`, `cargo clippy --all-targets` (no warnings)
 - The viewer is used with a mouse, a keyboard and from a phone over ssh: everything
   must work at 46 columns, by tapping as well as by keys.
 - Every toolbar button has a console command (test: `every_button_has_a_console_command`).
+- **The UI and the console can do the same things.** Anything you can do in the UI
+  (a button, key, menu item, tap) must also be a console command (and, if it's a
+  setting, a CLI flag that starts the viewer that way); anything you can do with a
+  console command must also be reachable in the UI (a button, menu item or key, so it
+  works by tapping on a phone too). Add both sides in the same change.
 - **Keep the tutorial up to date.** Whenever you add or change something a user can
   see or do (a flag, key, button, menu, console function, chart type, source or
   parser), update `src/tutorial.rs` in the same change: keys and buttons go in the

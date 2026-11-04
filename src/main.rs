@@ -181,14 +181,27 @@ fn promote_dashboard(
 
 /// "No format given", listing the formats that fit a sample of the input.
 /// The first records of a stream (up to 50, or what came in 8 seconds).
+/// A stream's first messages, to see what it sends: up to 50, listening a second
+/// after the first (a busy feed fills that at once; a quiet one isn't waited on), or
+/// 8 seconds for one that sends nothing.
 pub fn sample_stream(spec: SourceSpec) -> Vec<String> {
-    let rx = source::spawn(spec);
-    let end = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    first_messages(&source::spawn(spec))
+}
+
+/// The first messages from `rx` (as `sample_stream` takes them).
+pub fn first_messages(rx: &std::sync::mpsc::Receiver<source::Event>) -> Vec<String> {
+    use std::time::{Duration, Instant};
+    let mut end = Instant::now() + Duration::from_secs(8);
     let mut lines = Vec::new();
     while lines.len() < 50 {
-        let left = end.saturating_duration_since(std::time::Instant::now());
+        let left = end.saturating_duration_since(Instant::now());
         match rx.recv_timeout(left) {
-            Ok(source::Event::Line(l, _)) => lines.push(l),
+            Ok(source::Event::Line(l, _)) => {
+                if lines.is_empty() {
+                    end = end.min(Instant::now() + Duration::from_secs(1));
+                }
+                lines.push(l);
+            }
             Ok(source::Event::Error(_) | source::Event::Eof) | Err(_) => break,
             Ok(source::Event::SampleDone) => {}
         }

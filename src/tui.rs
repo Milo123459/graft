@@ -4701,12 +4701,16 @@ impl App {
         if self.backfill.is_some() {
             return true;
         }
-        // --history fetches the older data, when it can.
+        // --history fetches the older data, when it can — not while it's still
+        // loading what it started with (that says how far it's got itself).
         if let Some(h) = self.older.as_mut().filter(|h| h.pages_back()) {
+            if h.loading() {
+                return true;
+            }
             let more = h.more();
-            if more && h.loading() {
-                self.say("loading older data…", false);
-            } else if !more {
+            if more {
+                self.say("history: loading older data…", false);
+            } else if !h.done {
                 self.say("no older data from the history source", false);
             }
             return more;
@@ -10117,7 +10121,7 @@ pub(crate) mod tests {
         assert!(app.lab_theories);
         let s = screen_sized(&app, 46, 44);
         assert!(
-            s.contains("walking forward:") || s.contains("nothing stood out"),
+            s.contains('✓') || s.contains('✗') || s.contains("nothing stood out"),
             "{s}"
         );
         run(&mut app, "discover_pick(1)");

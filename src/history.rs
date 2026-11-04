@@ -168,16 +168,47 @@ impl History {
             (Some(a), Some(b)) => b - a,
             _ => 0.0,
         };
+        let page_s = if self.pages == 1 { "" } else { "s" };
         if self.filling && covered < self.depth && self.pages < MAX_PAGES && self.more() {
-            return (true, None);
+            // How far it's got, page by page, so it's clearly moving.
+            return (
+                true,
+                Some((
+                    format!(
+                        "history: loading… {} of {} ({} page{page_s})",
+                        crate::time::fmt_duration(covered),
+                        crate::time::fmt_duration(self.depth),
+                        self.pages
+                    ),
+                    false,
+                )),
+            );
+        }
+        // Scrolled back for more: say what came.
+        if !self.filling {
+            let back = oldest.map_or(String::new(), |o| {
+                format!(
+                    ", back to {} ago",
+                    crate::time::fmt_ago(crate::time::now_secs() - o)
+                )
+            });
+            return (
+                true,
+                Some((
+                    format!(
+                        "history: older data loaded ({} in all{back})",
+                        crate::time::fmt_duration(covered)
+                    ),
+                    false,
+                )),
+            );
         }
         let news = self.filling.then(|| {
             (
                 format!(
-                    "history: {} loaded ({} page{})",
+                    "history: {} loaded ({} page{page_s})",
                     crate::time::fmt_duration(covered),
                     self.pages,
-                    if self.pages == 1 { "" } else { "s" }
                 ),
                 false,
             )
@@ -245,10 +276,14 @@ mod tests {
         let mut h = History::open(cmd, &chart, 3600.0).unwrap();
         assert!(h.pages_back());
         let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut news = Vec::new();
         while h.loading() && std::time::Instant::now() < end {
-            h.tick();
+            news.extend(h.tick().1.map(|n| n.0));
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        // It says how far it's got as it goes, then that it's loaded.
+        assert!(news.iter().any(|n| n.contains("loading… ")), "{news:?}");
+        assert!(news.last().unwrap().contains("loaded ("), "{news:?}");
         let span = h.newest().unwrap() - h.oldest().unwrap();
         assert!(span >= 3600.0, "{span}");
         assert!(h.pages >= 6, "{}", h.pages);
@@ -270,11 +305,17 @@ mod tests {
         // Scrolled back: one more page.
         let before = h.oldest().unwrap();
         assert!(h.more());
+        let mut said = None;
         while h.loading() {
-            h.tick();
+            said = said.or(h.tick().1);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(h.oldest().unwrap() < before);
+        let said = said.expect("it says when the older data has come").0;
+        assert!(
+            said.contains("older data loaded") && said.contains("back to"),
+            "{said}"
+        );
     }
 
     #[test]

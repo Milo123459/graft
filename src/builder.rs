@@ -162,6 +162,8 @@ pub struct Builder {
     sample_meta: Vec<crate::data::LineMeta>,
     from_command: bool,
     loading: Option<Receiver<Result<Vec<String>, String>>>,
+    /// A stream keeps sending after its sample: the newer messages, in batches.
+    more: Option<Receiver<Vec<String>>>,
     loaded_at: Option<Instant>,
     suggestions: Vec<Suggestion>,
     preview: Preview,
@@ -325,6 +327,7 @@ impl Builder {
             sample_meta: Vec::new(),
             from_command: false,
             loading: None,
+            more: None,
             loaded_at: None,
             suggestions: Vec::new(),
             preview: Preview::default(),
@@ -448,6 +451,7 @@ impl Builder {
                 }
                 // A file on another machine: sample it over ssh.
                 if self.cli.ssh.is_some() {
+                    self.more = None;
                     self.loading = Some(run_sample_command(
                         format!("head -n {SAMPLE_LINES} {}", crate::cli::shell_quote(&path)),
                         self.cli.ssh.clone(),
@@ -488,6 +492,7 @@ impl Builder {
                     self.from_command = true;
                     return self.sample_loaded();
                 }
+                self.more = None;
                 self.loading = Some(run_sample_command(cmd, self.cli.ssh.clone()));
                 self.message = Some(("running the command for a sample…".into(), false));
             }
@@ -511,15 +516,39 @@ impl Builder {
                     send: self.cli.send.iter().map(|m| fill(m)).collect(),
                 };
                 let (tx, rx) = mpsc::channel();
+                let (more_tx, more_rx) = mpsc::channel();
                 thread::spawn(move || {
-                    let lines = crate::sample_stream(spec);
-                    let _ = tx.send(if lines.is_empty() {
+                    let events = crate::source::spawn(spec);
+                    let lines = crate::first_messages(&events);
+                    let empty = lines.is_empty();
+                    let _ = tx.send(if empty {
                         Err("the stream sent nothing in 8 seconds (or couldn't connect)".into())
                     } else {
                         Ok(lines)
                     });
+                    if empty {
+                        return;
+                    }
+                    // Then what it sends next, a batch every half second, until the
+                    // builder stops listening (another source, or it's closed).
+                    loop {
+                        let until = Instant::now() + Duration::from_millis(500);
+                        let mut batch = Vec::new();
+                        while let Some(left) = until.checked_duration_since(Instant::now()) {
+                            match events.recv_timeout(left) {
+                                Ok(crate::source::Event::Line(l, _)) => batch.push(l),
+                                Ok(crate::source::Event::Eof) => return,
+                                Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                            }
+                        }
+                        if !batch.is_empty() && more_tx.send(batch).is_err() {
+                            return;
+                        }
+                    }
                 });
                 self.loading = Some(rx);
+                self.more = Some(more_rx);
                 self.message = Some(("listening to the stream for a sample…".into(), false));
             }
             Src::Stdin => {
@@ -785,6 +814,30 @@ impl Builder {
     }
 
     pub fn tick(&mut self) {
+        // A stream's newer messages: the sample keeps up (the newest SAMPLE_LINES), and
+        // so does the preview.
+        if self.loading.is_none()
+            && let Some(rx) = &self.more
+        {
+            let mut new = Vec::new();
+            loop {
+                match rx.try_recv() {
+                    Ok(batch) => new.extend(batch),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        self.more = None;
+                        break;
+                    }
+                }
+            }
+            if !new.is_empty() && self.src == Src::Stream {
+                self.sample.extend(new);
+                let over = self.sample.len().saturating_sub(SAMPLE_LINES);
+                self.sample.drain(..over);
+                self.sample_meta.clear();
+                self.refresh();
+            }
+        }
         if let Some(rx) = &self.loading {
             match rx.try_recv() {
                 Ok(Ok(lines)) => {
@@ -2366,6 +2419,42 @@ mod tests {
             b.message.as_ref().unwrap().1,
             "missing file is an error message"
         );
+    }
+
+    #[test]
+    fn a_busy_stream_is_sampled_in_about_a_second() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/feed", listener.local_addr().unwrap());
+        // A message every 200 ms, forever: it never fills 50 or closes.
+        thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n"
+                );
+                for i in 0.. {
+                    if write!(s, "data: {{\"p\":{i}}}\n\n").is_err() {
+                        break;
+                    }
+                    let _ = s.flush();
+                    thread::sleep(Duration::from_millis(200));
+                }
+            }
+        });
+        let start = Instant::now();
+        let lines = crate::sample_stream(crate::source::SourceSpec::Stream {
+            url,
+            send: Vec::new(),
+        });
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(lines.len() >= 3, "{lines:?}");
     }
 
     #[test]
