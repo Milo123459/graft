@@ -453,17 +453,18 @@ elsewhere, the average spread around the price).
 each search works it out from what it has:
 
 - **learning and checking**: it learns on the first half and **walks forward** over
-  the second, in as many stretches (up to 5) as leave each one 30 spans of the longest
+  the second, in as many stretches (up to 5) as leave each one 10 spans of the longest
   horizon. Each stretch is traded with the thresholds re-fitted on everything before
   it — as trading it from then on would — so every point of the second half is
   out-of-sample. Why half: for an edge that's really there, t grows with √trades, so
   the weaker of the two t's (what strategies are ranked by) is largest when both
   halves are the same size;
-- **horizons**: from the shortest where the typical move is 4× what a round trip costs
-  (spread and fees; with profit sharing the move whose kept share pays the spread),
-  each about 3× the last, at most 1/60 of the learning half. Expensive markets and
-  quiet ones look further ahead; if nothing the data allows moves enough, the panel
-  says so;
+- **horizons**: how long trades are held, spread over everything the data allows —
+  from 2 points up to 1/30 of the learning half, each about 3× the last (up to 6), so
+  quick trades and long holds are both tried. Costs don't choose them: every trade
+  pays the spread and fees, and walking forward says what's left. For longer holds give
+  it more data, or fewer points (24 hours of 1-second points reach about 24 minutes;
+  `--resample 5s --history-depth 3d`, about 2 hours);
 - **tails**: for each horizon, enough of a formula's range that events h apart come
   up about 20 times per tail (2% to 10%), and 3× that;
 - **thresholds are ranks**, not numbers: "in the lowest 5% so far". Re-fitting keeps

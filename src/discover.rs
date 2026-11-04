@@ -1136,10 +1136,11 @@ pub struct Layout {
     pub learn: usize,
     /// Then they're checked walking forward: on each stretch [cuts[k], cuts[k + 1]),
     /// with their thresholds re-fitted on everything before it. As many stretches
-    /// (up to 5) as leave each one 30 spans of the longest horizon.
+    /// (up to 5) as leave each one 10 spans of the longest horizon.
     pub cuts: Vec<usize>,
-    /// Horizons (points ahead): from the shortest where the typical move is 4× what a
-    /// round trip costs, each about 3× the last; at most 1/60 of the learning half.
+    /// Horizons (points ahead): spread over everything the data allows, from 2 points
+    /// to 1/30 of the learning half, each about 3× the last. Not chosen by what trading
+    /// costs: every trade pays them, and walking forward says what works.
     pub aheads: Vec<usize>,
     /// The typical move (bp, one standard deviation) over each horizon.
     pub moves: Vec<f64>,
@@ -1150,9 +1151,6 @@ pub struct Layout {
     /// What a round trip costs (bp): the spread and fees, or with profit sharing the
     /// move whose kept share pays the spread.
     pub cost: f64,
-    /// No horizon the data allows moves enough to pay for that (so the longest are
-    /// used, and edges have to be large).
-    pub short_of_costs: bool,
 }
 
 impl Layout {
@@ -1174,7 +1172,8 @@ impl Layout {
                 .collect();
             Perf::of(&r).sd
         };
-        let longest = (learn / 60).max(2);
+        // 30 spans of it in the learning half, at least.
+        let longest = (learn / 30).max(2);
         // 2, 3, 4, 6, 9, 13, 20, 30, 45 … up to the longest the data allows.
         let mut ladder = vec![2usize];
         while let Some(&h) = ladder.last() {
@@ -1184,30 +1183,23 @@ impl Layout {
             }
             ladder.push(next);
         }
-        let moves: Vec<f64> = ladder.iter().map(|&h| move_over(h)).collect();
-        let first = ladder
-            .iter()
-            .zip(&moves)
-            .position(|(_, m)| *m >= 4.0 * cost);
-        let short_of_costs = first.is_none();
-        let start = first.unwrap_or(ladder.len().saturating_sub(1));
-        // About 3× apart (every third rung) from the start; closer together when the
-        // data runs out first, and shorter ones only when there aren't 4 above it.
-        let room = ladder.len() - start;
-        let mut picked: Vec<usize> = if room >= 10 {
-            (start..ladder.len()).step_by(3).take(4).collect()
-        } else {
-            let mut v: Vec<usize> = (0..4).map(|k| start + (room - 1) * k / 3).collect();
-            v.dedup();
+        // About 3× apart (every third rung) down from the longest, and the shortest:
+        // quick trades and long holds alike. Fewer rungs: 4 spread over them.
+        let top = ladder.len() - 1;
+        let mut picked: Vec<usize> = if ladder.len() >= 10 {
+            let mut v: Vec<usize> = (0..=top).rev().step_by(3).take(6).collect();
+            // The shortest too, unless one next to it is in already.
+            if v.len() < 6 && v.last().is_some_and(|&k| k >= 2) {
+                v.push(0);
+            }
+            v.reverse();
             v
+        } else {
+            (0..4).map(|k| top * k / 3).collect()
         };
-        let mut down = start;
-        while picked.len() < 4 && down > 0 {
-            down -= 1;
-            picked.insert(0, down);
-        }
+        picked.dedup();
         let aheads: Vec<usize> = picked.iter().map(|&k| ladder[k]).collect();
-        let moves: Vec<f64> = picked.iter().map(|&k| moves[k]).collect();
+        let moves: Vec<f64> = aheads.iter().map(|&h| move_over(h)).collect();
         let tails = aheads
             .iter()
             .map(|&h| {
@@ -1216,7 +1208,7 @@ impl Layout {
             })
             .collect();
         let h_max = aheads.last().copied().unwrap_or(2);
-        let stretches = ((n - learn) / (30 * h_max)).clamp(1, 5);
+        let stretches = ((n - learn) / (10 * h_max)).clamp(1, 5);
         let cuts = (0..=stretches)
             .map(|k| learn + (n - learn) * k / stretches)
             .collect();
@@ -1227,7 +1219,6 @@ impl Layout {
             moves,
             tails,
             cost,
-            short_of_costs,
         }
     }
 
@@ -1243,16 +1234,11 @@ impl Layout {
         let lo = self.tails.iter().map(|t| t[0]).fold(1.0, f64::min);
         let hi = self.tails.iter().map(|t| t[1]).fold(0.0, f64::max);
         format!(
-            "learned on the first half ({} points), checked walking forward over {} stretch{} · horizons {}{} · tails {:.0}–{:.0}%",
+            "learned on the first half ({} points), checked walking forward over {} stretch{} · horizons {} · tails {:.0}–{:.0}%",
             self.learn,
             self.cuts.len() - 1,
             if self.cuts.len() == 2 { "" } else { "es" },
             hs.join(" "),
-            if self.short_of_costs {
-                " (none moves 4× the costs yet)"
-            } else {
-                ""
-            },
             lo * 100.0,
             hi * 100.0
         )
@@ -2396,34 +2382,26 @@ mod tests {
         let p = bouncy(12_000);
         let free = Layout::of(&input(p.clone()), &Fees::Flat(0.0));
         assert_eq!(free.learn, 6_000);
-        assert_eq!(free.aheads[0], 2, "nothing to pay: from the shortest");
+        assert!(free.aheads[0] <= 3, "from the shortest: {:?}", free.aheads);
         assert!(
             free.aheads.windows(2).all(|w| w[1] >= w[0] * 2),
             "{:?}",
             free.aheads
         );
-        assert!(*free.aheads.last().unwrap() <= 6_000 / 60);
-        assert!(free.cuts.len() > 2, "several stretches: {:?}", free.cuts);
-        assert_eq!(*free.cuts.last().unwrap(), 12_000);
-        // Paying more: longer horizons, where the typical move covers it.
-        let dear = Layout::of(&input(p.clone()), &Fees::Flat(0.01));
-        let sum = |l: &Layout| l.aheads.iter().sum::<usize>();
+        // …to the longest the data allows (a rung of the ladder below 1/30 of it).
+        let last = *free.aheads.last().unwrap();
         assert!(
-            sum(&dear) > sum(&free),
-            "{:?} {:?}",
-            dear.aheads,
+            last <= 6_000 / 30 && last * 3 / 2 > 6_000 / 30,
+            "{:?}",
             free.aheads
         );
-        assert!(
-            dear.aheads
-                .iter()
-                .zip(&dear.moves)
-                .any(|(h, m)| *h > 2 && *m >= 4.0 * dear.cost),
-            "{:?} {:?} {}",
-            dear.aheads,
-            dear.moves,
-            dear.cost
-        );
+        assert!(free.cuts.len() > 2, "several stretches: {:?}", free.cuts);
+        assert_eq!(*free.cuts.last().unwrap(), 12_000);
+        // What trading costs doesn't choose them (every trade pays it, and walking
+        // forward says what works), so dear or not, the same holds are tried.
+        let dear = Layout::of(&input(p.clone()), &Fees::Flat(0.5));
+        assert_eq!(dear.aheads, free.aheads);
+        assert!(dear.cost > free.cost);
         // Longer horizons get wider tails (enough events), within 2–30%.
         assert!(free.tails.windows(2).all(|w| w[1][0] >= w[0][0]));
         assert!(free.tails.iter().all(|t| t[0] >= 0.02 && t[1] <= 0.3));
@@ -2431,10 +2409,6 @@ mod tests {
         let small = Layout::of(&input(p[..600].to_vec()), &Fees::Flat(0.0));
         assert!(small.cuts.len() <= free.cuts.len());
         assert!(small.aheads.last() <= free.aheads.last());
-        // Way too dear: says so.
-        let silly = Layout::of(&input(p), &Fees::Flat(5.0));
-        assert!(silly.short_of_costs);
-        assert!(silly.describe(&input(bouncy(600))).contains("4× the costs"));
     }
 
     #[test]
