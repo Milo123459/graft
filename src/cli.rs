@@ -420,6 +420,15 @@ pub struct Cli {
     #[arg(long, value_name = "DURATION", value_parser = parse_duration, help_heading = "Analysis")]
     pub latency: Option<Duration>,
 
+    /// With --discover: which tab of the panel to show. Same as `discover_view("compare")`.
+    #[arg(long, value_name = "VIEW", value_enum, default_value_t = LabView::Strategies, help_heading = "Analysis")]
+    pub discover_view: LabView,
+
+    /// With --discover: what the compare tab sorts by (the most first; drawdown and
+    /// worst: the least). Same as `discover_sort("drawdown")`.
+    #[arg(long, value_name = "KEY", value_enum, default_value_t = LabSort::Rank, help_heading = "Analysis")]
+    pub discover_sort: LabSort,
+
     /// Print statistics and trends (slope, R², forecast) for each series.
     #[arg(short = 'S', long, help_heading = "Analysis")]
     pub stats: bool,
@@ -702,6 +711,14 @@ impl Cli {
         );
         opt("--discover", self.discover.map(|f| f.to_arg()));
         opt("--latency", self.latency.map(|l| fmt_secs(l.as_secs_f64())));
+        opt(
+            "--discover-view",
+            (self.discover_view != d.discover_view).then(|| value_name(self.discover_view)),
+        );
+        opt(
+            "--discover-sort",
+            (self.discover_sort != d.discover_sort).then(|| value_name(self.discover_sort)),
+        );
         opt("--book", self.book.clone());
         for m in &self.send {
             opt("--send", Some(m.clone()));
@@ -1036,6 +1053,84 @@ pub enum XMode {
     Index,
     /// Time each line was read.
     Arrival,
+}
+
+/// The discover panel's tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum LabView {
+    /// Each strategy: its rules and how it did, picked, walking forward and live.
+    #[default]
+    Strategies,
+    /// All of them side by side in a table, sorted by any column.
+    Compare,
+    /// Each one's running total, trade by trade, on one chart.
+    Equity,
+    /// Every strategy's trades, newest first.
+    Trades,
+    /// What the strategies are built from.
+    Theories,
+    /// What the reviews found and what was retired.
+    Lessons,
+}
+
+impl LabView {
+    pub const ALL: [LabView; 6] = [
+        LabView::Strategies,
+        LabView::Compare,
+        LabView::Equity,
+        LabView::Trades,
+        LabView::Theories,
+        LabView::Lessons,
+    ];
+
+    pub fn name(self) -> String {
+        value_name(self)
+    }
+}
+
+/// What the discover panel's compare tab sorts by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum LabSort {
+    /// The panel's own ranking (how sure it is, walking forward and live).
+    #[default]
+    Rank,
+    /// Made the most where it wasn't picked: walking forward plus live (bp).
+    Profit,
+    /// The smallest max drawdown first.
+    Drawdown,
+    /// Made the most live (paper-traded since it was found).
+    Live,
+    /// The best average trade.
+    Mean,
+    /// The surest: the highest t-statistic.
+    T,
+    /// The highest share of winners.
+    Won,
+    /// The most trades.
+    Trades,
+    /// Beats holding by the most.
+    Edge,
+    /// The mildest worst trade first.
+    Worst,
+}
+
+impl LabSort {
+    pub const ALL: [LabSort; 10] = [
+        LabSort::Rank,
+        LabSort::Profit,
+        LabSort::Drawdown,
+        LabSort::Live,
+        LabSort::Mean,
+        LabSort::T,
+        LabSort::Won,
+        LabSort::Trades,
+        LabSort::Edge,
+        LabSort::Worst,
+    ];
+
+    pub fn name(self) -> String {
+        value_name(self)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1408,6 +1503,16 @@ mod tests {
                 "10m",
                 "--kind",
                 "bar",
+            ],
+            &[
+                "graft",
+                "x.log",
+                "--discover",
+                "0",
+                "--discover-view",
+                "equity",
+                "--discover-sort",
+                "worst",
             ],
             &[
                 "graft",

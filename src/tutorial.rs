@@ -569,8 +569,12 @@ Most of what looks good fades: on real prices, few edges survive costs. That's t
                 "start or stop discovering: a panel lists the strategies found, each with how it did where it was picked, walking forward (up in how many stretches), how much better than holding, and live (in a trade now too), then what it risked: its max drawdown (the most its running total fell from a high), worst and best trade — with leverage also as % of the margin; tap one (or discover_pick(n)) to draw its trades: ▲/▼ in (labelled open while it's still in it: one trade at a time), • out with its result (and paper when the trade came after the strategy was found — paper-traded, not replayed from history)",
             ),
             (
-                "theories",
-                "in the panel: the theories instead (✓ held walking forward)",
+                "strategies / compare / equity / trades / theories / lessons",
+                "the panel's tabs (discover_view(\"compare\")): strategies — each one's rules and record; compare — all of them side by side in a table (what each made walking forward + live, its max drawdown, live, an average trade, t, won, trades, worst, best, vs holding, the trade it's in now), with the best at each up top; equity — each one's running total trade by trade on one chart, in its legend colour; trades — every paper trade, open ones first, then the newest; theories — what strategies are built from: when a formula is in a tail of its range, what the price did a while later (green: it held walking forward); lessons — each review's ? why and ✎ repair, and what was retired. Tap a row (or a legend line) to draw that strategy's trades; the wheel or ▲/▼ lines scroll a long tab",
+            ),
+            (
+                "sort: rank / profit / drawdown / live / mean / t / won / trades / edge / worst",
+                "on the compare tab: what the table sorts by (discover_sort(\"drawdown\")), the best first — the most made, the smallest drawdown, the mildest worst trade; ▾ marks the column. At 46 columns it keeps the columns that fit and says which a wider screen adds",
             ),
             (
                 "keep N",
@@ -605,6 +609,10 @@ Most of what looks good fades: on real prices, few edges survive costs. That's t
             (
                 "--discover 0 --latency 300ms",
                 "no fees, but every order fills 300 ms after it's sent (latency(\"300ms\") in the console, latency(false) for at once)",
+            ),
+            (
+                r#":discover_view("compare")  :discover_sort("drawdown")"#,
+                "the compare tab, smallest drawdown first; --discover-view compare --discover-sort drawdown opens it that way",
             ),
             (
                 r#"--line 'f = formula("z(pct(api, 5), 50)")'"#,

@@ -404,6 +404,15 @@ impl Input {
         d.get(d.len() / 2).copied().unwrap_or(1.0)
     }
 
+    /// `3s` (with times), else `15pt`: for tables.
+    pub fn points_short(&self, n: usize) -> String {
+        if self.time {
+            crate::time::fmt_duration_compact(n as f64 * self.step())
+        } else {
+            format!("{n}pt")
+        }
+    }
+
     /// `15 points (3s)`.
     pub fn points_text(&self, n: usize) -> String {
         let pts = format!("{n} point{}", if n == 1 { "" } else { "s" });

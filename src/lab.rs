@@ -63,6 +63,118 @@ impl PaperTrade {
     }
 }
 
+/// One strategy's numbers, to set beside the others': where it wasn't picked
+/// (walking forward, then live), all together.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Compared {
+    /// Its place in `tracked` (the panel's ranking).
+    pub index: usize,
+    /// Walking forward plus live, added up (bp).
+    pub profit: f64,
+    pub live: Perf,
+    /// The larger of its max drawdowns walking forward and live (bp).
+    pub drawdown: f64,
+    /// An average trade (bp), how sure that is (t), and the share that won.
+    pub mean: f64,
+    pub t: f64,
+    pub won: f64,
+    pub trades: usize,
+    pub worst: f64,
+    pub best: f64,
+    /// Beats holding by, a trade walking forward (bp before costs).
+    pub edge: f64,
+    /// The trade it's in now (bp so far).
+    pub open: Option<f64>,
+}
+
+impl Tracked {
+    pub fn compared(&self, index: usize) -> Compared {
+        let (c, l) = (&self.found.checked, &self.live);
+        let n = c.n + l.n;
+        let both = [c, l];
+        let some = || both.iter().filter(|p| p.n > 0);
+        let profit = c.total + l.total;
+        let mean = if n > 0 { profit / n as f64 } else { 0.0 };
+        // Pooled spread: each part's own, and how far its average is from the whole's.
+        let var = if n > 1 {
+            some()
+                .map(|p| p.n as f64 * (p.sd.powi(2) + (p.mean - mean).powi(2)))
+                .sum::<f64>()
+                / n as f64
+        } else {
+            0.0
+        };
+        let t = if var > 0.0 {
+            mean / (var.sqrt() / (n as f64).sqrt())
+        } else {
+            0.0
+        };
+        Compared {
+            index,
+            profit,
+            live: *l,
+            drawdown: c.drawdown.max(l.drawdown),
+            mean,
+            t,
+            won: if n > 0 {
+                (c.win * c.n as f64 + l.win * l.n as f64) / n as f64
+            } else {
+                0.0
+            },
+            trades: n,
+            worst: some().map(|p| p.worst).fold(0.0, f64::min),
+            best: some().map(|p| p.best).fold(0.0, f64::max),
+            edge: self.found.edge.mean,
+            open: self.open,
+        }
+    }
+
+    /// Its running total after each trade it got out of (exit x, bp), over all the
+    /// data loaded.
+    pub fn equity(&self) -> Vec<(f64, f64)> {
+        let mut total = 0.0;
+        self.trades
+            .iter()
+            .filter_map(|p| {
+                let x = p.exit?;
+                total += p.net;
+                Some((x, total))
+            })
+            .collect()
+    }
+}
+
+/// The strategies side by side, sorted by `by` (the best first: the most made, the
+/// smallest drawdown, the mildest worst trade…; ties in the panel's order).
+pub fn compare(tracked: &[Tracked], by: crate::cli::LabSort) -> Vec<Compared> {
+    use crate::cli::LabSort as S;
+    let mut v: Vec<Compared> = tracked
+        .iter()
+        .enumerate()
+        .map(|(i, t)| t.compared(i))
+        .collect();
+    let key = |c: &Compared| -> f64 {
+        // No trades yet: nothing to compare, so last.
+        if c.trades == 0 && by != S::Rank {
+            return f64::NEG_INFINITY;
+        }
+        match by {
+            S::Rank => -(c.index as f64),
+            S::Profit => c.profit,
+            S::Drawdown => -c.drawdown,
+            S::Live => c.live.total,
+            S::Mean => c.mean,
+            S::T => c.t,
+            S::Won => c.won,
+            S::Trades => c.trades as f64,
+            S::Edge => c.edge,
+            S::Worst => c.worst,
+        }
+    };
+    v.sort_by(|a, b| key(b).total_cmp(&key(a)).then(a.index.cmp(&b.index)));
+    v
+}
+
 /// How many of the price's newest points have every series that starts later than it
 /// (a live order book, say, with no history behind it), when that's a stretch worth
 /// searching on its own: at least 600 points, and not nearly all of them anyway.

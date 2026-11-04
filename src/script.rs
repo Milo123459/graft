@@ -92,6 +92,10 @@ pub enum Action {
     Latency(Option<f64>),
     /// Show discovered strategy n's trades on the chart.
     DiscoverPick(usize),
+    /// `discover_view("compare")`: the discover panel's tab.
+    DiscoverView(crate::cli::LabView),
+    /// `discover_sort("drawdown")`: what its compare tab sorts by.
+    DiscoverSort(crate::cli::LabSort),
     /// What a series did after a rule's markers: (rule, series, after).
     Backtest(
         crate::backtest::RuleRef,
@@ -889,6 +893,16 @@ pub const USAGE: &[(&str, &str, &str)] = &[
         "show discovered strategy 2's trades on the chart",
     ),
     (
+        "discover_view",
+        r#"discover_view("compare")"#,
+        "the discover panel's tab (as --discover-view): strategies, compare (side by side), equity (running totals), trades, theories or lessons",
+    ),
+    (
+        "discover_sort",
+        r#"discover_sort("drawdown")"#,
+        "what the compare tab sorts by (as --discover-sort): rank, profit, drawdown, live, mean, t, won, trades, edge or worst",
+    ),
+    (
         "discover_keep",
         "discover_keep()  ·  discover_keep(2)",
         "keep a discovered strategy: its formulas as lines, its entries as a marker rule",
@@ -1074,6 +1088,8 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "latency",
             "discover_pick",
             "discover_keep",
+            "discover_view",
+            "discover_sort",
         ],
     ),
     ("alerts", &["alert", "unalert", "notify_to", "notify_off"]),
@@ -2904,6 +2920,26 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
     let st = state.clone();
     engine.register_fn("discover_pick", move |n: i64| {
         push(&st, Action::DiscoverPick(n.max(0) as usize))
+    });
+    let st = state.clone();
+    engine.register_fn("discover_view", move |v: &str| -> FnResult<()> {
+        use clap::ValueEnum;
+        let view = crate::cli::LabView::from_str(v, true).map_err(|_| {
+            let all: Vec<String> = crate::cli::LabView::ALL.iter().map(|v| v.name()).collect();
+            format!("discover_view: '{v}' isn't one of {}", all.join(", "))
+        })?;
+        push(&st, Action::DiscoverView(view));
+        Ok(())
+    });
+    let st = state.clone();
+    engine.register_fn("discover_sort", move |v: &str| -> FnResult<()> {
+        use clap::ValueEnum;
+        let sort = crate::cli::LabSort::from_str(v, true).map_err(|_| {
+            let all: Vec<String> = crate::cli::LabSort::ALL.iter().map(|v| v.name()).collect();
+            format!("discover_sort: '{v}' isn't one of {}", all.join(", "))
+        })?;
+        push(&st, Action::DiscoverSort(sort));
+        Ok(())
     });
     let st = state.clone();
     engine.register_fn("strategy", move |entry: Dynamic, exit: Dynamic| {

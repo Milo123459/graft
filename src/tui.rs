@@ -21,7 +21,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, Widget};
 
-use crate::cli::{ChartKind, Cli, TrendStyle, Window, parse_window};
+use crate::cli::{ChartKind, Cli, LabSort, LabView, TrendStyle, Window, parse_window};
 use crate::data::{Dataset, Series};
 use crate::interactive::{Live, Transition};
 use crate::render::panes::{Dir as PDir, Pane, Panes, Split as PSplit};
@@ -255,8 +255,12 @@ enum LabHit {
     SearchNow,
     /// Cycle how long orders take to fill.
     Latency,
-    /// Strategies or theories.
-    View,
+    /// Show this tab.
+    Tab(LabView),
+    /// Sort the compare tab by this.
+    Sort(LabSort),
+    /// Scroll the panel by so many rows.
+    Scroll(i32),
     Stop,
 }
 
@@ -385,6 +389,195 @@ fn trades_brief(t: &crate::backtest::Trades) -> String {
         t.total(),
         plural(n, "trade", "trades")
     )
+}
+
+/// The discover panel's rows: each line, and what a tap on it does.
+type LabRows = Vec<(Line<'static>, Option<Hit>)>;
+
+/// Add `text` to the discover panel, wrapped to `w` (the lines after the first
+/// indented).
+fn lab_push(text: String, style: Style, hit: Option<Hit>, w: usize, rows: &mut LabRows) {
+    // Its own indent stays (wrapping drops spaces between words).
+    let indent = " ".repeat(text.len() - text.trim_start_matches(' ').len());
+    let w = w.saturating_sub(2).saturating_sub(indent.len());
+    for (k, l) in wrap(&text, w).into_iter().enumerate() {
+        let l = if k == 0 {
+            format!("{indent}{l}")
+        } else {
+            format!("{indent}  {l}")
+        };
+        rows.push((Line::styled(l, style), hit));
+    }
+}
+
+/// A price with enough digits to see a basis point move: 6 significant ones.
+fn lab_price(v: f64) -> String {
+    let a = v.abs();
+    if !a.is_finite() || a == 0.0 || a >= 1e7 {
+        return crate::discover::fmt_num(v);
+    }
+    let digits = (5 - a.log10().floor() as i32).clamp(0, 8) as usize;
+    format!("{v:.digits$}")
+}
+
+fn lab_dim() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+/// Strategy i's colour on the equity tab.
+fn lab_color(i: usize) -> Color {
+    const COLORS: [Color; 8] = [
+        Color::Yellow,
+        Color::Cyan,
+        Color::LightMagenta,
+        Color::LightGreen,
+        Color::LightBlue,
+        Color::LightRed,
+        Color::White,
+        Color::Magenta,
+    ];
+    COLORS[i % COLORS.len()]
+}
+
+/// What the strategies are built from: what the price did after each formula's
+/// extremes, from the latest search.
+fn lab_theory_rows(report: &crate::discover::Report, w: usize, rows: &mut LabRows) {
+    lab_push(
+        format!(
+            "theories: when a formula is in a tail of its range, what the price does a while later — the raw ideas strategies are built from. Kept when |t| ≥ {:.1} on the learning half (stronger than luck gives from {} tests); green: it held walking forward",
+            report.bar, report.tests
+        ),
+        Style::default().add_modifier(Modifier::BOLD),
+        None,
+        w,
+        rows,
+    );
+    if report.theories.is_empty() {
+        lab_push(
+            "none yet: nothing stood out from luck".into(),
+            lab_dim(),
+            None,
+            w,
+            rows,
+        );
+    }
+    for t in &report.theories {
+        let style = if t.held() {
+            Style::default().fg(Color::LightGreen)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        lab_push(
+            format!("• {}", t.describe(&report.input)),
+            style,
+            None,
+            w,
+            rows,
+        );
+    }
+    lab_push(
+        format!(
+            "holding: learning half {:+.1}bp, the rest {:+.1}bp",
+            report.hold[0], report.hold[1]
+        ),
+        lab_dim(),
+        None,
+        w,
+        rows,
+    );
+}
+
+/// What the reviews made of each strategy, the repairs, and what was retired.
+fn lab_lesson_rows(
+    lab: &crate::lab::Lab,
+    report: &crate::discover::Report,
+    w: usize,
+    rows: &mut LabRows,
+) {
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let dim = lab_dim();
+    if !lab.tracked.is_empty() {
+        lab_push(
+            "each search's review: ? why it isn't paying (or that it is), ✎ what a repair changed"
+                .into(),
+            bold,
+            None,
+            w,
+            rows,
+        );
+    }
+    for (i, t) in lab.tracked.iter().enumerate() {
+        let hit = Some(Hit::Lab(LabHit::Pick(i)));
+        let head = if i == lab.selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let newest = t.newest.map_or(String::new(), |p| {
+            format!(" · newest stretch {}", p.brief())
+        });
+        let repairs = match t.repairs {
+            0 => String::new(),
+            n => format!(" · repaired {n}×"),
+        };
+        lab_push(
+            format!(
+                "#{} {}{repairs}{newest}",
+                i + 1,
+                t.found.strategy.describe(&report.input)
+            ),
+            head,
+            hit,
+            w,
+            rows,
+        );
+        if let Some(note) = &t.note {
+            lab_push(
+                format!("  ✎ {note}"),
+                Style::default().fg(Color::Cyan),
+                hit,
+                w,
+                rows,
+            );
+        }
+        lab_push(
+            format!("  ? {}", t.why.as_deref().unwrap_or("not reviewed yet")),
+            Style::default().fg(Color::Gray),
+            hit,
+            w,
+            rows,
+        );
+    }
+    if lab.lessons.is_empty() {
+        lab_push("nothing retired yet".into(), dim, None, w, rows);
+    } else {
+        lab_push(
+            "learned (retired after losing live; still watched, back if they pay again):".into(),
+            bold,
+            None,
+            w,
+            rows,
+        );
+        for l in &lab.lessons {
+            lab_push(format!("• {l}"), dim, None, w, rows);
+        }
+    }
+    if !lab.benched.is_empty() {
+        let since: Vec<String> = lab.benched.iter().take(4).map(|t| t.live.brief()).collect();
+        lab_push(
+            format!(
+                "watching {} retired: since retiring {}",
+                lab.benched.len(),
+                since.join(" · ")
+            ),
+            dim,
+            None,
+            w,
+            rows,
+        );
+    }
 }
 
 /// `1 strategy`, `3 strategies`.
@@ -574,8 +767,10 @@ pub struct App {
     lab_marks_at: usize,
     /// Discovering was started at some point (the tutorial's check).
     lab_started: bool,
-    /// The discover panel shows theories instead of strategies.
-    lab_theories: bool,
+    /// How far the discover panel is scrolled, how far it can be, and where it is.
+    lab_scroll: usize,
+    lab_scroll_max: std::cell::Cell<usize>,
+    lab_rect: std::cell::Cell<Rect>,
     paused: bool,
     help: bool,
     /// `:help` (the console reference) is open.
@@ -738,7 +933,9 @@ impl App {
             }),
             lab_marks_at: 0,
             lab_started: cli.discover.is_some(),
-            lab_theories: false,
+            lab_scroll: 0,
+            lab_scroll_max: std::cell::Cell::new(0),
+            lab_rect: std::cell::Cell::new(Rect::default()),
             mouse: !cli.no_mouse,
             cli,
             session,
@@ -1284,9 +1481,37 @@ impl App {
                 let next = [0.1, 0.3, 1.0].into_iter().find(|s| *s > now + 1e-9);
                 self.set_latency(next);
             }
-            LabHit::View => self.lab_theories = !self.lab_theories,
+            LabHit::Tab(v) => self.set_discover_view(v),
+            LabHit::Sort(k) => self.set_discover_sort(k),
+            LabHit::Scroll(d) => self.scroll_lab(d),
             LabHit::Stop => self.stop_discover(),
         }
+    }
+
+    /// `discover_view("compare")`: show that tab of the discover panel.
+    fn set_discover_view(&mut self, v: LabView) {
+        self.cli.discover_view = v;
+        self.lab_scroll = 0;
+        if self.lab.is_none() {
+            self.say(
+                format!(
+                    "the discover panel will open on {} — discover() to start discovering",
+                    v.name()
+                ),
+                false,
+            );
+        }
+    }
+
+    /// `discover_sort("drawdown")`: sort the compare tab by that, and show it.
+    fn set_discover_sort(&mut self, k: LabSort) {
+        self.cli.discover_sort = k;
+        self.set_discover_view(LabView::Compare);
+    }
+
+    fn scroll_lab(&mut self, by: i32) {
+        let max = self.lab_scroll_max.get() as i64;
+        self.lab_scroll = (self.lab_scroll as i64 + by as i64).clamp(0, max) as usize;
     }
 
     /// Run the discovery lab: searches in the background, paper trades on new data.
@@ -1352,7 +1577,7 @@ impl App {
         };
         self.lab = Some(crate::lab::Lab::new(settings));
         self.lab_started = true;
-        self.lab_theories = false;
+        self.lab_scroll = 0;
         let on = crate::discover::price_series(
             &self.ds,
             self.lab.as_ref().and_then(|l| l.settings.series.as_deref()),
@@ -6451,11 +6676,19 @@ impl App {
             }
             Action::Discover(fee, series) => self.start_discover(fee, series),
             Action::Latency(secs) => self.set_latency(secs),
+            Action::DiscoverView(v) => self.set_discover_view(v),
+            Action::DiscoverSort(k) => self.set_discover_sort(k),
             Action::Undiscover => self.stop_discover(),
             Action::DiscoverPick(n) => match self.lab.as_mut() {
                 Some(lab) if n >= 1 && n <= lab.tracked.len() => {
                     lab.selected = n - 1;
-                    self.lab_theories = false;
+                    // Tabs that don't show which: back to the strategies.
+                    if matches!(
+                        self.cli.discover_view,
+                        LabView::Theories | LabView::Lessons
+                    ) {
+                        self.cli.discover_view = LabView::Strategies;
+                    }
                     self.place_lab_marks();
                 }
                 Some(lab) => {
@@ -7660,6 +7893,19 @@ impl App {
                     2
                 });
             }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                if self.lab.is_some()
+                    && self
+                        .lab_rect
+                        .get()
+                        .contains(ratatui::layout::Position { x: col, y: row }) =>
+            {
+                self.scroll_lab(if m.kind == MouseEventKind::ScrollUp {
+                    -2
+                } else {
+                    2
+                });
+            }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 // A menu drawn over the chart: the scroll is meant for it, not the chart.
                 let over_menu = self.lines_menu
@@ -7936,11 +8182,10 @@ impl App {
         let note_h = note.len() as u16;
         let pane_h = self.pane_panel_height(area.width);
         let lab_rows = self.lab_rows(area.width.saturating_sub(2));
-        let lab_buttons = self.lab_buttons();
         let lab_h = if self.lab.is_some() {
-            let want =
-                lab_rows.len() as u16 + 2 + flow_height(&lab_buttons, area.width.saturating_sub(2));
-            want.min(area.height * 45 / 100).max(5)
+            self.lab_height(area.width, lab_rows.len())
+                .min(area.height * 45 / 100)
+                .max(5)
         } else {
             0
         };
@@ -7989,7 +8234,7 @@ impl App {
             self.draw_pane_panel(f, pane_area);
         }
         if lab_h > 0 {
-            self.draw_lab(f, lab_area, lab_rows, &lab_buttons);
+            self.draw_lab(f, lab_area, lab_rows);
         }
         if self.show_stats {
             self.draw_stats(f, stats);
@@ -8241,25 +8486,91 @@ impl App {
         lines
     }
 
-    /// The discover panel's rows (wrapped to `width`), each with what a tap on it does.
-    fn lab_rows(&self, width: u16) -> Vec<(Line<'static>, Option<Hit>)> {
+    /// The discover panel's rows for the tab showing (wrapped to `width`), each with
+    /// what a tap on it does.
+    fn lab_rows(&self, width: u16) -> LabRows {
         let Some(lab) = &self.lab else {
             return Vec::new();
         };
         let w = width.max(10) as usize;
-        let mut rows: Vec<(Line<'static>, Option<Hit>)> = Vec::new();
-        let push = |text: String,
-                    style: Style,
-                    hit: Option<Hit>,
-                    rows: &mut Vec<(Line<'static>, Option<Hit>)>| {
-            // Room for the indent of the lines after the first.
-            for (k, l) in wrap(&text, w - 2).into_iter().enumerate() {
-                let l = if k == 0 { l } else { format!("  {l}") };
-                rows.push((Line::styled(l, style), hit));
+        let mut rows = LabRows::new();
+        let view = self.cli.discover_view;
+        // The search's details go with the theories; elsewhere a line at most.
+        match view {
+            LabView::Theories => self.lab_status_rows(lab, w, &mut rows),
+            LabView::Strategies => self.lab_status_line(lab, w, &mut rows),
+            _ => {}
+        }
+        let Some(report) = &lab.report else {
+            if !matches!(view, LabView::Strategies | LabView::Theories) {
+                lab_push(
+                    "the first search is still running…".into(),
+                    lab_dim(),
+                    None,
+                    w,
+                    &mut rows,
+                );
             }
+            return rows;
         };
-        let dim = Style::default().fg(Color::DarkGray);
-        let plain = Style::default();
+        if lab.tracked.is_empty()
+            && matches!(
+                view,
+                LabView::Strategies | LabView::Compare | LabView::Equity | LabView::Trades
+            )
+        {
+            lab_push(
+                format!(
+                    "no strategy has made money after costs ({}) on both the learning half and walking forward yet — it keeps looking as data comes in",
+                    report.fees.explain(report.spread)
+                ),
+                Style::default(),
+                None,
+                w,
+                &mut rows,
+            );
+            return rows;
+        }
+        match view {
+            LabView::Strategies => self.lab_strategy_rows(lab, report, w, &mut rows),
+            LabView::Compare => self.lab_compare_rows(lab, report, w, &mut rows),
+            LabView::Equity => self.lab_equity_rows(lab, w, &mut rows),
+            LabView::Trades => self.lab_trade_rows(lab, w, &mut rows),
+            LabView::Theories => lab_theory_rows(report, w, &mut rows),
+            LabView::Lessons => lab_lesson_rows(lab, report, w, &mut rows),
+        }
+        rows
+    }
+
+    /// What the search is up to, in a line: the details are on the theories tab.
+    fn lab_status_line(&self, lab: &crate::lab::Lab, w: usize, rows: &mut LabRows) {
+        let Some(r) = &lab.report else {
+            return self.lab_status_rows(lab, w, rows);
+        };
+        let status = if lab.searching() {
+            "searching…".to_string()
+        } else {
+            lab.next_in()
+                .map_or(String::new(), |s| format!("next in {s}s"))
+        };
+        lab_push(
+            format!(
+                "search {} · {} formulas ({:.0}/s) · {} strategies tried · {status}",
+                lab.runs,
+                lab.tried,
+                lab.tried as f64 / lab.since.elapsed().as_secs_f64().max(1.0),
+                r.tried,
+            ),
+            lab_dim(),
+            None,
+            w,
+            rows,
+        );
+    }
+
+    /// What the search is up to.
+    fn lab_status_rows(&self, lab: &crate::lab::Lab, w: usize, rows: &mut LabRows) {
+        let dim = lab_dim();
         let status = if lab.searching() {
             "searching…".to_string()
         } else {
@@ -8267,14 +8578,14 @@ impl App {
                 .map_or(String::new(), |s| format!("next in {s}s"))
         };
         match (&lab.report, &lab.waiting) {
-            (_, Some(w)) if lab.report.is_none() => {
+            (_, Some(wait)) if lab.report.is_none() => {
                 let sep = if status.is_empty() { "" } else { " · " };
-                push(format!("{w}{sep}{status}"), dim, None, &mut rows);
+                lab_push(format!("{wait}{sep}{status}"), dim, None, w, rows);
             }
-            (None, _) => push(format!("first search… {status}"), dim, None, &mut rows),
+            (None, _) => lab_push(format!("first search… {status}"), dim, None, w, rows),
             (Some(r), _) => {
                 let invented = r.pool.iter().filter(|s| s.invented).count();
-                push(
+                lab_push(
                     format!(
                         "search {}{} · {} pts of {} · {:.1}s · {} formulas ({:.0}/s, {} in all) · {} strategies · {invented}/{} kept invented · {} · {status}",
                         lab.runs,
@@ -8295,199 +8606,533 @@ impl App {
                     ),
                     dim,
                     None,
-                    &mut rows,
+                    w,
+                    rows,
                 );
-                push(r.layout.describe(&r.input), dim, None, &mut rows);
+                lab_push(r.layout.describe(&r.input), dim, None, w, rows);
             }
         }
-        let Some(report) = &lab.report else {
-            return rows;
-        };
-        if self.lab_theories {
-            push(
-                format!(
-                    "theories: |t| ≥ {:.1} on the learning half (stronger than luck gives from {} tests), checked walking forward",
-                    report.bar, report.tests
-                ),
-                Style::default().add_modifier(Modifier::BOLD),
-                None,
-                &mut rows,
-            );
-            if report.theories.is_empty() {
-                push(
-                    "none yet: nothing stood out from luck".into(),
-                    dim,
-                    None,
-                    &mut rows,
-                );
-            }
-            for t in &report.theories {
-                let style = if t.held() {
-                    Style::default().fg(Color::LightGreen)
-                } else {
-                    Style::default().fg(Color::Gray)
-                };
-                push(
-                    format!("• {}", t.describe(&report.input)),
-                    style,
-                    None,
-                    &mut rows,
-                );
-            }
-            push(
-                format!(
-                    "holding: learning half {:+.1}bp, the rest {:+.1}bp",
-                    report.hold[0], report.hold[1]
-                ),
-                dim,
-                None,
-                &mut rows,
-            );
-            return rows;
-        }
-        if lab.tracked.is_empty() {
-            push(
-                format!(
-                    "no strategy has made money after costs ({}) on both the learning half and walking forward yet — it keeps looking as data comes in",
-                    report.fees.explain(report.spread)
-                ),
-                plain,
-                None,
-                &mut rows,
-            );
-        } else {
-            push(
+    }
+
+    /// Each strategy: its rules, how it did, what it risked.
+    fn lab_strategy_rows(
+        &self,
+        lab: &crate::lab::Lab,
+        report: &crate::discover::Report,
+        w: usize,
+        rows: &mut LabRows,
+    ) {
+        lab_push(
             "strategies: picked on the learning half, checked walking forward, then paper-traded live · tap one for its trades".into(),
             Style::default().add_modifier(Modifier::BOLD),
             None,
-            &mut rows,
+            w,
+            rows,
         );
-            for (i, t) in lab.tracked.iter().enumerate() {
-                let hit = Some(Hit::Lab(LabHit::Pick(i)));
-                let mut head = Style::default().fg(Color::White);
-                if i == lab.selected {
-                    head = head.fg(Color::Yellow).add_modifier(Modifier::BOLD);
-                }
-                let mark = if i == lab.selected { "▸" } else { " " };
-                push(
-                    format!(
-                        "{mark}{} {}",
-                        i + 1,
-                        t.found.strategy.describe(&report.input)
-                    ),
-                    head,
+        for (i, t) in lab.tracked.iter().enumerate() {
+            let hit = Some(Hit::Lab(LabHit::Pick(i)));
+            let mut head = Style::default().fg(Color::White);
+            if i == lab.selected {
+                head = head.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+            }
+            let mark = if i == lab.selected { "▸" } else { " " };
+            lab_push(
+                format!(
+                    "{mark}{} {}",
+                    i + 1,
+                    t.found.strategy.describe(&report.input)
+                ),
+                head,
+                hit,
+                w,
+                rows,
+            );
+            let live = if t.live.n == 0 {
+                "live: no trades yet".to_string()
+            } else {
+                format!("live {}", t.live.brief())
+            };
+            let open = t
+                .open
+                .map_or(String::new(), |o| format!(" · in a trade {o:+.1}bp"));
+            // With leverage: what that is on the margin.
+            let roi = report
+                .fees
+                .roi(if t.live.n > 0 {
+                    t.live.mean
+                } else {
+                    t.found.checked.mean
+                })
+                .map_or(String::new(), |r| format!(" · {r:+.1}% ROI a trade"));
+            let color = if t.live.n == 0 {
+                Color::Gray
+            } else if t.live.mean > 0.0 {
+                Color::LightGreen
+            } else {
+                Color::LightRed
+            };
+            let steps = t
+                .found
+                .consistency()
+                .filter(|c| c.1 > 1)
+                .map_or(String::new(), |(up, of)| {
+                    format!(", up in {up} of {of} stretches")
+                });
+            let edge = if t.found.edge.n >= 5 {
+                format!(
+                    " · beats holding by {:+.2}bp (t {:.1})",
+                    t.found.edge.mean, t.found.edge.t
+                )
+            } else {
+                String::new()
+            };
+            lab_push(
+                format!(
+                    "↳ picked {} · walking forward {}{steps}{edge} · {live}{open}{roi} · found in search {}",
+                    t.found.picked.brief(),
+                    t.found.checked.brief(),
+                    t.run
+                ),
+                Style::default().fg(color),
+                hit,
+                w,
+                rows,
+            );
+            // What it risked: walking forward, and live once it has traded.
+            let live_risk = if t.live.n > 0 {
+                format!(" · live {}", t.live.risk(&report.fees))
+            } else {
+                String::new()
+            };
+            lab_push(
+                format!(
+                    "  walking forward {}{live_risk}",
+                    t.found.checked.risk(&report.fees)
+                ),
+                Style::default().fg(Color::Gray),
+                hit,
+                w,
+                rows,
+            );
+            if let Some(note) = &t.note {
+                lab_push(
+                    format!("  ✎ {note}"),
+                    Style::default().fg(Color::Cyan),
                     hit,
-                    &mut rows,
+                    w,
+                    rows,
                 );
-                let live = if t.live.n == 0 {
-                    "live: no trades yet".to_string()
-                } else {
-                    format!("live {}", t.live.brief())
-                };
-                let open = t
-                    .open
-                    .map_or(String::new(), |o| format!(" · in a trade {o:+.1}bp"));
-                // With leverage: what that is on the margin.
-                let roi = report
-                    .fees
-                    .roi(if t.live.n > 0 {
-                        t.live.mean
-                    } else {
-                        t.found.checked.mean
-                    })
-                    .map_or(String::new(), |r| format!(" · {r:+.1}% ROI a trade"));
-                let color = if t.live.n == 0 {
-                    Color::Gray
-                } else if t.live.mean > 0.0 {
-                    Color::LightGreen
-                } else {
-                    Color::LightRed
-                };
-                let steps = t
-                    .found
-                    .consistency()
-                    .filter(|c| c.1 > 1)
-                    .map_or(String::new(), |(up, of)| {
-                        format!(", up in {up} of {of} stretches")
-                    });
-                let edge = if t.found.edge.n >= 5 {
-                    format!(
-                        " · beats holding by {:+.2}bp (t {:.1})",
-                        t.found.edge.mean, t.found.edge.t
-                    )
-                } else {
-                    String::new()
-                };
-                push(
-                    format!(
-                        "↳ picked {} · walking forward {}{steps}{edge} · {live}{open}{roi} · found in search {}",
-                        t.found.picked.brief(),
-                        t.found.checked.brief(),
-                        t.run
-                    ),
-                    Style::default().fg(color),
-                    hit,
-                    &mut rows,
-                );
-                // What it risked: walking forward, and live once it has traded.
-                let live_risk = if t.live.n > 0 {
-                    format!(" · live {}", t.live.risk(&report.fees))
-                } else {
-                    String::new()
-                };
-                push(
-                    format!(
-                        "  walking forward {}{live_risk}",
-                        t.found.checked.risk(&report.fees)
-                    ),
+            }
+            if let Some(why) = &t.why {
+                lab_push(
+                    format!("  ? {why}"),
                     Style::default().fg(Color::Gray),
                     hit,
-                    &mut rows,
+                    w,
+                    rows,
                 );
-                if let Some(note) = &t.note {
-                    push(
-                        format!("  ✎ {note}"),
-                        Style::default().fg(Color::Cyan),
-                        hit,
-                        &mut rows,
-                    );
-                }
-                if let Some(why) = &t.why {
-                    push(
-                        format!("  ? {why}"),
-                        Style::default().fg(Color::Gray),
-                        hit,
-                        &mut rows,
-                    );
-                }
             }
         }
-        if !lab.lessons.is_empty() {
-            push(
-                "learned (retired after losing live; still watched, back if they pay again):"
-                    .into(),
-                Style::default().add_modifier(Modifier::BOLD),
+    }
+
+    /// All of them side by side: who made the most, fell the furthest, …, as a table
+    /// that keeps the columns that fit.
+    fn lab_compare_rows(
+        &self,
+        lab: &crate::lab::Lab,
+        report: &crate::discover::Report,
+        w: usize,
+        rows: &mut LabRows,
+    ) {
+        use crate::cli::LabSort as S;
+        use unicode_width::UnicodeWidthStr;
+        let sort = self.cli.discover_sort;
+        let all = crate::lab::compare(&lab.tracked, sort);
+        let traded: Vec<&crate::lab::Compared> = all.iter().filter(|c| c.trades > 0).collect();
+        let best = |key: fn(&crate::lab::Compared) -> f64| {
+            traded
+                .iter()
+                .copied()
+                .max_by(|a, b| key(a).total_cmp(&key(b)).then(b.index.cmp(&a.index)))
+        };
+        let mut most = Vec::new();
+        if let Some(c) = best(|c| c.profit) {
+            most.push(format!("most made #{} {:+.1}bp", c.index + 1, c.profit));
+        }
+        if let Some(c) = best(|c| -c.drawdown) {
+            most.push(format!("smallest DD #{} {:.1}bp", c.index + 1, c.drawdown));
+        }
+        if let Some(c) = best(|c| c.drawdown) {
+            most.push(format!("largest DD #{} {:.1}bp", c.index + 1, c.drawdown));
+        }
+        if let Some(c) = best(|c| c.t) {
+            most.push(format!("surest #{} t {:.1}", c.index + 1, c.t));
+        }
+        let live_n: usize = lab.tracked.iter().map(|t| t.live.n).sum();
+        if let Some(c) = best(|c| c.live.total).filter(|c| c.live.n > 0) {
+            most.push(format!(
+                "best live #{} {:+.1}bp × {}",
+                c.index + 1,
+                c.live.total,
+                c.live.n
+            ));
+        }
+        if live_n > 0 {
+            let total: f64 = lab.tracked.iter().map(|t| t.live.total).sum();
+            most.push(format!("all live {total:+.1}bp over {live_n} trades"));
+        }
+        if !most.is_empty() {
+            lab_push(
+                most.join(" · "),
+                Style::default().fg(Color::White),
                 None,
-                &mut rows,
+                w,
+                rows,
             );
-            for l in &lab.lessons {
-                push(format!("• {l}"), dim, None, &mut rows);
-            }
         }
-        if !lab.benched.is_empty() {
-            let since: Vec<String> = lab.benched.iter().take(4).map(|t| t.live.brief()).collect();
-            push(
-                format!(
-                    "watching {} retired: since retiring {}",
-                    lab.benched.len(),
-                    since.join(" · ")
+        lab_push(
+            format!(
+                "bp after costs ({}), where it wasn't picked: walking forward + live · tap a row for its trades",
+                report.fees.short()
+            ),
+            lab_dim(),
+            None,
+            w,
+            rows,
+        );
+        // Each column: its header, what sorts by it, and a cell per strategy.
+        let num = |v: f64, places: usize| format!("{v:+.places$}");
+        let cols: Vec<(&str, Option<S>, Vec<String>)> = vec![
+            (
+                "#",
+                Some(S::Rank),
+                all.iter()
+                    .map(|c| {
+                        let mark = if c.index == lab.selected { "▸" } else { " " };
+                        format!("{mark}{}", c.index + 1)
+                    })
+                    .collect(),
+            ),
+            (
+                "rule",
+                None,
+                all.iter()
+                    .map(|c| {
+                        let s = &lab.tracked[c.index].found.strategy;
+                        let sides = match (s.long.is_empty(), s.short.is_empty()) {
+                            (false, false) => "▲▼",
+                            (false, true) => "▲",
+                            _ => "▼",
+                        };
+                        format!("{sides} {}", report.input.points_short(s.exit.hold))
+                    })
+                    .collect(),
+            ),
+            (
+                "made",
+                Some(S::Profit),
+                all.iter().map(|c| num(c.profit, 1)).collect(),
+            ),
+            (
+                "max DD",
+                Some(S::Drawdown),
+                all.iter().map(|c| format!("{:.1}", c.drawdown)).collect(),
+            ),
+            (
+                "live",
+                Some(S::Live),
+                all.iter()
+                    .map(|c| match c.live.n {
+                        0 => "—".into(),
+                        n => format!("{}×{n}", num(c.live.total, 1)),
+                    })
+                    .collect(),
+            ),
+            (
+                "a trade",
+                Some(S::Mean),
+                all.iter().map(|c| num(c.mean, 2)).collect(),
+            ),
+            (
+                "t",
+                Some(S::T),
+                all.iter().map(|c| format!("{:.1}", c.t)).collect(),
+            ),
+            (
+                "won",
+                Some(S::Won),
+                all.iter()
+                    .map(|c| format!("{:.0}%", c.won * 100.0))
+                    .collect(),
+            ),
+            (
+                "trades",
+                Some(S::Trades),
+                all.iter().map(|c| c.trades.to_string()).collect(),
+            ),
+            (
+                "worst",
+                Some(S::Worst),
+                all.iter().map(|c| num(c.worst, 1)).collect(),
+            ),
+            ("best", None, all.iter().map(|c| num(c.best, 1)).collect()),
+            (
+                "vs hold",
+                Some(S::Edge),
+                all.iter().map(|c| num(c.edge, 2)).collect(),
+            ),
+            (
+                "now",
+                None,
+                all.iter()
+                    .map(|c| c.open.map_or(String::new(), |o| num(o, 1)))
+                    .collect(),
+            ),
+        ];
+        // The columns that fit, in that order (the sorted one too, if it fits at all).
+        let head = |name: &str, by: Option<S>| {
+            if by == Some(sort) && sort != S::Rank {
+                format!("{name}▾")
+            } else {
+                name.to_string()
+            }
+        };
+        let widths: Vec<usize> = cols
+            .iter()
+            .map(|(name, by, cells)| {
+                cells
+                    .iter()
+                    .map(|c| c.width())
+                    .chain([head(name, *by).width()])
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect();
+        let mut shown = Vec::new();
+        let mut used = 0;
+        for (k, cw) in widths.iter().enumerate() {
+            let need = if shown.is_empty() { *cw } else { cw + 1 };
+            if used + need > w {
+                continue;
+            }
+            used += need;
+            shown.push(k);
+        }
+        let cell = |k: usize, text: &str| {
+            let pad = widths[k].saturating_sub(text.width());
+            // The rule reads left to right; numbers line up on the right.
+            if k == 1 {
+                format!("{text}{}", " ".repeat(pad))
+            } else {
+                format!("{}{text}", " ".repeat(pad))
+            }
+        };
+        let line = |texts: Vec<String>| texts.join(" ");
+        rows.push((
+            Line::styled(
+                line(
+                    shown
+                        .iter()
+                        .map(|&k| cell(k, &head(cols[k].0, cols[k].1)))
+                        .collect(),
                 ),
-                dim,
+                Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            ),
+            None,
+        ));
+        for (r, c) in all.iter().enumerate() {
+            let style = if c.index == lab.selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else if c.trades == 0 {
+                Style::default().fg(Color::Gray)
+            } else if c.profit > 0.0 {
+                Style::default().fg(Color::LightGreen)
+            } else {
+                Style::default().fg(Color::LightRed)
+            };
+            rows.push((
+                Line::styled(
+                    line(shown.iter().map(|&k| cell(k, &cols[k].2[r])).collect()),
+                    style,
+                ),
+                Some(Hit::Lab(LabHit::Pick(c.index))),
+            ));
+        }
+        let hidden: Vec<&str> = (0..cols.len())
+            .filter(|k| !shown.contains(k))
+            .map(|k| cols[k].0)
+            .collect();
+        if !hidden.is_empty() {
+            lab_push(
+                format!("wider for: {}", hidden.join(", ")),
+                lab_dim(),
                 None,
-                &mut rows,
+                w,
+                rows,
             );
         }
-        rows
+    }
+
+    /// The equity tab's legend (the chart is drawn under it): each strategy's colour,
+    /// where it ended up and its worst fall.
+    fn lab_equity_rows(&self, lab: &crate::lab::Lab, w: usize, rows: &mut LabRows) {
+        lab_push(
+            "running total after each trade (bp, after costs) over all the data loaded — the part before a strategy was found includes where it was picked".into(),
+            lab_dim(),
+            None,
+            w,
+            rows,
+        );
+        for (i, t) in lab.tracked.iter().enumerate() {
+            let eq = t.equity();
+            let end = eq.last().map_or(0.0, |p| p.1);
+            // The worst fall from a high, over the same trades.
+            let (mut high, mut dd) = (0.0f64, 0.0f64);
+            for (_, v) in &eq {
+                high = high.max(*v);
+                dd = dd.max(high - v);
+            }
+            let mut style = Style::default().fg(lab_color(i));
+            let mark = if i == lab.selected {
+                style = style.add_modifier(Modifier::BOLD);
+                "▸"
+            } else {
+                " "
+            };
+            lab_push(
+                format!(
+                    "{mark}━ #{} {end:+.1}bp over {} trades · DD {dd:.1}bp",
+                    i + 1,
+                    eq.len()
+                ),
+                style,
+                Some(Hit::Lab(LabHit::Pick(i))),
+                w,
+                rows,
+            );
+        }
+    }
+
+    /// Every strategy's trades, open ones first, then the newest: live ones (paper
+    /// traded since it was found) when there are any, else all.
+    fn lab_trade_rows(&self, lab: &crate::lab::Lab, w: usize, rows: &mut LabRows) {
+        let mut all: Vec<(usize, &crate::lab::PaperTrade)> = lab
+            .tracked
+            .iter()
+            .enumerate()
+            .flat_map(|(i, t)| t.trades.iter().map(move |p| (i, p)))
+            .collect();
+        let live = all.iter().any(|(_, p)| p.live);
+        if live {
+            all.retain(|(_, p)| p.live);
+        }
+        all.sort_by(|a, b| {
+            b.1.exit
+                .is_none()
+                .cmp(&a.1.exit.is_none())
+                .then(b.1.entry.total_cmp(&a.1.entry))
+        });
+        let wins = all
+            .iter()
+            .filter(|(_, p)| p.exit.is_some() && p.net > 0.0)
+            .count();
+        let closed = all.iter().filter(|(_, p)| p.exit.is_some()).count();
+        let total: f64 = all
+            .iter()
+            .filter(|(_, p)| p.exit.is_some())
+            .map(|(_, p)| p.net)
+            .sum();
+        lab_push(
+            format!(
+                "{} · {closed} closed, {wins} won, {total:+.1}bp in all · tap one for its strategy",
+                if live {
+                    "paper trades since each was found"
+                } else {
+                    "no paper trades yet: the replayed ones"
+                }
+            ),
+            lab_dim(),
+            None,
+            w,
+            rows,
+        );
+        let span = self.ds.x_range().map_or(0.0, |(a, b)| b - a);
+        let span = if span > 86_400.0 {
+            86_400.0 * 2.0
+        } else {
+            60.0
+        };
+        for (i, p) in all.into_iter().take(300) {
+            let side = if p.side == crate::discover::Side::Long {
+                "▲"
+            } else {
+                "▼"
+            };
+            let price = lab_price;
+            let (out, result, color) = match (p.exit, p.y_out) {
+                (Some(_), Some(y)) => (
+                    price(y),
+                    p.exit_label(),
+                    if p.net > 0.0 {
+                        Color::LightGreen
+                    } else {
+                        Color::LightRed
+                    },
+                ),
+                _ => ("…".into(), format!("open {:+.1}bp", p.net), Color::Yellow),
+            };
+            let held = p
+                .exit
+                .filter(|_| self.ds.x_kind == crate::data::XKind::Time)
+                .map_or(String::new(), |x| {
+                    format!(" · {}", crate::time::fmt_duration_compact(x - p.entry))
+                });
+            let mut style = Style::default().fg(color);
+            if i == lab.selected {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            lab_push(
+                format!(
+                    "{} #{} {side} {}→{out} {result}{held}",
+                    self.ds.fmt_x(p.entry, span),
+                    i + 1,
+                    price(p.y_in)
+                ),
+                style,
+                Some(Hit::Lab(LabHit::Pick(i))),
+                w,
+                rows,
+            );
+        }
+    }
+
+    fn lab_tabs(&self) -> Vec<Button<Hit>> {
+        if self.lab.is_none() {
+            return Vec::new();
+        }
+        LabView::ALL
+            .iter()
+            .map(|v| {
+                Button::new(v.name(), Hit::Lab(LabHit::Tab(*v)))
+                    .active(*v == self.cli.discover_view)
+            })
+            .collect()
+    }
+
+    /// The compare tab's sort buttons.
+    fn lab_sorts(&self) -> Vec<Button<Hit>> {
+        if self.lab.is_none() || self.cli.discover_view != LabView::Compare {
+            return Vec::new();
+        }
+        LabSort::ALL
+            .iter()
+            .map(|s| {
+                Button::new(s.name(), Hit::Lab(LabHit::Sort(*s)))
+                    .active(*s == self.cli.discover_sort)
+            })
+            .collect()
     }
 
     fn lab_buttons(&self) -> Vec<Button<Hit>> {
@@ -8495,20 +9140,12 @@ impl App {
             return Vec::new();
         };
         let mut v = Vec::new();
-        if !lab.tracked.is_empty() && !self.lab_theories {
+        if !lab.tracked.is_empty() {
             v.push(Button::new(
                 format!("keep {}", lab.selected + 1),
                 Hit::Lab(LabHit::Keep),
             ));
         }
-        v.push(Button::new(
-            if self.lab_theories {
-                "strategies"
-            } else {
-                "theories"
-            },
-            Hit::Lab(LabHit::View),
-        ));
         v.push(Button::new("search now", Hit::Lab(LabHit::SearchNow)).active(lab.searching()));
         let latency = match lab.settings.latency {
             s if s > 0.0 => crate::time::fmt_duration_compact(s),
@@ -8522,13 +9159,27 @@ impl App {
         v
     }
 
-    fn draw_lab(
-        &self,
-        f: &mut Frame,
-        area: Rect,
-        rows: Vec<(Line<'static>, Option<Hit>)>,
-        buttons: &[Button<Hit>],
-    ) {
+    /// How tall the discover panel wants to be at this width.
+    fn lab_height(&self, width: u16, rows: usize) -> u16 {
+        if self.lab.is_none() {
+            return 0;
+        }
+        let inner = width.saturating_sub(2);
+        let chart = if self.cli.discover_view == LabView::Equity {
+            12
+        } else {
+            0
+        };
+        rows as u16
+            + 2
+            + chart
+            + flow_height(&self.lab_tabs(), inner)
+            + flow_height(&self.lab_sorts(), inner)
+            + flow_height(&self.lab_buttons(), inner)
+    }
+
+    fn draw_lab(&self, f: &mut Frame, area: Rect, rows: LabRows) {
+        self.lab_rect.set(area);
         let fees = self.lab.as_ref().map_or(String::new(), |l| {
             let late = match l.settings.latency {
                 s if s > 0.0 => format!(" · fills {} late", crate::time::fmt_duration_compact(s)),
@@ -8541,25 +9192,197 @@ impl App {
             .title(format!(" discover · {fees} "));
         let inner = block.inner(area);
         f.render_widget(block, area);
-        let bh = flow_height(buttons, inner.width).min(inner.height);
-        let body_h = inner.height.saturating_sub(bh);
-        for (k, (line, hit)) in rows.into_iter().take(body_h as usize).enumerate() {
-            let r = Rect {
-                y: inner.y + k as u16,
-                height: 1,
+        let tabs = self.lab_tabs();
+        let sorts = self.lab_sorts();
+        let buttons = self.lab_buttons();
+        // The tabs first, then the actions at the bottom, then whatever's left.
+        let th = flow_height(&tabs, inner.width).min(inner.height);
+        let bh = flow_height(&buttons, inner.width).min(inner.height - th);
+        let sh = flow_height(&sorts, inner.width).min(inner.height - th - bh);
+        crate::ui::render_buttons(
+            &tabs,
+            Rect {
+                height: th,
                 ..inner
+            },
+            f.buffer_mut(),
+            &self.hits,
+        );
+        crate::ui::render_buttons_quiet(
+            &sorts,
+            Rect {
+                y: inner.y + th,
+                height: sh,
+                ..inner
+            },
+            f.buffer_mut(),
+            &self.hits,
+        );
+        let body = Rect {
+            y: inner.y + th + sh,
+            height: inner.height - th - sh - bh,
+            ..inner
+        };
+        crate::ui::render_buttons_quiet(
+            &buttons,
+            Rect {
+                y: body.bottom(),
+                height: bh,
+                ..inner
+            },
+            f.buffer_mut(),
+            &self.hits,
+        );
+        // The equity chart takes what the legend leaves (at least half).
+        let (rows_area, chart_area) = if self.cli.discover_view == LabView::Equity
+            && self.lab.as_ref().is_some_and(|l| !l.tracked.is_empty())
+        {
+            let legend = (rows.len() as u16).min(body.height / 2);
+            (
+                Rect {
+                    height: legend,
+                    ..body
+                },
+                Some(Rect {
+                    y: body.y + legend,
+                    height: body.height - legend,
+                    ..body
+                }),
+            )
+        } else {
+            (body, None)
+        };
+        self.draw_lab_rows(f, rows_area, rows);
+        if let Some(a) = chart_area {
+            self.draw_lab_equity(f, a);
+        }
+    }
+
+    /// The rows that fit, from where it's scrolled to, with ▲/▼ lines to tap for more.
+    fn draw_lab_rows(&self, f: &mut Frame, area: Rect, rows: LabRows) {
+        let h = area.height as usize;
+        let (from, visible) = if rows.len() <= h {
+            self.lab_scroll_max.set(0);
+            (0, h)
+        } else {
+            // The last line says what's above and below.
+            let visible = h.saturating_sub(1);
+            let max = rows.len() - visible;
+            self.lab_scroll_max.set(max);
+            (self.lab_scroll.min(max), visible)
+        };
+        let total = rows.len();
+        for (k, (line, hit)) in rows.into_iter().skip(from).take(visible).enumerate() {
+            let r = Rect {
+                y: area.y + k as u16,
+                height: 1,
+                ..area
             };
             f.render_widget(Paragraph::new(line), r);
             if let Some(h) = hit {
                 self.hits.push(r, h);
             }
         }
-        let b_area = Rect {
-            y: inner.y + body_h,
-            height: bh,
-            ..inner
+        if total > h && h > 0 {
+            let y = area.y + visible as u16;
+            let half = area.width / 2;
+            let page = visible.max(1) as i32;
+            let below = total - from - visible;
+            let dim = Style::default().fg(Color::Cyan);
+            if from > 0 {
+                let r = Rect {
+                    y,
+                    height: 1,
+                    width: half,
+                    ..area
+                };
+                f.render_widget(
+                    Paragraph::new(Line::styled(format!("▲ {from} above"), dim)),
+                    r,
+                );
+                self.hits.push(r, Hit::Lab(LabHit::Scroll(-page)));
+            }
+            if below > 0 {
+                let r = Rect {
+                    x: area.x + half,
+                    y,
+                    height: 1,
+                    width: area.width - half,
+                };
+                f.render_widget(
+                    Paragraph::new(Line::styled(format!("▼ {below} more"), dim)),
+                    r,
+                );
+                self.hits.push(r, Hit::Lab(LabHit::Scroll(page)));
+            }
+        }
+    }
+
+    /// Each strategy's running total on one chart, in its legend colour.
+    fn draw_lab_equity(&self, f: &mut Frame, area: Rect) {
+        use ratatui::symbols::Marker;
+        use ratatui::widgets::{Axis, Chart, Dataset as RDataset, GraphType};
+        let Some(lab) = &self.lab else {
+            return;
         };
-        crate::ui::render_buttons_quiet(buttons, b_area, f.buffer_mut(), &self.hits);
+        if area.height < 3 {
+            return;
+        }
+        let curves: Vec<Vec<(f64, f64)>> = lab.tracked.iter().map(|t| t.equity()).collect();
+        let pts = || curves.iter().flatten();
+        let (Some(x0), Some(x1)) = (
+            pts().map(|p| p.0).min_by(f64::total_cmp),
+            pts().map(|p| p.0).max_by(f64::total_cmp),
+        ) else {
+            f.render_widget(
+                Paragraph::new(Line::styled("no trades closed yet", lab_dim())),
+                area,
+            );
+            return;
+        };
+        let y0 = pts().map(|p| p.1).fold(0.0, f64::min);
+        let y1 = pts().map(|p| p.1).fold(0.0, f64::max);
+        let pad = ((y1 - y0) * 0.05).max(0.5);
+        let (y0, y1) = (y0 - pad, y1 + pad);
+        let x1 = if x1 > x0 { x1 } else { x0 + 1.0 };
+        // The selected one last, so it's drawn over the rest.
+        let mut order: Vec<usize> = (0..curves.len()).filter(|&i| i != lab.selected).collect();
+        order.push(lab.selected);
+        let zero = [(x0, 0.0), (x1, 0.0)];
+        let mut sets = vec![
+            RDataset::default()
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(Color::DarkGray))
+                .data(&zero),
+        ];
+        for i in order {
+            if let Some(c) = curves.get(i) {
+                sets.push(
+                    RDataset::default()
+                        .marker(Marker::Braille)
+                        .graph_type(GraphType::Line)
+                        .style(Style::default().fg(lab_color(i)))
+                        .data(c),
+                );
+            }
+        }
+        let span = x1 - x0;
+        let dim = lab_dim();
+        let chart = Chart::new(sets)
+            .x_axis(
+                Axis::default()
+                    .bounds([x0, x1])
+                    .style(dim)
+                    .labels([self.ds.fmt_x(x0, span), self.ds.fmt_x(x1, span)]),
+            )
+            .y_axis(
+                Axis::default()
+                    .bounds([y0, y1])
+                    .style(dim)
+                    .labels([format!("{y0:+.0}"), format!("{y1:+.0}bp")]),
+            );
+        f.render_widget(chart, area);
     }
 
     fn draw_stats(&self, f: &mut Frame, area: Rect) {
@@ -10487,17 +11310,56 @@ pub(crate) mod tests {
             "{wide}"
         );
         assert!(s.contains("keep 1") && s.contains("theories"), "{s}");
-        // The other view: theories.
-        let (x, y) = find(&app, "theories");
-        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
-        assert!(app.lab_theories);
+        // Another tab: theories.
+        let (x, y) = find(&app, " theories ");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert_eq!(app.cli.discover_view, LabView::Theories);
         let s = screen_sized(&app, 46, 44);
         assert!(
-            s.contains("theories: |t|") && (s.contains("• ") || s.contains("nothing stood out")),
+            s.contains("theories: when a formula")
+                && (s.contains("• ") || s.contains("nothing stood out")),
             "{s}"
         );
         run(&mut app, "discover_pick(1)");
-        assert!(!app.lab_theories);
+        assert_eq!(app.cli.discover_view, LabView::Strategies);
+        // Each tab draws at 46 columns, and says something of its own.
+        for (view, says) in [
+            ("compare", "max DD"),
+            ("equity", "running total"),
+            ("trades", "closed"),
+            ("lessons", "review"),
+        ] {
+            run(&mut app, &format!("discover_view(\"{view}\")"));
+            let s = screen_sized(&app, 46, 44);
+            assert!(s.contains(says), "{view}: {s}");
+            if std::env::var("SHOW").is_ok() {
+                eprintln!("{s}");
+            }
+        }
+        // Compare: sorted by the smallest drawdown, by a tap on its button.
+        run(&mut app, "discover_view(\"compare\")");
+        screen_sized(&app, 46, 44);
+        let (x, y) = find(&app, " drawdown ");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
+        assert_eq!(app.cli.discover_sort, LabSort::Drawdown);
+        let s = screen_sized(&app, 46, 44);
+        assert!(s.contains("max DD▾"), "{s}");
+        let order = crate::lab::compare(&app.lab.as_ref().unwrap().tracked, LabSort::Drawdown);
+        assert!(
+            order
+                .windows(2)
+                .all(|w| w[1].trades == 0 || w[0].drawdown <= w[1].drawdown),
+            "{order:?}"
+        );
+        // Copy cmd gives the flags for both.
+        let args = app.cli.to_args().join(" ");
+        assert!(
+            args.contains("--discover-view compare --discover-sort drawdown"),
+            "{args}"
+        );
+        run(&mut app, "discover_view(\"bogus\")");
+        assert!(app.console_note.as_ref().is_some_and(|m| m.error));
+        run(&mut app, "discover_view(\"strategies\")");
         // Kept: formulas become hidden lines, entries a marker rule.
         run(&mut app, "discover_keep(1)");
         let note = app

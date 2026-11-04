@@ -584,12 +584,26 @@ there or live are retired with what they learned, and never picked again.
 Tap a strategy (or `discover_pick(2)`) to draw its trades (▲/▼ in, • out with its
 result; an entry says *open* while it's still in it — a strategy is in one trade at a
 time — and an exit says *paper* when the trade came after the strategy was found:
-paper-traded, not replayed from history); **theories** switches the panel to them. **keep** (`discover_keep()`) turns a
+paper-traded, not replayed from history). **keep** (`discover_keep()`) turns a
 strategy into ordinary chart parts: its formulas become hidden lines (`--line 'disc1_1
 = formula("…")'`) and its entries a marker rule (`disc1 long`) you can backtest,
 notify on or alert. `undiscover()` stops. The pieces work on their own: `formula("z(pct(
 price, 5), 50)")` in a line, and `zscore`, `change_bp`, `range_pos`, `updown`,
 `volatility`, `gap` for arrays.
+
+The panel has tabs along its top (`discover_view("compare")`, `--discover-view compare`):
+
+| tab | what it shows |
+| --- | --- |
+| **strategies** | each strategy's rules, its record picked, walking forward and live, and what it risked |
+| **compare** | all of them side by side: what each made where it wasn't picked (walking forward + live), max drawdown, live, an average trade, t, won, trades, worst, best, vs holding, the trade it's in now — with the best at each up top (most made, smallest and largest drawdown, surest, best live, all live together). Sort by any of them (the **sort** buttons, `discover_sort("drawdown")`, `--discover-sort drawdown`): the best first, ▾ marks the column. On a narrow screen it keeps the columns that fit and says which a wider one adds |
+| **equity** | each strategy's running total, trade by trade, on one chart in its legend colour (over all the data loaded, so it includes where it was picked) |
+| **trades** | every paper trade across them, open ones first, then the newest: when, which, ▲/▼, in → out, the result, how long |
+| **theories** | what strategies are built from: when a formula is in a tail of its range, what the price did a while later — green ones held walking forward |
+| **lessons** | each review's *?* why it isn't paying and *✎* what a repair changed, what was retired, and the retired ones still watched |
+
+Tap a row on any of them to draw that strategy's trades; the mouse wheel or the ▲/▼
+lines scroll a long tab.
 
 Be sceptical: most of what looks good fades, and few edges survive costs — on BTC the
 moves it finds are fractions of a basis point, so give it more than the price.
