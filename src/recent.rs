@@ -112,7 +112,7 @@ pub fn portable(cli: &Cli) -> Cli {
 
 /// Same file or command: the newer view replaces the older.
 fn same_source(a: &Cli, b: &Cli) -> bool {
-    a.input == b.input && a.cmd == b.cmd && a.ssh == b.ssh
+    a.input == b.input && a.cmd == b.cmd && a.ssh == b.ssh && a.stream == b.stream
 }
 
 /// Remember a chart that was viewed. Piped input can't be reopened, so it isn't kept.
@@ -121,7 +121,9 @@ pub fn remember(cli: &Cli) {
 }
 
 fn try_remember(cli: &Cli) -> Result<()> {
-    let from_stdin = cli.cmd.is_none() && cli.input.as_ref().is_none_or(|p| p.as_os_str() == "-");
+    let from_stdin = cli.cmd.is_none()
+        && cli.stream.is_none()
+        && cli.input.as_ref().is_none_or(|p| p.as_os_str() == "-");
     if from_stdin || !cli.has_parser() {
         return Ok(());
     }
@@ -207,6 +209,9 @@ impl Recent {
             .unwrap_or_default();
         if let Some(c) = &cli.cmd {
             return format!("{host}{c}");
+        }
+        if let Some(u) = &cli.stream {
+            return crate::stream::short(u);
         }
         let name = cli
             .input

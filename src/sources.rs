@@ -94,8 +94,8 @@ impl Merge {
                 e.to_string().lines().next().unwrap_or("")
             )
         })?;
-        if cli.cmd.is_none() && cli.input.is_none() {
-            anyhow::bail!("--merge '{spec}': no command or file to read");
+        if !cli.has_source() {
+            anyhow::bail!("--merge '{spec}': no command, file or stream to read");
         }
         if !cli.has_parser() {
             anyhow::bail!("--merge '{spec}': say how to read it (--format, --regex, --json…)");
@@ -181,7 +181,7 @@ pub fn rename(name: &str, ds: &mut Dataset) {
 /// builder work as usual). `args` includes the program name; returns the new
 /// arguments, or `None` when there's nothing to do.
 pub fn promote(cli: &Cli, args: &[String]) -> Result<Option<Vec<String>>> {
-    if cli.cmd.is_some() || cli.input.is_some() || cli.has_parser() {
+    if cli.has_source() || cli.has_parser() {
         return Ok(None);
     }
     // Only --merge sources: the first is the main one, named after itself.

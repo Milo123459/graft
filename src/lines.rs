@@ -403,6 +403,167 @@ pub fn stoch(high: &[f64], low: &[f64], close: &[f64], n: usize) -> Vec<f64> {
         .collect()
 }
 
+// ───────────── indicators for short-term trading (bp = 1/100 of a percent) ─────────────
+// Each is NaN until it has n points behind it.
+
+/// Change over the last n points, in bp: `(v / v[n back] − 1) × 10000`.
+pub fn change(values: &[f64], n: usize) -> Vec<f64> {
+    let n = n.max(1);
+    (0..values.len())
+        .map(|i| {
+            if i >= n && values[i - n] != 0.0 {
+                (values[i] / values[i - n] - 1.0) * 1e4
+            } else {
+                f64::NAN
+            }
+        })
+        .collect()
+}
+
+/// How far each value is from its average over the last n points, in standard
+/// deviations of those points (0 when they're all the same).
+pub fn zscore(values: &[f64], n: usize) -> Vec<f64> {
+    let n = n.max(2);
+    // Measured from the first value, so big numbers (prices) keep their precision.
+    let base = values.first().copied().unwrap_or(0.0);
+    let (mut sum, mut sq) = (0.0, 0.0);
+    let mut out = Vec::with_capacity(values.len());
+    for (i, &v) in values.iter().enumerate() {
+        let d = v - base;
+        sum += d;
+        sq += d * d;
+        if i >= n {
+            let old = values[i - n] - base;
+            sum -= old;
+            sq -= old * old;
+        }
+        if i + 1 < n {
+            out.push(f64::NAN);
+            continue;
+        }
+        let mean = sum / n as f64;
+        let sd = (sq / n as f64 - mean * mean).max(0.0).sqrt();
+        out.push(if sd > 0.0 { (d - mean) / sd } else { 0.0 });
+    }
+    out
+}
+
+/// Where each value sits in the range of the last n points: 0 at the lowest, 100 at
+/// the highest (50 when flat).
+pub fn range_pos(values: &[f64], n: usize) -> Vec<f64> {
+    use std::collections::VecDeque;
+    let n = n.max(2);
+    // Indices of candidate highs (falling values) and lows (rising values).
+    let (mut hi, mut lo): (VecDeque<usize>, VecDeque<usize>) = (VecDeque::new(), VecDeque::new());
+    let mut out = Vec::with_capacity(values.len());
+    for (i, &v) in values.iter().enumerate() {
+        while hi.back().is_some_and(|&j| values[j] <= v) {
+            hi.pop_back();
+        }
+        hi.push_back(i);
+        while lo.back().is_some_and(|&j| values[j] >= v) {
+            lo.pop_back();
+        }
+        lo.push_back(i);
+        while hi.front().is_some_and(|&j| j + n <= i) {
+            hi.pop_front();
+        }
+        while lo.front().is_some_and(|&j| j + n <= i) {
+            lo.pop_front();
+        }
+        if i + 1 < n {
+            out.push(f64::NAN);
+            continue;
+        }
+        let (h, l) = (values[hi[0]], values[lo[0]]);
+        out.push(if h > l {
+            (v - l) / (h - l) * 100.0
+        } else {
+            50.0
+        });
+    }
+    out
+}
+
+/// The share of the last n moves that were up, in % (one that didn't move counts half).
+pub fn updown(values: &[f64], n: usize) -> Vec<f64> {
+    let n = n.max(1);
+    let score = |i: usize| -> f64 {
+        match values[i].partial_cmp(&values[i - 1]) {
+            Some(std::cmp::Ordering::Greater) => 1.0,
+            Some(std::cmp::Ordering::Less) | None => 0.0,
+            Some(std::cmp::Ordering::Equal) => 0.5,
+        }
+    };
+    let mut sum = 0.0;
+    let mut out = Vec::with_capacity(values.len());
+    for i in 0..values.len() {
+        if i >= 1 {
+            sum += score(i);
+        }
+        if i > n {
+            sum -= score(i - n);
+        }
+        out.push(if i >= n {
+            sum / n as f64 * 100.0
+        } else {
+            f64::NAN
+        });
+    }
+    out
+}
+
+/// Volatility: the standard deviation of the point-to-point changes over the last n
+/// points, in bp.
+pub fn volatility(values: &[f64], n: usize) -> Vec<f64> {
+    let n = n.max(2);
+    let step = |i: usize| -> f64 {
+        if values[i - 1] != 0.0 {
+            (values[i] / values[i - 1] - 1.0) * 1e4
+        } else {
+            0.0
+        }
+    };
+    let (mut sum, mut sq) = (0.0, 0.0);
+    let mut out = Vec::with_capacity(values.len());
+    for i in 0..values.len() {
+        if i >= 1 {
+            let r = step(i);
+            sum += r;
+            sq += r * r;
+        }
+        if i > n {
+            let r = step(i - n);
+            sum -= r;
+            sq -= r * r;
+        }
+        if i < n {
+            out.push(f64::NAN);
+            continue;
+        }
+        let mean = sum / n as f64;
+        out.push((sq / n as f64 - mean * mean).max(0.0).sqrt());
+    }
+    out
+}
+
+/// `a` relative to `b`, in bp: `(a / b − 1) × 10000` (lined up at their ends when one
+/// is shorter).
+pub fn gap(a: &[f64], b: &[f64]) -> Vec<f64> {
+    let len = a.len().min(b.len());
+    let (a, b) = (&a[a.len() - len..], &b[b.len() - len..]);
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| {
+            if *y != 0.0 {
+                (x / y - 1.0) * 1e4
+            } else {
+                f64::NAN
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

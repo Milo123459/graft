@@ -4,9 +4,12 @@ mod backtest;
 mod builder;
 mod cli;
 mod data;
+mod discover;
 mod explain;
 mod export;
+mod formula;
 mod interactive;
+mod lab;
 mod lines;
 mod marks;
 mod notify;
@@ -24,6 +27,7 @@ mod snapshots;
 mod source;
 mod sources;
 mod stats;
+mod stream;
 mod suggest;
 mod template;
 mod time;
@@ -106,7 +110,7 @@ fn run() -> Result<ExitCode> {
     let color = stdout_tty && !cli.no_color;
     let interactive =
         !cli.once && !cli.no_chart && cli.explain.is_none() && cli.export.is_empty() && stdout_tty;
-    let no_source = cli.cmd.is_none() && cli.input.is_none();
+    let no_source = !cli.has_source();
 
     // The format is never guessed: without one, the builder offers suggestions to pick
     // from (interactive), or the error lists them as commands.
@@ -175,11 +179,28 @@ fn promote_dashboard(
 }
 
 /// "No format given", listing the formats that fit a sample of the input.
+/// The first records of a stream (up to 50, or what came in 8 seconds).
+pub fn sample_stream(spec: SourceSpec) -> Vec<String> {
+    let rx = source::spawn(spec);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    let mut lines = Vec::new();
+    while lines.len() < 50 {
+        let left = end.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(source::Event::Line(l, _)) => lines.push(l),
+            Ok(source::Event::Error(_) | source::Event::Eof) | Err(_) => break,
+            Ok(source::Event::SampleDone) => {}
+        }
+    }
+    lines
+}
+
 fn no_format_error(cli: &Cli, interactive: bool) -> anyhow::Error {
     let what = cli
         .cmd
         .as_deref()
         .map(|c| format!("`{c}`"))
+        .or_else(|| cli.stream.clone())
         .or_else(|| cli.input.as_ref().map(|p| p.display().to_string()))
         .unwrap_or_else(|| "stdin".into());
     let mut msg =
@@ -196,6 +217,7 @@ fn no_format_error(cli: &Cli, interactive: bool) -> anyhow::Error {
             Some(&host),
         )
         .unwrap_or_default(),
+        Ok(spec @ SourceSpec::Stream { .. }) => sample_stream(spec),
         Ok(SourceSpec::Stdin) => std::io::stdin()
             .lines()
             .map_while(Result::ok)
@@ -252,10 +274,19 @@ fn run_once(
     timeframe: transform::Timeframe,
 ) -> Result<ExitCode> {
     let cli = &cli.with_params();
+    // A stream never ends: take --count records of it (1 by default).
+    let mut records_left =
+        matches!(spec, SourceSpec::Stream { .. }).then(|| cli.count.unwrap_or(1));
     for ev in rx {
         match ev {
             Event::Line(line, meta) => {
                 let _ = session.feed(&line, &meta);
+                if let Some(n) = records_left.as_mut() {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        break;
+                    }
+                }
             }
             Event::Error(e) => eprintln!("graft: {e}"),
             Event::SampleDone => {}

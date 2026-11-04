@@ -58,7 +58,11 @@ The user (milo123459, repo `milo123459/graft`, branch `master`):
 | `src/render/mod.rs` | `ChartWidget`, `render_xy` (lines, `front=` order, candles via `draw_candles`, readout box), `candle_roles_named/of`, `pane_view` (candles panes bring their OHLC along) |
 | `src/render/panes.rs` | `Pane` spec: series, `kind=`, `lines=`, `front=`, `source=`, `title=` (takes the rest) |
 | `src/tui.rs` (10k lines) | `App`, the viewer: toolbar, legend row, popups, console, settings menu, markers menu, backfill, params, backtest/strategies/sweep commands. Tests are at the bottom (`pub(crate) mod tests`: `app()`, `screen`, `screen_sized`, `run`, `key`, `mouse`, `find`, `type_str`) |
-| `src/builder.rs` | the format builder (F) |
+| `src/builder.rs` | the format builder (F); sources: file, command, stream, stdin |
+| `src/stream.rs` | `--stream URL` (`--ws`/`--sse`): WebSockets (tungstenite + rustls/ring, webpki roots) and streaming HTTP (ureq): server-sent events (`data:` = one record) or lines; `--send` messages; reconnect with backoff |
+| `src/formula.rs` | the formula language (`z(pct(price, 5), 50)`): parse/print, eval over lined-up columns (NaN-aware, causal), random/mutate/cross for evolution, `classics()` seeds |
+| `src/discover.rs` | the discovery engine: `Input` (price, bid/ask by name, other series), evolve formulas (fitness = best |t| of forward returns after its 10% tails, first 70% only), theories (bar = √(2 ln tests)), strategies (exits sized from σ, costs: fee + ask/bid), dedupe by overlapping entries |
+| `src/lab.rs` | the viewer's lab: background searches every 20 s (3 s budget, pool carried over), paper-trading tracked strategies from when found, markers |
 | `src/tutorial.rs` | tutorial steps (keys, examples, checks) |
 
 ## Features added in this session (newest last)
@@ -98,11 +102,13 @@ The user (milo123459, repo `milo123459/graft`, branch `master`):
 
 ## Pending (agreed with the user, roughly in order)
 
-1. **WebSocket sources** (`--ws URL --send MSG`), e.g. Hyperliquid
-   `wss://api.hyperliquid.xyz/ws` with
-   `{"method":"subscribe","subscription":{"type":"candle","coin":"ETH","interval":"1m"}}`.
-   Not started. Needs a websocket crate with TLS (e.g. tungstenite + rustls) and a new
-   `SourceSpec`. The user asked about it twice.
+1. Done (2026-11-04): **streams** (`--stream`, `--ws`, `--sse`, `--send`) and
+   **discovery** (`discover()`, `--discover FEE`, `E`, the discover panel,
+   `discover_keep/pick`, `undiscover`, `formula()`, `zscore change_bp range_pos updown
+   volatility gap`). Ideas next: let users seed the search with their own formulas,
+   multi-asset features (several --merge'd prices), a maker-fee/limit-order exit model,
+   walk-forward (rolling) re-validation of tracked strategies, alerts on live entries.
+   Six tests fail on macOS only (presets use sysctl, tests expect /proc): pre-existing.
 2. **Volume bars under the candles** (own small scale in the candles pane) and a
    **Heikin-Ashi** candle style.
 3. **Draw tool**: pick a shape (horizontal level, vertical line, box, trend line), tap

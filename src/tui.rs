@@ -102,6 +102,10 @@ const HELP: &[(&str, &str)] = &[
         "alerts & notifications: add, edit, where they go, test",
     ),
     ("C", "copy the command for this view"),
+    (
+        "discover / E",
+        "invent formulas and strategies from the data, paper-trade them",
+    ),
     ("⋯", "more: chart type, log scale, target lines, pause,"),
     (
         "",
@@ -165,6 +169,7 @@ enum Cmd {
     Sources,
     Legend,
     Undo,
+    Discover,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -230,7 +235,21 @@ enum Hit {
     InsertCommand(&'static str),
     /// The tutorial panel.
     Tutorial(TutorialHit),
+    /// The discover panel.
+    Lab(LabHit),
     MenuBackground,
+}
+
+/// The discover panel's parts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LabHit {
+    /// Show strategy n's trades on the chart.
+    Pick(usize),
+    Keep,
+    SearchNow,
+    /// Strategies or theories.
+    View,
+    Stop,
 }
 
 /// Whose parameters: the main source, merged source `n`, or pane `n`'s own source.
@@ -523,6 +542,14 @@ pub struct App {
     selection: Option<(f64, f64)>,
     hidden: HashSet<String>,
     show_stats: bool,
+    /// Discovering strategies (`discover()`), and where its markers start in
+    /// `opts.marks`.
+    lab: Option<crate::lab::Lab>,
+    lab_marks_at: usize,
+    /// Discovering was started at some point (the tutorial's check).
+    lab_started: bool,
+    /// The discover panel shows theories instead of strategies.
+    lab_theories: bool,
     paused: bool,
     help: bool,
     /// `:help` (the console reference) is open.
@@ -671,6 +698,15 @@ impl App {
             paged: false,
             built_uncut: false,
             show_stats: cli.stats,
+            lab: cli.discover.map(|fee| {
+                crate::lab::Lab::new(crate::discover::Settings {
+                    fee,
+                    ..Default::default()
+                })
+            }),
+            lab_marks_at: 0,
+            lab_started: cli.discover.is_some(),
+            lab_theories: false,
             mouse: !cli.no_mouse,
             cli,
             session,
@@ -774,6 +810,7 @@ impl App {
         c.split = self.opts.split;
         c.log = self.opts.log;
         c.stats = self.show_stats;
+        c.discover = self.lab.as_ref().map(|l| l.settings.fee);
         c.no_mouse = !self.mouse;
         c.target = self.opts.analysis.targets.to_specs();
         c.trend = self.opts.trends.clone();
@@ -880,6 +917,7 @@ impl App {
             self.shown_merge_problems = problems;
         }
         self.rebuild(false);
+        self.tick_lab();
         // Back at the newest (or the view reset): the timeframe cuts again.
         if (self.paged && self.view.is_some()) != self.built_uncut {
             if self.view.is_none() {
@@ -1089,6 +1127,172 @@ impl App {
         }
         marks.extend(self.manual_marks.iter().cloned());
         self.opts.marks = marks;
+        self.lab_marks_at = self.opts.marks.len();
+        if let Some(lab) = &self.lab {
+            self.opts.marks.extend(lab.marks());
+        }
+    }
+
+    // ───────────── discover ─────────────
+
+    fn lab_hit(&mut self, h: LabHit) {
+        match h {
+            LabHit::Pick(i) => {
+                if let Some(lab) = self.lab.as_mut() {
+                    lab.selected = i;
+                }
+                self.place_lab_marks();
+            }
+            LabHit::Keep => match self.discover_keep(None) {
+                Ok(text) => self.note(text, false),
+                Err(e) => self.say(e, true),
+            },
+            LabHit::SearchNow => {
+                if let Some(lab) = self.lab.as_mut() {
+                    lab.rerun();
+                }
+                self.tick_lab();
+            }
+            LabHit::View => self.lab_theories = !self.lab_theories,
+            LabHit::Stop => self.stop_discover(),
+        }
+    }
+
+    /// Run the discovery lab: searches in the background, paper trades on new data.
+    fn tick_lab(&mut self) {
+        let Some(lab) = self.lab.as_mut() else {
+            return;
+        };
+        let before = (lab.runs, lab.report.is_some(), lab.selected);
+        let news = lab.tick(&self.ds);
+        let changed = before != (lab.runs, lab.report.is_some(), lab.selected) || news.is_some();
+        let trading = !lab.tracked.is_empty();
+        if let Some(n) = news {
+            self.say(n, false);
+        }
+        if changed || trading {
+            self.place_lab_marks();
+        }
+    }
+
+    fn place_lab_marks(&mut self) {
+        self.opts
+            .marks
+            .truncate(self.lab_marks_at.min(self.opts.marks.len()));
+        if let Some(lab) = &self.lab {
+            self.opts.marks.extend(lab.marks());
+        }
+    }
+
+    /// `discover(fee, series)`: start (or restart) the lab.
+    fn start_discover(&mut self, fee: f64, series: Option<String>) {
+        if let Some(name) = &series
+            && crate::discover::price_series(&self.ds, Some(name)).is_none()
+        {
+            let names: Vec<&str> = self.ds.series.iter().map(|s| s.name.as_str()).collect();
+            self.say(
+                format!(
+                    "discover: there's no series called \"{name}\" (there's {})",
+                    names.join(", ")
+                ),
+                true,
+            );
+            return;
+        }
+        let settings = crate::discover::Settings {
+            fee,
+            series,
+            ..Default::default()
+        };
+        self.lab = Some(crate::lab::Lab::new(settings));
+        self.lab_started = true;
+        self.lab_theories = false;
+        let on = crate::discover::price_series(
+            &self.ds,
+            self.lab.as_ref().and_then(|l| l.settings.series.as_deref()),
+        )
+        .map_or("the price".to_string(), |s| s.name.clone());
+        self.say(
+            format!(
+                "discover: inventing formulas on {on} and testing them (fee {fee}% a side) — strategies are paper-traded from when they're found"
+            ),
+            false,
+        );
+        self.tick_lab();
+    }
+
+    fn stop_discover(&mut self) {
+        self.lab = None;
+        self.place_lab_marks();
+    }
+
+    /// `discover_keep(n)`: the strategy's formulas become (hidden) lines and its entries
+    /// a marker rule, kept with the chart.
+    fn discover_keep(&mut self, n: Option<usize>) -> Result<String, String> {
+        let lab = self
+            .lab
+            .as_ref()
+            .ok_or("discover_keep: discover isn't running — discover() starts it")?;
+        let i = match n {
+            Some(n) => n
+                .checked_sub(1)
+                .ok_or("discover_keep: strategies count from 1")?,
+            None => lab.selected,
+        };
+        let t = lab
+            .tracked
+            .get(i)
+            .ok_or_else(|| format!("discover_keep: there's no strategy {} yet", i + 1))?;
+        let report = lab
+            .report
+            .as_ref()
+            .ok_or("discover_keep: nothing found yet")?;
+        let s = &t.found.strategy;
+        let mut k = 1;
+        let taken = |k: usize, me: &Self| {
+            let p = format!("disc{k}");
+            me.session.custom.iter().any(|l| l.name.starts_with(&p))
+                || me.mark_rules.iter().any(|r| {
+                    r.label
+                        .as_deref()
+                        .is_some_and(|l| l.starts_with(&format!("{p} ")))
+                })
+        };
+        while taken(k, self) {
+            k += 1;
+        }
+        let mut conds = Vec::new();
+        let mut names = Vec::new();
+        for (j, c) in s.conds.iter().enumerate() {
+            let name = format!("disc{k}_{}", j + 1);
+            let line = crate::lines::CustomLine::parse(&format!(
+                "{name} = formula({:?})",
+                c.feature.to_string()
+            ))?;
+            self.session.custom.push(line);
+            self.hidden.insert(name.clone());
+            let th = format!("{:.8}", c.threshold);
+            let th = th.trim_end_matches('0').trim_end_matches('.');
+            conds.push(format!("{name} {} {th}", if c.above { ">" } else { "<" }));
+            names.push(name);
+        }
+        let long = s.side == crate::discover::Side::Long;
+        let label = format!("disc{k} {}", if long { "long" } else { "short" });
+        let spec = format!(
+            "{} => {label} | {}",
+            conds.join(" && "),
+            if long { "▲ lime" } else { "▼ red" }
+        );
+        let rule = crate::marks::MarkRule::parse(&spec)?;
+        self.mark_rules.push(rule);
+        let exit = s.describe(&report.input);
+        let exit = exit.split(" · ").last().unwrap_or("").to_string();
+        let hold = s.exit.hold;
+        self.rebuild(true);
+        Ok(format!(
+            "kept as the marker rule \"{label}\" (lines {}, hidden) — it was tested as: {exit}. Try backtest(\"{label}\", {hold}), or notify on it from the markers menu (K)",
+            names.join(", ")
+        ))
     }
 
     /// Send a notification to the `--notify` targets (the bell if there are none), and
@@ -1136,6 +1340,7 @@ impl App {
             C::Line => !self.session.custom.is_empty(),
             C::Undo => t.is_some_and(|t| t.undone),
             C::Copied => t.is_some_and(|t| t.copied),
+            C::Discover => self.lab_started,
         }
     }
 
@@ -3677,6 +3882,8 @@ impl App {
             Cmd::Split => self.opts.split = !self.opts.split,
             Cmd::Log => self.opts.log = !self.opts.log,
             Cmd::Stats => self.show_stats = !self.show_stats,
+            Cmd::Discover if self.lab.is_some() => self.stop_discover(),
+            Cmd::Discover => self.start_discover(0.0, None),
             Cmd::Forecast => self.toggle_forecast(),
             Cmd::Pause => {
                 self.paused = !self.paused;
@@ -3913,6 +4120,9 @@ impl App {
         }
         if !self.alerts.is_empty() {
             v.extend(pick(Cmd::Alerts));
+        }
+        if self.lab.is_some() {
+            v.extend(pick(Cmd::Discover));
         }
         if self.toolbar_more {
             for b in &full {
@@ -5903,6 +6113,27 @@ impl App {
                 let text = self.strategies(fee);
                 self.note(text, false);
             }
+            Action::Discover(fee, series) => self.start_discover(fee, series),
+            Action::Undiscover => self.stop_discover(),
+            Action::DiscoverPick(n) => match self.lab.as_mut() {
+                Some(lab) if n >= 1 && n <= lab.tracked.len() => {
+                    lab.selected = n - 1;
+                    self.lab_theories = false;
+                    self.place_lab_marks();
+                }
+                Some(lab) => {
+                    let msg = format!(
+                        "discover_pick: pick 1 to {} (the strategies in the panel)",
+                        lab.tracked.len()
+                    );
+                    self.say(msg, true);
+                }
+                None => self.say("discover_pick: discover() starts discovering", true),
+            },
+            Action::DiscoverKeep(n) => match self.discover_keep(n) {
+                Ok(text) => self.note(text, false),
+                Err(e) => self.say(e, true),
+            },
             Action::Sweep(fee) => {
                 let (text, error) = match self.sweep(fee) {
                     Ok(t) => (t, false),
@@ -6578,6 +6809,7 @@ impl App {
             KeyCode::Char('y') => Cmd::Log,
             KeyCode::Char('x') => Cmd::Split,
             KeyCode::Char('s') => Cmd::Stats,
+            KeyCode::Char('E') => Cmd::Discover,
             KeyCode::Char('f') => Cmd::Forecast,
             KeyCode::Char('F') => Cmd::Format,
             KeyCode::Char('M') => Cmd::Mouse,
@@ -6769,6 +7001,10 @@ impl App {
                         }
                         Hit::CloseNote => {
                             self.console_note = None;
+                            Transition::None
+                        }
+                        Hit::Lab(h) => {
+                            self.lab_hit(h);
                             Transition::None
                         }
                         Hit::Layer(l, right) => {
@@ -7118,6 +7354,7 @@ impl App {
             .active(self.sources_menu),
             b("forecast", Cmd::Forecast).active(self.opts.forecast.is_some()),
             b("split", Cmd::Split).active(self.opts.split),
+            b("discover", Cmd::Discover).active(self.lab.is_some()),
         ];
         if !self.undo.is_empty() {
             v.insert(0, b("↶ undo", Cmd::Undo));
@@ -7306,9 +7543,19 @@ impl App {
         let note = self.note_lines(area.width);
         let note_h = note.len() as u16;
         let pane_h = self.pane_panel_height(area.width);
+        let lab_rows = self.lab_rows(area.width.saturating_sub(2));
+        let lab_buttons = self.lab_buttons();
+        let lab_h = if self.lab.is_some() {
+            let want =
+                lab_rows.len() as u16 + 2 + flow_height(&lab_buttons, area.width.saturating_sub(2));
+            want.min(area.height * 45 / 100).max(5)
+        } else {
+            0
+        };
         let [
             chart,
             pane_area,
+            lab_area,
             stats,
             tool_area,
             note_area,
@@ -7317,6 +7564,7 @@ impl App {
         ] = Layout::vertical([
             Constraint::Min(6),
             Constraint::Length(pane_h),
+            Constraint::Length(lab_h),
             Constraint::Length(stats_h),
             Constraint::Length(tool_h),
             Constraint::Length(note_h),
@@ -7346,6 +7594,9 @@ impl App {
         }
         if pane_h > 0 {
             self.draw_pane_panel(f, pane_area);
+        }
+        if lab_h > 0 {
+            self.draw_lab(f, lab_area, lab_rows, &lab_buttons);
         }
         if self.show_stats {
             self.draw_stats(f, stats);
@@ -7595,6 +7846,223 @@ impl App {
             .collect();
         lines.truncate(max);
         lines
+    }
+
+    /// The discover panel's rows (wrapped to `width`), each with what a tap on it does.
+    fn lab_rows(&self, width: u16) -> Vec<(Line<'static>, Option<Hit>)> {
+        let Some(lab) = &self.lab else {
+            return Vec::new();
+        };
+        let w = width.max(10) as usize;
+        let mut rows: Vec<(Line<'static>, Option<Hit>)> = Vec::new();
+        let push = |text: String,
+                    style: Style,
+                    hit: Option<Hit>,
+                    rows: &mut Vec<(Line<'static>, Option<Hit>)>| {
+            for (k, l) in wrap(&text, w).into_iter().enumerate() {
+                let l = if k == 0 { l } else { format!("  {l}") };
+                rows.push((Line::styled(l, style), hit));
+            }
+        };
+        let dim = Style::default().fg(Color::DarkGray);
+        let plain = Style::default();
+        let status = if lab.searching() {
+            "searching…".to_string()
+        } else {
+            lab.next_in()
+                .map_or(String::new(), |s| format!("next in {s}s"))
+        };
+        match (&lab.report, &lab.waiting) {
+            (_, Some(w)) if lab.report.is_none() => {
+                push(format!("{w} · {status}"), dim, None, &mut rows);
+            }
+            (None, _) => push(format!("first search… {status}"), dim, None, &mut rows),
+            (Some(r), _) => {
+                let invented = r.pool.iter().filter(|s| s.invented).count();
+                push(
+                    format!(
+                        "search {} · {} · {} pts · {:.1}s · {} formulas, {} strategies tried · {invented}/{} best formulas invented · costs {:.1}bp a trip · {status}",
+                        lab.runs,
+                        r.input.name,
+                        r.input.len(),
+                        r.took.as_secs_f64(),
+                        r.formulas,
+                        r.tried,
+                        r.pool.len(),
+                        r.cost
+                    ),
+                    dim,
+                    None,
+                    &mut rows,
+                );
+            }
+        }
+        let Some(report) = &lab.report else {
+            return rows;
+        };
+        if self.lab_theories {
+            push(
+                format!(
+                    "theories: |t| ≥ {:.1} on the first 70% (stronger than luck gives from {} tests), checked on the last 30%",
+                    report.bar, report.tests
+                ),
+                Style::default().add_modifier(Modifier::BOLD),
+                None,
+                &mut rows,
+            );
+            if report.theories.is_empty() {
+                push(
+                    "none yet: nothing stood out from luck".into(),
+                    dim,
+                    None,
+                    &mut rows,
+                );
+            }
+            for t in &report.theories {
+                let style = if t.held() {
+                    Style::default().fg(Color::LightGreen)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                push(
+                    format!("• {}", t.describe(&report.input)),
+                    style,
+                    None,
+                    &mut rows,
+                );
+            }
+            push(
+                format!(
+                    "holding: first 70% {:+.1}bp, last 30% {:+.1}bp",
+                    report.hold[0], report.hold[1]
+                ),
+                dim,
+                None,
+                &mut rows,
+            );
+            return rows;
+        }
+        if lab.tracked.is_empty() {
+            push(
+                format!(
+                    "no strategy has made money after costs ({:.1}bp a round trip) on both the first 70% and the last 30% yet — it keeps looking as data comes in",
+                    report.cost
+                ),
+                plain,
+                None,
+                &mut rows,
+            );
+            return rows;
+        }
+        push(
+            "strategies: picked on the first 70%, checked on the last 30%, then paper-traded live · tap one for its trades".into(),
+            Style::default().add_modifier(Modifier::BOLD),
+            None,
+            &mut rows,
+        );
+        for (i, t) in lab.tracked.iter().enumerate() {
+            let hit = Some(Hit::Lab(LabHit::Pick(i)));
+            let mut head = Style::default().fg(Color::White);
+            if i == lab.selected {
+                head = head.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+            }
+            let mark = if i == lab.selected { "▸" } else { " " };
+            push(
+                format!(
+                    "{mark}{} {}",
+                    i + 1,
+                    t.found.strategy.describe(&report.input)
+                ),
+                head,
+                hit,
+                &mut rows,
+            );
+            let live = if t.live.n == 0 {
+                "live: no trades yet".to_string()
+            } else {
+                format!("live {}", t.live.brief())
+            };
+            let open = t
+                .open
+                .map_or(String::new(), |o| format!(" · in a trade {o:+.1}bp"));
+            let color = if t.live.n == 0 {
+                Color::Gray
+            } else if t.live.mean > 0.0 {
+                Color::LightGreen
+            } else {
+                Color::LightRed
+            };
+            push(
+                format!(
+                    "↳ first 70% {} · last 30% {} · {live}{open} · found in search {}",
+                    t.found.picked.brief(),
+                    t.found.checked.brief(),
+                    t.run
+                ),
+                Style::default().fg(color),
+                hit,
+                &mut rows,
+            );
+        }
+        rows
+    }
+
+    fn lab_buttons(&self) -> Vec<Button<Hit>> {
+        let Some(lab) = &self.lab else {
+            return Vec::new();
+        };
+        let mut v = Vec::new();
+        if !lab.tracked.is_empty() && !self.lab_theories {
+            v.push(Button::new(
+                format!("keep {}", lab.selected + 1),
+                Hit::Lab(LabHit::Keep),
+            ));
+        }
+        v.push(Button::new(
+            if self.lab_theories {
+                "strategies"
+            } else {
+                "theories"
+            },
+            Hit::Lab(LabHit::View),
+        ));
+        v.push(Button::new("search now", Hit::Lab(LabHit::SearchNow)).active(lab.searching()));
+        v.push(Button::new("stop", Hit::Lab(LabHit::Stop)));
+        v
+    }
+
+    fn draw_lab(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        rows: Vec<(Line<'static>, Option<Hit>)>,
+        buttons: &[Button<Hit>],
+    ) {
+        let fee = self.lab.as_ref().map_or(0.0, |l| l.settings.fee);
+        let block = Block::bordered()
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(format!(" discover · fee {fee}% a side "));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let bh = flow_height(buttons, inner.width).min(inner.height);
+        let body_h = inner.height.saturating_sub(bh);
+        for (k, (line, hit)) in rows.into_iter().take(body_h as usize).enumerate() {
+            let r = Rect {
+                y: inner.y + k as u16,
+                height: 1,
+                ..inner
+            };
+            f.render_widget(Paragraph::new(line), r);
+            if let Some(h) = hit {
+                self.hits.push(r, h);
+            }
+        }
+        let b_area = Rect {
+            y: inner.y + body_h,
+            height: bh,
+            ..inner
+        };
+        crate::ui::render_buttons_quiet(buttons, b_area, f.buffer_mut(), &self.hits);
     }
 
     fn draw_stats(&self, f: &mut Frame, area: Rect) {
@@ -9341,6 +9809,135 @@ pub(crate) mod tests {
         key(app, KeyCode::Enter);
     }
 
+    /// A price that bounces back after every sharp drop (something to discover).
+    fn bouncy_log(n: usize) -> std::path::PathBuf {
+        let mut seed = 7u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 10_000) as f64 / 10_000.0 - 0.5
+        };
+        let mut p = vec![100.0f64];
+        let mut bounce = 0;
+        for i in 1..n {
+            let last = p[i - 1];
+            let mut step = rnd() * 0.1;
+            if bounce > 0 {
+                step += 0.03;
+                bounce -= 1;
+            } else if i > 5 && (last / p[i - 5] - 1.0) * 1e4 < -12.0 {
+                bounce = 5;
+            }
+            p.push(last * (1.0 + step / 100.0));
+        }
+        let path =
+            std::env::temp_dir().join(format!("graft-bouncy-{}-{n}.log", std::process::id()));
+        let text: String = p.iter().map(|v| format!("price={v:.4}\n")).collect();
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    fn wait_for_search(app: &mut App) {
+        let end = Instant::now() + Duration::from_secs(60);
+        while app
+            .lab
+            .as_ref()
+            .is_some_and(|l| l.report.is_none() || l.searching())
+            && Instant::now() < end
+        {
+            app.tick_lab();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn discovers_paper_trades_and_keeps_a_strategy() {
+        let path = bouncy_log(6000);
+        let mut app = app(&["graft", path.to_str().unwrap(), "--kv"]);
+        run(&mut app, "discover()");
+        assert!(app.lab.is_some());
+        wait_for_search(&mut app);
+        let lab = app.lab.as_ref().unwrap();
+        assert!(!lab.tracked.is_empty(), "{:?}", lab.waiting);
+        assert!(lab.tracked[0].found.checked.mean > 0.0);
+        // Its trades are on the chart.
+        assert!(
+            app.opts
+                .marks
+                .iter()
+                .any(|m| m.symbol == "▲" || m.symbol == "▼")
+        );
+        // At 46 columns: the panel, a strategy, its record, the buttons.
+        let s = screen_sized(&app, 46, 44);
+        if std::env::var("SHOW").is_ok() {
+            eprintln!("{s}");
+        }
+        assert!(s.contains("discover · fee 0% a side"), "{s}");
+        assert!(s.contains("first 70%") && s.contains("last 30%"), "{s}");
+        assert!(s.contains("keep 1") && s.contains("theories"), "{s}");
+        // The other view: theories.
+        let (x, y) = find(&app, "theories");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x, y);
+        assert!(app.lab_theories);
+        let s = screen_sized(&app, 46, 44);
+        assert!(s.contains("held") || s.contains("nothing stood out"), "{s}");
+        run(&mut app, "discover_pick(1)");
+        assert!(!app.lab_theories);
+        // Kept: formulas become hidden lines, entries a marker rule.
+        run(&mut app, "discover_keep(1)");
+        let note = app
+            .console_note
+            .as_ref()
+            .map(|n| n.text.clone())
+            .unwrap_or_default();
+        assert!(
+            note.starts_with("kept as the marker rule \"disc1 "),
+            "{note}"
+        );
+        assert!(
+            app.session
+                .custom
+                .iter()
+                .any(|l| l.name == "disc1_1" && l.expr.starts_with("formula("))
+        );
+        assert!(app.hidden.contains("disc1_1"));
+        assert!(
+            app.mark_rules
+                .iter()
+                .any(|r| r.label.as_deref().is_some_and(|l| l.starts_with("disc1 ")))
+        );
+        assert!(
+            app.opts.marks.iter().any(|m| m.rule.is_some()),
+            "the kept rule places markers"
+        );
+        // Saved with the chart, and the lab with it.
+        let args = app.current_cli().to_args();
+        assert!(args.iter().any(|a| a.contains("formula(")), "{args:?}");
+        assert!(args.contains(&"--discover".to_string()), "{args:?}");
+        run(&mut app, "undiscover()");
+        assert!(app.lab.is_none());
+        assert!(
+            !app.opts
+                .marks
+                .iter()
+                .any(|m| m.rule.is_none() && m.symbol == "•")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn discover_waits_for_enough_data() {
+        let mut app = app(&["graft", LOG]);
+        key(&mut app, KeyCode::Char('E'));
+        assert!(app.lab.is_some());
+        app.tick_lab();
+        let s = screen_sized(&app, 46, 30);
+        assert!(s.contains("collecting data"), "{s}");
+        key(&mut app, KeyCode::Char('E'));
+        assert!(app.lab.is_none());
+    }
+
     #[test]
     fn review_fixes_for_the_viewer() {
         // An edit ends with the command it opened: a rule added later (here by a key
@@ -9535,6 +10132,14 @@ pub(crate) mod tests {
                 }
                 Check::Copied => {
                     key(&mut app, KeyCode::Char('C'));
+                }
+                Check::Discover => {
+                    key(&mut app, KeyCode::Char('E'));
+                    assert!(app.lab.is_some());
+                    let phone = screen_sized(&app, 46, 40);
+                    assert!(phone.contains("discover · fee"), "{phone}");
+                    // Stopped again: the rest of the tour has the room.
+                    key(&mut app, KeyCode::Char('E'));
                 }
             };
             assert!(done(&app), "{check:?} not ticked off");

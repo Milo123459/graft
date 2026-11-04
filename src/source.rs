@@ -1,4 +1,5 @@
-//! Input sources: files (optionally followed), stdin, and periodically-run commands.
+//! Input sources: files (optionally followed), stdin, periodically-run commands and
+//! streams (WebSockets, server-sent events: `stream.rs`).
 //! Each runs on its own thread and streams lines over a channel.
 
 use std::fs::File;
@@ -32,6 +33,12 @@ pub enum SourceSpec {
         path: String,
         follow: bool,
     },
+    /// A WebSocket or a streaming HTTP response (server-sent events or lines), with
+    /// messages to send once connected.
+    Stream {
+        url: String,
+        send: Vec<String>,
+    },
 }
 
 impl SourceSpec {
@@ -47,6 +54,7 @@ impl SourceSpec {
             Self::Command {
                 cmd, ssh: Some(h), ..
             } => format!("{h}: {cmd}"),
+            Self::Stream { url, .. } => crate::stream::short(url),
             Self::Remote { host, path, .. } => format!(
                 "{host}:{}",
                 std::path::Path::new(path)
@@ -62,6 +70,7 @@ impl SourceSpec {
             Self::File { follow: true, .. }
                 | Self::Remote { follow: true, .. }
                 | Self::Stdin
+                | Self::Stream { .. }
                 | Self::Command { count: None, .. }
         )
     }
@@ -89,6 +98,7 @@ pub fn spawn(spec: SourceSpec) -> Receiver<Event> {
                 ssh,
             } => run_command(&cmd, every, count, ssh.as_deref(), &tx),
             SourceSpec::Remote { host, path, follow } => read_remote(&host, &path, follow, &tx),
+            SourceSpec::Stream { url, send } => crate::stream::run(&url, &send, &tx),
         };
         if let Err(e) = result {
             let _ = tx.send(Event::Error(e));

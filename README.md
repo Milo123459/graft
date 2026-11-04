@@ -85,6 +85,7 @@ graft -p cpu                           # a preset: cpu, memory, load, network, d
 | File / stdin | `graft FILE`, `graft -`, or pipe into `graft` |
 | Follow a file | `-f, --follow` (handles truncation/rotation) |
 | Run a command repeatedly | `-c, --cmd 'COMMAND'`, `-n, --every 2s`, `--count N` |
+| A stream a server pushes | `--stream URL` (or `--ws`, `--sse`): a WebSocket (`wss://…`; `--send MSG` goes out once connected, e.g. a subscription) or a streaming HTTP response (`https://…`: server-sent events, each event's `data:` is a record, or plain lines; with `--send` it's a POST). Reconnects when dropped. With `--once`, `--count N` records |
 | Keep only recent data | `-w, --window 6h` or `--window 500` (points); older data is dropped from memory |
 | Timeframe | `-L, --last 7d` (or `--last 500` points), `--since 2026-10-15`, `--until "2026-10-20 12:00"`: what's shown **and** analysed. The viewer can change it |
 
@@ -415,6 +416,51 @@ told about new ones, **✕** deletes one, **+ add rule** and **mark now** add mo
 go (bell, desktop, ntfy on your phone, a webhook or a command), with a test
 button.
 
+### Discovering strategies (`discover()`)
+
+`:discover(0.045)` (or `--discover 0.045`, or `E`, or the **discover** button) hunts
+for edges in a price as data streams in, without being told which indicators to use:
+
+1. **It invents formulas** over every series on the chart, in a small language:
+   `pct(price, 5)` (the change over 5 points, in bp), `z(…, 50)` (distance from the
+   50-point average in standard deviations), `pos` (place in the range, 0–100), `lag
+   diff mean ema std max min rsi slope`, `abs neg sign log`, `+ - * /` and `gap(a, b)`
+   (a relative to b, in bp). It starts from the usual indicators and random formulas
+   and evolves them: mutations (another window, another operation, a part replaced) and
+   crossovers (parts swapped between two good ones). A formula is fit when the price
+   moved clearly one way after its extremes (its lowest or highest 10%), judged on the
+   **first 70%** of the data only; formulas that drift out of their range, or whose
+   parts are of wildly different sizes, are dropped. The best 150 carry over to the next
+   search (every 20 s), so it keeps improving as data arrives.
+2. **Theories**: when a formula is in its lowest or highest 5% / 15%, what the price
+   does 5, 15, 50 or 150 points later, from moments far enough apart not to overlap.
+   Listed only when |t| beats what luck alone would give from that many tests, and
+   checked on the **last 30%** (✓ held / ✗ faded).
+3. **Strategies**: in the theory's direction, out after so many points or at a
+   take-profit / stop-loss sized from the usual move, with a filter from another
+   formula where it clearly helps. Costs come off every trade: the fee on each side, and
+   buying at the ask / selling at the bid when the chart has series named …bid… and
+   …ask…. A strategy has to make money on the first 70% to be checked on the last 30%,
+   and then it's **paper-traded live** from the moment it was found — the only record
+   the search never saw. The panel ranks them by the last 30% and live together.
+
+Tap a strategy (or `discover_pick(2)`) to draw its trades (▲/▼ in, • out with its
+result). **keep** (`discover_keep()`) turns it into ordinary chart parts: its formulas
+become hidden lines (`--line 'disc1_1 = formula("…")'`) and its entries a marker rule
+(`disc1 long`) you can backtest, notify on or alert. `undiscover()` stops. The pieces
+work on their own too: `formula("z(pct(price, 5), 50)")` in a line, and `zscore`,
+`change_bp`, `range_pos`, `updown`, `volatility`, `gap` for arrays.
+
+Be sceptical: most of what looks good fades, and on real prices few edges survive
+costs. A live BTC price with bid and ask, pushed 5 times a second:
+
+```sh
+graft --stream 'https://feed-v3.veranta.xyz/v1/stream?price_feed_ids=1' --json --time-field timestampUs \
+  --series 'price:USD = priceFeeds_0_price * 1e-8' --series 'bid:USD = priceFeeds_0_bestBidPrice * 1e-8' \
+  --series 'ask:USD = priceFeeds_0_bestAskPrice * 1e-8' --series 'confidence:USD = priceFeeds_0_confidence * 1e-8' \
+  --select price,bid,ask,confidence --hide bid,ask,confidence --window 20000 --discover 0.045
+```
+
 ### Counting log lines
 
 Some logs don't have numbers worth charting, but *how often* something happens
@@ -540,8 +586,8 @@ on your machine are listed. CPU, memory, load, network and ping have both Linux
 
 Tap one to start it, or tap **edit** to open it in the builder and adjust it.
 Every preset spells out its format, so it also works as an example to copy.
-Your saved profiles appear in the same list, followed by **chart a file** and
-**chart a command**.
+Your saved profiles appear in the same list, followed by **chart a file**,
+**chart a command** and **chart a stream** (a WebSocket or server-sent events URL).
 
 ## Building a chart interactively
 

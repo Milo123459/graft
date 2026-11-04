@@ -48,6 +48,8 @@ enum Field {
 enum Src {
     File,
     Command,
+    /// A WebSocket or server-sent events.
+    Stream,
     Stdin,
 }
 
@@ -263,6 +265,8 @@ impl Builder {
     pub fn new(cli: Cli, live: Option<Live>, previous: Option<Box<App>>) -> Self {
         let src = if cli.cmd.is_some() {
             Src::Command
+        } else if cli.stream.is_some() {
+            Src::Stream
         } else if live.is_some() || cli.input.as_ref().is_some_and(|p| p.as_os_str() == "-") {
             Src::Stdin
         } else {
@@ -270,6 +274,7 @@ impl Builder {
         };
         let source = match src {
             Src::Command => cli.cmd.clone().unwrap_or_default(),
+            Src::Stream => cli.stream.clone().unwrap_or_default(),
             Src::File => cli
                 .input
                 .as_ref()
@@ -344,7 +349,8 @@ impl Builder {
         } else if b.source.value.is_empty() && b.src != Src::Stdin {
             b.focus = Some(Field::Source);
             b.message = Some((
-                "type a file path or a command, then tap load (or press Enter)".into(),
+                "type a file path, a command or a stream URL, then tap load (or press Enter)"
+                    .into(),
                 false,
             ));
         } else {
@@ -485,6 +491,37 @@ impl Builder {
                 self.loading = Some(run_sample_command(cmd, self.cli.ssh.clone()));
                 self.message = Some(("running the command for a sample…".into(), false));
             }
+            Src::Stream => {
+                let url = self.source.value.trim().to_string();
+                if url.is_empty() {
+                    return self.error(
+                        "enter a stream's URL: wss://… (a WebSocket) or https://… (server-sent events)"
+                            .into(),
+                    );
+                }
+                let params = crate::params::parse_all(&self.cli.param);
+                let fill = |t: &str| {
+                    crate::params::fill_times(
+                        &crate::params::fill(t, &params),
+                        crate::time::now_secs(),
+                    )
+                };
+                let spec = crate::source::SourceSpec::Stream {
+                    url: fill(&url),
+                    send: self.cli.send.iter().map(|m| fill(m)).collect(),
+                };
+                let (tx, rx) = mpsc::channel();
+                thread::spawn(move || {
+                    let lines = crate::sample_stream(spec);
+                    let _ = tx.send(if lines.is_empty() {
+                        Err("the stream sent nothing in 8 seconds (or couldn't connect)".into())
+                    } else {
+                        Ok(lines)
+                    });
+                });
+                self.loading = Some(rx);
+                self.message = Some(("listening to the stream for a sample…".into(), false));
+            }
             Src::Stdin => {
                 let raw = match (&self.live, &self.previous) {
                     (Some(l), _) => &l.raw,
@@ -558,16 +595,24 @@ impl Builder {
         match self.src {
             Src::File => {
                 c.cmd = None;
+                c.stream = None;
                 c.input = (!source.is_empty()).then(|| source.into());
+            }
+            Src::Stream => {
+                c.cmd = None;
+                c.input = None;
+                c.stream = (!source.is_empty()).then_some(source);
             }
             Src::Command => {
                 c.input = None;
+                c.stream = None;
                 c.cmd = (!source.is_empty()).then_some(source);
                 c.every = crate::time::parse_duration(self.every.value.trim())
                     .map_err(|e| anyhow::anyhow!("every: {e}"))?;
             }
             Src::Stdin => {
                 c.cmd = None;
+                c.stream = None;
                 c.input = Some("-".into());
             }
         }
@@ -674,7 +719,7 @@ impl Builder {
             return self.launch_merged();
         }
         self.apply()?;
-        if self.cli.input.is_none() && self.cli.cmd.is_none() {
+        if !self.cli.has_source() {
             bail!("choose a source first");
         }
         if self.parser == Parser::Unset {
@@ -708,8 +753,8 @@ impl Builder {
             bail!("give the source a one-word name (its series are named after it)");
         }
         self.apply()?;
-        if self.cli.input.is_none() && self.cli.cmd.is_none() {
-            bail!("choose a file or command for the source");
+        if !self.cli.has_source() {
+            bail!("choose a file, command or stream for the source");
         }
         if self.parser == Parser::Unset {
             bail!("pick a format first: tap a suggestion, or choose a parser and write one");
@@ -895,6 +940,7 @@ impl Builder {
                     self.src = s;
                     self.source.set(match s {
                         Src::Command => self.cli.cmd.clone().unwrap_or_default(),
+                        Src::Stream => self.cli.stream.clone().unwrap_or_default(),
                         Src::File => self
                             .cli
                             .input
@@ -1060,6 +1106,7 @@ impl Builder {
         let mut v = vec![
             Button::new("file", Hit::Src(Src::File)).active(self.src == Src::File),
             Button::new("command", Hit::Src(Src::Command)).active(self.src == Src::Command),
+            Button::new("stream", Hit::Src(Src::Stream)).active(self.src == Src::Stream),
         ];
         if self.live.is_some()
             || self
@@ -1310,6 +1357,13 @@ impl Builder {
             Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(rows[2]);
         match self.src {
             Src::File => self.field(f, src_rows[0], "file ", Field::Source, "path/to/file.log"),
+            Src::Stream => self.field(
+                f,
+                src_rows[0],
+                "url ",
+                Field::Source,
+                "wss://… or https://… (server-sent events)",
+            ),
             Src::Command => {
                 self.field(
                     f,
@@ -1580,6 +1634,7 @@ impl Builder {
         self.message = Some((
             match src {
                 Src::Command => "type a command whose output has numbers (e.g. cat /proc/meminfo), then press Enter or tap load",
+                Src::Stream => "type a stream's URL: wss://… for a WebSocket (--send in the command line for a subscription), https://… for server-sent events; then press Enter or tap load",
                 _ => "type the path of a file (e.g. /var/log/app.log), then press Enter or tap load",
             }
             .into(),
@@ -1617,6 +1672,7 @@ impl Builder {
                     }
                     KeyCode::Char('f') => self.new_source(Src::File),
                     KeyCode::Char('c') => self.new_source(Src::Command),
+                    KeyCode::Char('w') => self.new_source(Src::Stream),
                     _ => {}
                 }
             }
@@ -1767,6 +1823,7 @@ impl Builder {
         let buttons = vec![
             Button::new("chart a file", Hit::NewSource(Src::File)),
             Button::new("chart a command", Hit::NewSource(Src::Command)),
+            Button::new("chart a stream", Hit::NewSource(Src::Stream)),
             Button::new("quit", Hit::Back),
         ];
         let h = flow_height(&buttons, area.width);
@@ -1787,7 +1844,7 @@ impl Builder {
         line(
             f,
             Line::styled(
-                "keys: ↑/↓ choose · enter start · e edit · x forget · f file · c command · q quit",
+                "keys: ↑/↓ choose · enter start · e edit · x forget · f file · c command · w stream · q quit",
                 dim,
             ),
             &mut y,
@@ -2309,6 +2366,39 @@ mod tests {
             b.message.as_ref().unwrap().1,
             "missing file is an error message"
         );
+    }
+
+    #[test]
+    fn stream_source_samples_server_sent_events() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/feed", listener.local_addr().unwrap());
+        thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\nevent: tick\ndata: {{\"p\":1}}\n\ndata: {{\"p\":2}}\n\n"
+                );
+            }
+        });
+        let mut b = builder(&["graft", "--build"]);
+        tap(&mut b, " chart a stream ");
+        assert_eq!(b.src, Src::Stream);
+        url.chars().for_each(|c| {
+            key(&mut b, KeyCode::Char(c));
+        });
+        key(&mut b, KeyCode::Enter);
+        let start = Instant::now();
+        while b.loading.is_some() && start.elapsed() < Duration::from_secs(15) {
+            b.tick();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(b.sample, ["{\"p\":1}", "{\"p\":2}"]);
+        b.apply().unwrap();
+        assert_eq!(b.cli.stream.as_deref(), Some(url.as_str()));
+        assert!(b.cli.cmd.is_none() && b.cli.input.is_none());
     }
 
     #[test]

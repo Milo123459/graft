@@ -90,6 +90,15 @@ pub fn source_spec(cli: &Cli, interactive: bool) -> Result<SourceSpec> {
         .input
         .as_ref()
         .map(|p| std::path::PathBuf::from(crate::params::fill(&p.display().to_string(), &params)));
+    if let Some(url) = &cli.stream {
+        let fill = |t: &String| {
+            crate::params::fill_times(&crate::params::fill(t, &params), crate::time::now_secs())
+        };
+        return Ok(SourceSpec::Stream {
+            url: fill(url),
+            send: cli.send.iter().map(fill).collect(),
+        });
+    }
     Ok(match (&cmd, &input) {
         (Some(cmd), _) => {
             // Non-interactive runs take one sample unless told otherwise.
@@ -118,7 +127,7 @@ pub fn source_spec(cli: &Cli, interactive: bool) -> Result<SourceSpec> {
         }
         (None, None) if !std::io::stdin().is_terminal() => SourceSpec::Stdin,
         (None, None) => bail!(
-            "no input: give a FILE, pipe data in, use --cmd, or run `graft` in a terminal to open the builder"
+            "no input: give a FILE, pipe data in, use --cmd or --stream, or run `graft` in a terminal to open the builder"
         ),
     })
 }

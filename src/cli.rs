@@ -51,6 +51,29 @@ pub struct Cli {
     )]
     pub cmd: Option<String>,
 
+    /// Graph what a server pushes: a WebSocket (`ws://`, `wss://`) or a streaming
+    /// HTTP response (`https://`): server-sent events (each event's data is one record)
+    /// or lines. Reconnects when the connection drops.
+    #[arg(
+        long,
+        visible_aliases = ["ws", "sse"],
+        value_name = "URL",
+        help_heading = "Input",
+        conflicts_with_all = ["input", "cmd"]
+    )]
+    pub stream: Option<String>,
+
+    /// A message to send once --stream connects (repeatable): a WebSocket
+    /// subscription like `{"method":"subscribe",…}`, or for https:// the body of a
+    /// POST. `{name}` settings are filled in.
+    #[arg(
+        long,
+        value_name = "MESSAGE",
+        help_heading = "Input",
+        requires = "stream"
+    )]
+    pub send: Vec<String>,
+
     /// Add another source's series to this chart (repeatable), named after it: a preset
     /// or saved profile (`--merge coinbase`), or inline with its own arguments:
     /// `--merge 'binance = -c "curl -s …" --regex "…"'`. With only --merge, the first
@@ -97,7 +120,8 @@ pub struct Cli {
     #[arg(short = 'n', long, value_name = "DURATION", default_value = "1s", value_parser = parse_duration, help_heading = "Input")]
     pub every: Duration,
 
-    /// Stop after this many --cmd samples (non-interactive default: 1).
+    /// Stop after this many --cmd samples, or --stream records (non-interactive
+    /// default: 1).
     #[arg(long, value_name = "N", help_heading = "Input")]
     pub count: Option<u64>,
 
@@ -347,6 +371,12 @@ pub struct Cli {
     pub no_color: bool,
 
     // ───────────── Analysis ─────────────
+    /// Discover strategies as the data comes in: invent formulas over the series, test
+    /// what the price does after their extremes, build strategies (with this fee in %
+    /// per buy and per sell) and paper-trade them live. Same as `discover(FEE)`.
+    #[arg(long, value_name = "FEE", num_args = 0..=1, default_missing_value = "0", help_heading = "Analysis")]
+    pub discover: Option<f64>,
+
     /// Print statistics and trends (slope, R², forecast) for each series.
     #[arg(short = 'S', long, help_heading = "Analysis")]
     pub stats: bool,
@@ -609,6 +639,11 @@ impl Cli {
             }
         };
         opt("--cmd", self.cmd.clone());
+        opt("--stream", self.stream.clone());
+        opt("--discover", self.discover.map(|f| f.to_string()));
+        for m in &self.send {
+            opt("--send", Some(m.clone()));
+        }
         opt("--ssh", self.ssh.clone());
         opt("--as", self.as_name.clone());
         for m in &self.merge {
@@ -817,6 +852,11 @@ impl Cli {
         self.parse_fn = false;
         self.auto = false;
         self.grep.clear();
+    }
+
+    /// Whether a source (command, file or stream) was given.
+    pub fn has_source(&self) -> bool {
+        self.cmd.is_some() || self.input.is_some() || self.stream.is_some()
     }
 
     /// Whether a way of parsing the input was chosen (one is always required).

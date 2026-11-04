@@ -76,6 +76,13 @@ pub enum Action {
     Strategies(f64),
     /// The strategies for every combination of the settings the lines and rules use.
     Sweep(f64),
+    /// Start (or restart) discovering strategies: fee % per side, the price series.
+    Discover(f64, Option<String>),
+    Undiscover,
+    /// Keep discovered strategy n (`None`: the one on the chart) as lines and a rule.
+    DiscoverKeep(Option<usize>),
+    /// Show discovered strategy n's trades on the chart.
+    DiscoverPick(usize),
     /// What a series did after a rule's markers: (rule, series, after).
     Backtest(
         crate::backtest::RuleRef,
@@ -200,6 +207,25 @@ pub struct ScriptHost {
 }
 
 /// Turn a series name into a valid Rhai identifier (`cpu.user` → `cpu_user`).
+/// Series lined up for `formula()`.
+struct FormulaCols {
+    rows: usize,
+    cols: Vec<(String, Vec<f64>)>,
+}
+
+impl crate::formula::Columns for FormulaCols {
+    fn column(&self, name: &str) -> Option<&[f64]> {
+        self.cols
+            .iter()
+            .find(|c| c.0 == name)
+            .map(|c| c.1.as_slice())
+    }
+
+    fn rows(&self) -> usize {
+        self.rows
+    }
+}
+
 pub fn ident(name: &str) -> String {
     const RESERVED: &[&str] = &[
         "if",
@@ -613,6 +639,41 @@ pub const USAGE: &[(&str, &str, &str)] = &[
         "the lowest value over the last n points",
     ),
     (
+        "formula",
+        r#"formula("z(pct(price, 5), 50)")"#,
+        "a formula over series (the language discover() writes): lag diff pct mean ema std max min z pos rsi slope, abs neg sign log, + - * /, gap",
+    ),
+    (
+        "change_bp",
+        r#"change_bp(values("price"), 15)"#,
+        "change over the last n points, in bp (1/100 of a %)",
+    ),
+    (
+        "zscore",
+        r#"zscore(values("price"), 50)"#,
+        "how many standard deviations from the last n points' average",
+    ),
+    (
+        "range_pos",
+        r#"range_pos(values("price"), 50)"#,
+        "where it sits in the last n points' range: 0 the low, 100 the high",
+    ),
+    (
+        "updown",
+        r#"updown(values("price"), 50)"#,
+        "% of the last n moves that were up",
+    ),
+    (
+        "volatility",
+        r#"volatility(values("price"), 50)"#,
+        "spread of the point-to-point changes over the last n points, in bp",
+    ),
+    (
+        "gap",
+        r#"gap(ema(values("price"), 5), ema(values("price"), 20))"#,
+        "one array relative to another, in bp: (a / b - 1) × 10000",
+    ),
+    (
         "macd",
         r#"macd(values("api"))"#,
         "MACD: 12-point EMA minus 26-point EMA (signal: ema(values(\"macd\"), 9))",
@@ -768,6 +829,26 @@ pub const USAGE: &[(&str, &str, &str)] = &[
         "the strategies for every combination of the --param settings your lines and rules use",
     ),
     (
+        "discover",
+        r#"discover(0.045)  ·  discover(0.045, "price")"#,
+        "invent formulas and strategies from the data as it streams in, and paper-trade them (fee % a side)",
+    ),
+    (
+        "undiscover",
+        "undiscover()",
+        "stop discovering (closes the panel)",
+    ),
+    (
+        "discover_pick",
+        "discover_pick(2)",
+        "show discovered strategy 2's trades on the chart",
+    ),
+    (
+        "discover_keep",
+        "discover_keep()  ·  discover_keep(2)",
+        "keep a discovered strategy: its formulas as lines, its entries as a marker rule",
+    ),
+    (
         "is_num",
         r#"is_num(ema50_prev)"#,
         "whether a value is there (a series that hasn't begun is ())",
@@ -868,6 +949,13 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "stoch",
             "highest",
             "lowest",
+            "formula",
+            "change_bp",
+            "zscore",
+            "range_pos",
+            "updown",
+            "volatility",
+            "gap",
             "mean_of",
         ],
     ),
@@ -935,6 +1023,10 @@ pub const GROUPS: &[(&str, &[&str])] = &[
             "strategy",
             "strategies",
             "sweep",
+            "discover",
+            "undiscover",
+            "discover_pick",
+            "discover_keep",
         ],
     ),
     ("alerts", &["alert", "unalert", "notify_to", "notify_off"]),
@@ -2119,6 +2211,29 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
             )))
         },
     );
+    engine.register_fn("change_bp", move |a: Array, n: i64| -> FnResult<Array> {
+        let n = window("change_bp(values, n)", n)?;
+        Ok(to_array(crate::lines::change(&floats(&a), n)))
+    });
+    engine.register_fn("zscore", move |a: Array, n: i64| -> FnResult<Array> {
+        let n = window("zscore(values, n)", n)?;
+        Ok(to_array(crate::lines::zscore(&floats(&a), n)))
+    });
+    engine.register_fn("range_pos", move |a: Array, n: i64| -> FnResult<Array> {
+        let n = window("range_pos(values, n)", n)?;
+        Ok(to_array(crate::lines::range_pos(&floats(&a), n)))
+    });
+    engine.register_fn("updown", move |a: Array, n: i64| -> FnResult<Array> {
+        let n = window("updown(values, n)", n)?;
+        Ok(to_array(crate::lines::updown(&floats(&a), n)))
+    });
+    engine.register_fn("volatility", move |a: Array, n: i64| -> FnResult<Array> {
+        let n = window("volatility(values, n)", n)?;
+        Ok(to_array(crate::lines::volatility(&floats(&a), n)))
+    });
+    engine.register_fn("gap", move |a: Array, b: Array| -> FnResult<Array> {
+        Ok(to_array(crate::lines::gap(&floats(&a), &floats(&b))))
+    });
     engine.register_fn("highest", move |a: Array, n: i64| -> FnResult<Array> {
         let n = window("highest(values, n)", n)?;
         Ok(to_array(crate::lines::highest(&floats(&a), n)))
@@ -2220,6 +2335,35 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
                 .collect())
         },
     );
+
+    // formula(text): [x, y] at each point of the first series it names.
+    let st = state.clone();
+    engine.register_fn("formula", move |text: &str| -> FnResult<Array> {
+        let e = crate::formula::parse(text)?;
+        let names = e.columns();
+        let Some(first) = names.first() else {
+            return Err(format!("formula '{text}' names no series").into());
+        };
+        let base = points(&st, first)?.points;
+        let xs: Vec<f64> = base.iter().map(|p| p.0).collect();
+        let mut cols = FormulaCols {
+            rows: xs.len(),
+            cols: Vec::new(),
+        };
+        for n in &names {
+            let pts = points(&st, n)?.points;
+            cols.cols
+                .push((n.clone(), crate::discover::line_up(&pts, &xs)));
+        }
+        Ok(e.eval(&cols)
+            .into_iter()
+            .zip(&xs)
+            .filter(|(y, _)| y.is_finite())
+            .map(|(y, x)| {
+                Dynamic::from_array(vec![Dynamic::from_float(*x), Dynamic::from_float(y)])
+            })
+            .collect())
+    });
 
     for (fname, take_x) in [("values", false), ("xs", true)] {
         let st = state.clone();
@@ -2590,6 +2734,35 @@ fn register_api(engine: &mut Engine, state: &State, binary: bool) {
         Ok(())
     });
     let st = state.clone();
+    engine.register_fn("discover", move || push(&st, Action::Discover(0.0, None)));
+    let st = state.clone();
+    engine.register_fn("discover", move |fee: Dynamic| -> FnResult<()> {
+        push(&st, Action::Discover(fee_of(&fee)?, None));
+        Ok(())
+    });
+    let st = state.clone();
+    engine.register_fn(
+        "discover",
+        move |fee: Dynamic, series: &str| -> FnResult<()> {
+            push(&st, Action::Discover(fee_of(&fee)?, Some(series.into())));
+            Ok(())
+        },
+    );
+    let st = state.clone();
+    engine.register_fn("undiscover", move || push(&st, Action::Undiscover));
+    let st = state.clone();
+    engine.register_fn("discover_keep", move || {
+        push(&st, Action::DiscoverKeep(None))
+    });
+    let st = state.clone();
+    engine.register_fn("discover_keep", move |n: i64| {
+        push(&st, Action::DiscoverKeep(Some(n.max(0) as usize)))
+    });
+    let st = state.clone();
+    engine.register_fn("discover_pick", move |n: i64| {
+        push(&st, Action::DiscoverPick(n.max(0) as usize))
+    });
+    let st = state.clone();
     engine.register_fn("strategy", move |entry: Dynamic, exit: Dynamic| {
         push(
             &st,
@@ -2750,10 +2923,14 @@ mod tests {
                 .map(|i| i.insert)
                 .collect()
         };
-        assert_eq!(items("und"), ["undo()"]);
+        assert_eq!(items("undo"), ["undo()"]);
         assert_eq!(items("perc")[0], "percentile(\"");
         assert_eq!(items("zoom_"), ["zoom_in()", "zoom_out()"]);
-        assert_eq!(items("ap"), ["api", "vwap("], "starting with it first");
+        assert_eq!(
+            items("ap"),
+            ["api", "vwap(", "gap("],
+            "starting with it first"
+        );
         // The last argument closes the call; one with more to come doesn't.
         assert_eq!(items("last(\"")[..3], ["web\")", "api\")", "db\")"]);
         assert_eq!(items("percentile(\"d"), ["db\""]);

@@ -47,6 +47,7 @@ impl Session {
             arrival_time: !cli.grep.is_empty()
                 && cli.x == crate::cli::XMode::Auto
                 && (cli.cmd.is_some()
+                    || cli.stream.is_some()
                     || cli.follow
                     || cli.input.as_ref().is_none_or(|p| p.as_os_str() == "-")),
             custom: cli

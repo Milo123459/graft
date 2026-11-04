@@ -45,6 +45,7 @@ pub enum Check {
     Line,
     Undo,
     Copied,
+    Discover,
 }
 
 pub struct Step {
@@ -544,6 +545,55 @@ The expression can go in quotes or be written as code: add_line("total", user + 
         ..BASE
     },
     Step {
+        title: "discover strategies",
+        text: r#"discover() hunts for edges in a price (here: api) as data streams in, without being told which indicators to use. It invents formulas over every series on the chart, in a small language: pct(price, 5) is the change over 5 points in bp, z(…, 50) the distance from the 50-point average in standard deviations, pos the place in the range; also lag diff mean ema std max min rsi slope, abs neg sign log, + - * / and gap(a, b). Starting from the usual indicators and random formulas, it keeps changing and combining the ones after whose extremes (their lowest or highest 10%) the price moved most clearly one way: evolution, judged only on the first 70% of the data. The best carry over to the next search, every 20 s.
+Then it tests theories (when a formula is in its lowest or highest 5%/15%, what the price does 5…150 points later, from moments far enough apart not to overlap) and builds strategies from them: in that direction, out after so many points or at a take-profit / stop-loss sized from the usual move, maybe with a filter from another formula. Costs come off every trade: the fee on each side, and buying at the ask / selling at the bid when the chart has bid and ask series. A strategy must make money on the first 70% (where it was picked) to be checked on the last 30%, and is then paper-traded live from the moment it was found: that's the only record the search never saw, so trust it most. Theories must beat the |t| luck alone would give from that many tests.
+Most of what looks good fades: on real prices, few edges survive costs. That's the honest answer, not a bug."#,
+        keys: &[
+            (
+                "E / discover",
+                "start or stop discovering: a panel lists the strategies found, each with how it did on the first 70%, the last 30% and live (in a trade now too); tap one (or discover_pick(n)) to draw its trades: ▲/▼ in, • out with its result",
+            ),
+            (
+                "theories",
+                "in the panel: the theories instead (✓ held on the last 30%)",
+            ),
+            (
+                "keep N",
+                "keep the strategy on the chart (discover_keep(n)): its formulas become hidden lines, formula(\"…\"), and its entries a marker rule — backtest it, notify on it or alert",
+            ),
+            (
+                "search now / stop",
+                "search again right away / stop discovering",
+            ),
+        ],
+        examples: &[
+            (
+                r#":discover(0.045)"#,
+                "with a fee of 0.045% per buy and per sell; discover() alone: no fee",
+            ),
+            (
+                r#":discover(0, "api")  :undiscover()"#,
+                "on a chosen series (else close, price or mid, else the first); undiscover() stops",
+            ),
+            (
+                "--discover 0.045",
+                "start discovering with the chart (kept when you save it)",
+            ),
+            (
+                r#"--line 'f = formula("z(pct(api, 5), 50)")'"#,
+                "the formula language as a line of your own",
+            ),
+            (
+                r#"--line 'z = zscore(values("api"), 50)'"#,
+                "its pieces for arrays: zscore(values, n), change_bp(values, n) in bp, range_pos(values, n) 0–100, updown(values, n) the % of moves up, volatility(values, n) in bp, gap(a, b) in bp",
+            ),
+        ],
+        task: Some("press E (or : discover()) and watch it search the api series"),
+        check: Check::Discover,
+        ..BASE
+    },
+    Step {
         title: "undo",
         text: r#"Every change (buttons, keys, console commands) is a step you can undo, up to 100 of them. Where you're looking (zoom, cursor) isn't a change, so undo never jumps the view around."#,
         keys: &[
@@ -586,7 +636,7 @@ The expression can go in quotes or be written as code: add_line("total", user + 
     },
     Step {
         title: "getting data in",
-        text: r#"Three kinds of source: a file (read once, or followed as it grows), a command (run every few seconds, like watch) or stdin (a pipe). Any of them can run on another machine with --ssh, and more sources can share one chart: their series are named after them (cb, or cb.price when there are several).
+        text: r#"Four kinds of source: a file (read once, or followed as it grows), a command (run every few seconds, like watch), a stream a server pushes (a WebSocket, or server-sent events) or stdin (a pipe). Any of them can run on another machine with --ssh, and more sources can share one chart: their series are named after them (cb, or cb.price when there are several).
 The sources menu lists them all: the main one, merged ones (edit in the builder with a live preview, add, remove), and in a dashboard each pane's own source (edit changes what it runs; other source… shows different data in that pane, like cpu or a recent chart). An edited pane source is kept with the chart as a named source.
 From here on the steps are a reference: read what's useful, skip the rest with Enter."#,
         keys: &[
@@ -611,6 +661,14 @@ From here on the steps are a reference: read what's useful, skip the rest with E
             (
                 "graft -c 'date +%S' --columns 1 --count 5 --once",
                 "stop after 5 runs (--count)",
+            ),
+            (
+                r#"graft --stream wss://api.hyperliquid.xyz/ws --send '{"method":"subscribe","subscription":{"type":"trades","coin":"BTC"}}' --json"#,
+                "a WebSocket (--ws): --send goes out once it connects (a subscription); each message is a record. It reconnects when dropped, waiting longer each time",
+            ),
+            (
+                "graft --stream 'https://example.com/v1/stream?ids=1' --json --time-field timestampUs",
+                "server-sent events (--sse): each event's data is a record; any HTTP response that keeps sending lines works too (with --send: POSTed)",
             ),
             (
                 "graft --ssh pi@raspberrypi -c 'vcgencmd measure_temp' --regex 'temp=(?P<temp>[0-9.]+)'",
@@ -1009,6 +1067,14 @@ The next pages are recipes for real use: copy puts one on your clipboard."#,
         text: "Hyperliquid candles (500 of them, polled every 5 s; --replace keeps the newest up to date instead of piling up copies) drawn as candlesticks (kind=candles, from the open/high/low/close series), with EMA30/EMA50 over them and crossover markers, RSI, MACD and volume in panes. coin ▾ and interval ▾ switch asset and candle size; press ← (or scroll back to the oldest candle) and older ones load. RSI and MACD are built in (rsi(values, 14), macd(values)), so are bollinger(values, 20, 2.0), vwap(close, volume), atr(high, low, close, 14), stoch(high, low, close, 14), highest(values, n) and lowest(values, n).",
         command: Some(
             r#"graft -c 'curl -s --json "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"{coin}\",\"interval\":\"{interval}\",\"startTime\":{from_ms:500*{interval}},\"endTime\":{now_ms}}}" https://api.hyperliquid.xyz/info' --param 'coin = ETH | BTC | SOL | HYPE' --param 'interval = 1m | 5m | 15m | 1h | 4h | 1d' -n 5s --json --time-field t --replace --series 'open:USD = o' --series 'high:USD = h' --series 'low:USD = l' --series 'close:USD = c' --series 'volume:{coin} = v' --select open,high,low,close,volume --line 'ema30 = ema(values("close"), 30)' --line 'ema50 = ema(values("close"), 50)' --line 'rsi14:% = rsi(values("close"), 14)' --line 'overbought:% = 70' --line 'oversold:% = 30' --line 'macd = macd(values("close"))' --line 'signal = ema(values("macd"), 9)' --mark 'cross_above(ema30, ema50) => golden cross | ▲ cyan badge' --mark 'cross_below(ema30, ema50) => death cross | ▼ magenta badge' --pane 'ema30,ema50 kind=candles title={coin} {interval}' --pane 'rsi14,overbought,oversold front=rsi14' --pane 'macd,signal front=macd' --pane volume --layout '1 /60% ((2 | 3) / 4)' --title '{coin} {interval}'"#,
+        ),
+        ..BASE
+    },
+    Step {
+        title: "recipe: a scalping lab",
+        text: "A live BTC price pushed 5 times a second (server-sent events), with its bid and ask: discover strategies on it with a 0.045% fee a side. Its confidence and publisher count are signals the formulas can use too. Give it a few minutes of data; the longer it runs, the more it has to learn from and the more live trades judge what it found.",
+        command: Some(
+            r#"graft --stream 'https://feed-v3.veranta.xyz/v1/stream?price_feed_ids=1' --json --time-field timestampUs --series 'price:USD = priceFeeds_0_price * 1e-8' --series 'bid:USD = priceFeeds_0_bestBidPrice * 1e-8' --series 'ask:USD = priceFeeds_0_bestAskPrice * 1e-8' --series 'confidence:USD = priceFeeds_0_confidence * 1e-8' --select price,bid,ask,confidence --hide bid,ask,confidence --window 20000 --discover 0.045 --title 'BTC scalping lab'"#,
         ),
         ..BASE
     },
