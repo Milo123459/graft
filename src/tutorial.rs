@@ -565,7 +565,7 @@ Most of what looks good fades: on real prices, few edges survive costs. That's t
         keys: &[
             (
                 "E / discover",
-                "start or stop discovering: a panel lists the strategies found, each with how it did where it was picked, walking forward (up in how many stretches), how much better than holding, and live (in a trade now too), then what it risked: its max drawdown (the most its running total fell from a high), worst and best trade — with leverage also as % of the margin; tap one (or discover_pick(n)) to draw its trades: ▲/▼ in, • out with its result",
+                "start or stop discovering: a panel lists the strategies found, each with how it did where it was picked, walking forward (up in how many stretches), how much better than holding, and live (in a trade now too), then what it risked: its max drawdown (the most its running total fell from a high), worst and best trade — with leverage also as % of the margin; tap one (or discover_pick(n)) to draw its trades: ▲/▼ in (labelled live when it was entered after the strategy was found — paper-traded, not replayed from history — and open while it's still in it), • out with its result",
             ),
             (
                 "theories",

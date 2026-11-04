@@ -43,6 +43,19 @@ pub struct PaperTrade {
     pub y_out: Option<f64>,
 }
 
+impl PaperTrade {
+    /// What its entry says on the chart: "open" while it's still in it, "live" when it
+    /// was entered after the strategy was found (paper-traded, not replayed from the
+    /// data it was found on), else nothing.
+    pub fn label(&self) -> &'static str {
+        match (self.exit, self.live) {
+            (None, _) => "open",
+            (Some(_), true) => "live",
+            (Some(_), false) => "",
+        }
+    }
+}
+
 /// How many of the price's newest points have every series that starts later than it
 /// (a live order book, say, with no history behind it), when that's a stretch worth
 /// searching on its own: at least 600 points, and not nearly all of them anyway.
@@ -573,7 +586,7 @@ impl Lab {
             out.push(mark(
                 p.entry,
                 Some(p.y_in).filter(|v| v.is_finite()),
-                if p.live { "live".into() } else { String::new() },
+                p.label().into(),
                 if long { "▲" } else { "▼" },
                 color,
             ));
@@ -645,6 +658,22 @@ mod tests {
                 points,
             }],
         }
+    }
+
+    #[test]
+    fn entries_say_live_once_found_and_open_while_in() {
+        let t = |exit: Option<f64>, live| PaperTrade {
+            entry: 0.0,
+            exit,
+            side: Side::Long,
+            net: 0.0,
+            live,
+            y_in: 1.0,
+            y_out: None,
+        };
+        assert_eq!(t(Some(1.0), false).label(), "");
+        assert_eq!(t(Some(1.0), true).label(), "live");
+        assert_eq!(t(None, true).label(), "open");
     }
 
     #[test]

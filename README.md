@@ -563,7 +563,8 @@ with that condition left out (✎ in the panel). Ones that keep losing live are 
 with what they learned, and never picked again.
 
 Tap a strategy (or `discover_pick(2)`) to draw its trades (▲/▼ in, • out with its
-result); **theories** switches the panel to them. **keep** (`discover_keep()`) turns a
+result; an entry says *live* when it came after the strategy was found — paper-traded,
+not replayed from history — and *open* while it's still in it); **theories** switches the panel to them. **keep** (`discover_keep()`) turns a
 strategy into ordinary chart parts: its formulas become hidden lines (`--line 'disc1_1
 = formula("…")'`) and its entries a marker rule (`disc1 long`) you can backtest,
 notify on or alert. `undiscover()` stops. The pieces work on their own: `formula("z(pct(
