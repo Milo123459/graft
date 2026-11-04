@@ -557,10 +557,21 @@ from a high), its **worst** and **best** trade — with leverage, also as a shar
 margin a trade puts up (a 34bp drawdown at 250x is 85% of it).
 
 **4. Learning from what it trades.** Each search reviews the strategies being
-paper-traded: whether costs eat an edge that's there, whether it faded (it fitted the
-past) or never predicted, and what it loses in; a strategy with a fix is tried again
-with that condition left out (✎ in the panel). Ones that keep losing live are retired
-with what they learned, and never picked again.
+paper-traded and says what's wrong (the **?** line): whether costs eat an edge that's
+there, it only rode the trend, it faded (it fitted the past) or never predicted, what
+it loses in, which side pays (longs against shorts), and whether its losses run far
+past its stop (it's checked once a point and fills after the move). Then it tries to
+repair it, one change at a time: **not when …** (leave out what it loses in), **only
+its longs** / **only its shorts**, **stricter entries** (only the rarer extremes), or
+**another exit** (out sooner or later, take-profit and stop re-sized from the usual
+move). Each repair has to clear the same bar as a new strategy and beat the original
+where it's judged; the best one is paper-traded next to it (✎ in the panel says what it
+changed), and a repair can be repaired again, three times at most (each fits the same
+data a little closer). **Judged on the market it's trading:** once a strategy has
+traded 8 times on the newest stretch — where series that start late, like a recorded
+order book, have data, so the market you'd really trade — it's judged, repaired and
+retired on that alone, not on older history from elsewhere. Ones that keep losing
+there or live are retired with what they learned, and never picked again.
 
 Tap a strategy (or `discover_pick(2)`) to draw its trades (▲/▼ in, • out with its
 result; an entry says *live* when it came after the strategy was found — paper-traded,

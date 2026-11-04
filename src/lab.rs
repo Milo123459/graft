@@ -28,6 +28,8 @@ const BENCH: usize = 24;
 const TRACKED: usize = 8;
 /// Live trades before a losing strategy is retired.
 const RETIRE_AFTER: usize = 8;
+/// Repairs of repairs at most: each one fits the same data a bit closer.
+const MAX_REPAIRS: usize = 3;
 
 /// One of a tracked strategy's trades, for the record and the chart.
 #[derive(Debug, Clone, Copy)]
@@ -74,6 +76,16 @@ pub fn recent_window(ds: &Dataset, s: &Settings) -> Option<usize> {
         .max_by(f64::total_cmp)?;
     let n = total - price.points.partition_point(|p| p.0 < late);
     (n >= 2 * discover::MIN_POINTS && n * 10 < total * 9).then_some(n)
+}
+
+/// Where the newest stretch (`recent_window`) starts, as an x.
+pub fn newest_from(ds: &Dataset, s: &Settings) -> Option<f64> {
+    let n = recent_window(ds, s)?;
+    let price = discover::price_series(ds, s.series.as_deref())?;
+    price
+        .points
+        .get(price.points.len().checked_sub(n)?)
+        .map(|p| p.0)
 }
 
 /// Its paper trades over `input`, and its live record (the ones entered after
@@ -123,6 +135,11 @@ pub struct Tracked {
     pub why: Option<String>,
     /// How it came about, when it's a fix of another.
     pub note: Option<String>,
+    /// Its record on the newest stretch (the market's own data), from the latest
+    /// review, once it's traded there enough to tell.
+    pub newest: Option<Perf>,
+    /// How many repairs it's been through (a fix of a fix of …).
+    pub repairs: usize,
 }
 
 impl Tracked {
@@ -262,6 +279,7 @@ impl Lab {
                             .map(|t| t.found.strategy.clone())
                             .collect(),
                         failed: self.failed.clone(),
+                        newest_from: newest_from(ds, &self.settings),
                     };
                     self.runs += 1;
                     let budget = Budget {
@@ -330,6 +348,8 @@ impl Lab {
             trades: Vec::new(),
             why: None,
             note,
+            newest: None,
+            repairs: 0,
         };
         // What the review made of each one, and fixes to try.
         for r in &report.reviews {
@@ -341,26 +361,24 @@ impl Lab {
                 continue;
             };
             self.tracked[k].why = Some(r.why.clone());
-            // Not a fix of a fix: each leaves out more of its losers, until only a
-            // lucky few trades are left.
+            self.tracked[k].newest = r.newest;
+            // A repair of a repair too, a few times over: each has to clear the same
+            // bar as a new strategy and beat the one it came from where it's judged.
             if let Some(fix) = &r.fix
-                && self.tracked[k]
-                    .note
-                    .as_deref()
-                    .is_none_or(|n| !n.starts_with("learned from"))
+                && self.tracked[k].repairs < MAX_REPAIRS
                 && !self.failed.contains(&fix.strategy.key())
                 && !self
                     .tracked
                     .iter()
-                    .any(|t| t.found.strategy.key() == fix.strategy.key())
+                    .chain(&self.benched)
+                    .any(|t| t.found.strategy == fix.strategy)
             {
-                let lesson = fix
-                    .strategy
-                    .except
-                    .last()
-                    .map_or(String::new(), discover::Cond::describe);
-                let note = format!("learned from #{}: not when {lesson}", k + 1);
-                self.tracked.push(new(fix.clone(), Some(note), self.runs));
+                let what = r.fix_note.clone().unwrap_or_default();
+                let note = format!("learned from #{}: {what}", k + 1);
+                let repairs = self.tracked[k].repairs + 1;
+                let mut t = new(fix.clone(), Some(note), self.runs);
+                t.repairs = repairs;
+                self.tracked.push(t);
             }
         }
         for f in report.strategies.iter().take(4) {
@@ -443,7 +461,10 @@ impl Lab {
         let mut k = 0;
         while k < self.tracked.len() {
             let t = &self.tracked[k];
-            let losing = t.live.n >= RETIRE_AFTER && t.live.mean < 0.0 && t.live.t < -0.5;
+            let loses = |p: &Perf| p.n >= RETIRE_AFTER && p.mean < 0.0 && p.t < -0.5;
+            // Live, or on the newest stretch (the market it's trading, recorded): it
+            // needn't lose 8 live trades first to show it doesn't work there.
+            let losing = loses(&t.live) || t.newest.as_ref().is_some_and(loses);
             if !losing {
                 k += 1;
                 continue;
@@ -456,8 +477,13 @@ impl Lab {
             self.lessons.insert(
                 0,
                 format!(
-                    "retired {what}: live {}{}",
-                    t.live.brief(),
+                    "retired {what}: {}{}",
+                    match t.newest {
+                        Some(p) if !(t.live.n >= RETIRE_AFTER && t.live.mean < 0.0) => {
+                            format!("on the newest stretch {}", p.brief())
+                        }
+                        _ => format!("live {}", t.live.brief()),
+                    },
                     t_why.map(|w| format!(" — {w}")).unwrap_or_default()
                 ),
             );
@@ -467,6 +493,7 @@ impl Lab {
             t.since = now;
             t.live = Perf::default();
             t.open = None;
+            t.newest = None;
             self.benched.insert(0, t);
             self.benched.truncate(BENCH);
         }
@@ -661,6 +688,34 @@ mod tests {
     }
 
     #[test]
+    fn losing_on_the_newest_stretch_retires_it_without_waiting_for_live_trades() {
+        let mut lab = Lab::new(Settings::default());
+        let t = |newest: Option<Perf>| Tracked {
+            found: Found::default(),
+            since: 0.0,
+            run: 1,
+            live: Perf::default(),
+            open: None,
+            trades: Vec::new(),
+            why: None,
+            note: None,
+            newest,
+            repairs: 0,
+        };
+        let losing = Perf::of(&[-1.0, -0.5, -0.8, -1.2, 0.3, -0.9, -0.7, -1.1, -0.4]);
+        let fine = Perf::of(&[1.0, 0.5, -0.8, 1.2, 0.3, 0.9, -0.7, 1.1, 0.4]);
+        lab.tracked = vec![t(Some(fine)), t(Some(losing)), t(None)];
+        lab.retire(0.0);
+        assert_eq!(lab.tracked.len(), 2);
+        assert!(lab.tracked.iter().all(|t| t.newest != Some(losing)));
+        assert!(
+            lab.lessons[0].contains("on the newest stretch"),
+            "{:?}",
+            lab.lessons
+        );
+    }
+
+    #[test]
     fn entries_say_live_once_found_and_open_while_in() {
         let t = |exit: Option<f64>, live| PaperTrade {
             entry: 0.0,
@@ -747,6 +802,8 @@ mod tests {
             trades: Vec::new(),
             why: None,
             note: None,
+            newest: None,
+            repairs: 0,
         });
         lab.refresh(&prices(400, 400));
         assert!(lab.tracked.is_empty(), "retired after losing live");

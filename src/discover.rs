@@ -1101,7 +1101,15 @@ pub struct Review {
     pub key: String,
     pub why: String,
     pub fix: Option<Found>,
+    /// What the fix changed (`not when …`, `only its longs`, `exit: …`, …).
+    pub fix_note: Option<String>,
+    /// Its record on the newest stretch (`Feedback::newest_from`), once it has traded
+    /// enough there to judge it on that.
+    pub newest: Option<Perf>,
 }
+
+/// Trades on the newest stretch before a strategy is judged (and fixed) on that alone.
+pub const JUDGE_ON_NEWEST: usize = 8;
 
 /// A strategy and how it did.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -1619,6 +1627,10 @@ fn evolve(lab: &Lab, pool: &[Expr], budget: Budget) -> (Vec<Scored>, usize) {
 pub struct Feedback {
     pub review: Vec<Strategy>,
     pub failed: Vec<String>,
+    /// Where the newest stretch starts (x): where series that start late — the
+    /// market's own book, recorded — have data. What's traded there is the market the
+    /// strategy will really trade, so it's judged on that once there's enough of it.
+    pub newest_from: Option<f64>,
 }
 
 pub fn search(
@@ -1993,49 +2005,165 @@ pub fn search(
     // Reviews of what's being paper-traded: after the learning half (where it wasn't picked
     // — and for an older one, also the newest data), why it isn't paying, and a fix
     // when there's a condition it loses in.
+    // The newest stretch (the market's own data, recorded), when it's a part of this.
+    let newest_at = feedback
+        .newest_from
+        .map(|x| input.x.partition_point(|v| *v < x))
+        .filter(|&k| k > 0 && k < n);
     let reviews: Vec<Review> = feedback
         .review
         .iter()
         .map(|s| {
             let all = trades_of(s, 0, n);
-            let later: Vec<Trade> = all.iter().filter(|t| t.entry >= learn).copied().collect();
+            // Its trades on the newest stretch, when there are enough to go on: what
+            // it's judged and fixed on (it did well on older data, or it wouldn't be
+            // here — what matters is how it does on the market it's trading now).
+            let on_newest: Option<Vec<Trade>> = newest_at.and_then(|k| {
+                let t: Vec<Trade> = all.iter().filter(|t| t.entry >= k).copied().collect();
+                (t.iter().filter(|t| t.exit.is_some()).count() >= JUDGE_ON_NEWEST).then_some(t)
+            });
+            let (from, later) = match &on_newest {
+                Some(t) => (newest_at.unwrap_or(learn), t.clone()),
+                None => (
+                    learn,
+                    all.iter().filter(|t| t.entry >= learn).copied().collect(),
+                ),
+            };
             let closed: Vec<&Trade> = later.iter().filter(|t| t.exit.is_some()).collect();
             let gross = Perf::of(&closed.iter().map(|t| t.gross).collect::<Vec<_>>());
             let net = perf(&later);
-            let before = perf(&all.iter().filter(|t| t.entry < learn).copied().collect::<Vec<_>>());
-            let edge = beat(&later, learn, n);
+            let before = perf(&all.iter().filter(|t| t.entry < from).copied().collect::<Vec<_>>());
+            let edge = beat(&later, from, n);
             let own: Vec<&Expr> = s.conds().map(|c| &c.feature).collect();
-            // A lesson from every trade it made, so there are enough to learn from.
-            let lesson = adverse(&all, &features, &values, &own, 0.5);
-            let fix = lesson.as_ref().and_then(|l| {
+            // A lesson from what it did on the newest stretch when it's judged there
+            // (what went wrong is there), else from every trade it made, so there are
+            // enough to learn from.
+            let lesson = adverse(on_newest.as_deref().unwrap_or(&all), &features, &values, &own, 0.5);
+            // Ways to repair it, one change each — what the diagnosis points at.
+            let mut repairs: Vec<(Strategy, String)> = Vec::new();
+            // Leave out what it loses in (two at most: more only leaves a lucky few).
+            if let Some(l) = &lesson
+                && s.except.len() < 2
+            {
                 let mut f = s.clone();
                 f.except.push(l.cond.clone());
+                repairs.push((f, format!("not when {}", l.cond.describe())));
+            }
+            // One side loses, the other doesn't: only the other.
+            let side = |sd: Side| perf(&later.iter().filter(|t| t.side == sd).copied().collect::<Vec<_>>());
+            let (longs, shorts) = (side(Side::Long), side(Side::Short));
+            if !s.long.is_empty() && !s.short.is_empty() && longs.n >= 3 && shorts.n >= 3 {
+                if longs.mean < 0.0 && shorts.mean > longs.mean {
+                    repairs.push((Strategy { long: Vec::new(), ..s.clone() }, "only its shorts".into()));
+                }
+                if shorts.mean < 0.0 && longs.mean > shorts.mean {
+                    repairs.push((Strategy { short: Vec::new(), ..s.clone() }, "only its longs".into()));
+                }
+            }
+            // Stricter: only the rarer extremes (each condition's tail halved).
+            {
+                let vals = vals_of(s);
+                let mut r = ranks.borrow_mut();
+                let mut v = vals.iter();
+                let mut tighten = |cs: &[Cond]| -> Vec<Cond> {
+                    cs.iter()
+                        .map(|c| {
+                            let sorted = r.of(&c.feature, v.next().expect("a value per condition"), learn);
+                            if sorted.is_empty() {
+                                return c.clone();
+                            }
+                            let q = sorted.partition_point(|x| *x < c.threshold) as f64 / sorted.len() as f64;
+                            let q = if c.above { 1.0 - (1.0 - q) / 2.0 } else { q / 2.0 };
+                            let at = ((sorted.len() - 1) as f64 * q).round() as usize;
+                            Cond {
+                                threshold: sorted[at.min(sorted.len() - 1)],
+                                ..c.clone()
+                            }
+                        })
+                        .collect()
+                };
+                let long = tighten(&s.long);
+                let short = tighten(&s.short);
+                let f = Strategy {
+                    long,
+                    short,
+                    ..s.clone()
+                };
+                if f != *s {
+                    repairs.push((f, "stricter entries (only the rarer extremes)".into()));
+                }
+            }
+            // Other exits: out sooner or later, take-profit and stop re-sized from the
+            // usual move over its hold.
+            let h = s.exit.hold.max(2);
+            let typical = {
+                let fwd = forward(&input.price, h);
+                Perf::of(&fwd[..learn].iter().copied().filter(|v| v.is_finite()).collect::<Vec<_>>()).sd
+            };
+            let mut other_exits = exits(typical, h);
+            other_exits.extend([h / 2, 2 * h].into_iter().filter(|&k| k >= 2).map(|hold| Exit { hold, ..s.exit }));
+            for e in other_exits {
+                if e != s.exit {
+                    let f = Strategy { exit: e, ..s.clone() };
+                    let what = f.describe(&input);
+                    let out = what.rsplit(" · ").next().unwrap_or(&what).to_string();
+                    repairs.push((f, format!("exit: {out}")));
+                }
+            }
+            // Each checked like any strategy; the one that does best where it's judged.
+            let mut fix: Option<(Found, String, f64)> = None;
+            for (f, what) in repairs {
                 let t = trades_of(&f, 0, learn);
                 let (checked, steps, edge) = walk(&f);
                 let picked = perf(&t);
+                // Better where it's judged: on the newest stretch it has to pay, and
+                // beat what it did there (`net`); otherwise, walking forward.
+                let score = match (newest_at, &on_newest) {
+                    (Some(k), Some(_)) => {
+                        let there = perf(&trades_of(&f, k, n));
+                        (there.n >= JUDGE_ON_NEWEST / 2 && there.mean > 0.0).then_some(there.mean)
+                    }
+                    _ => Some(checked.mean),
+                }
+                .filter(|m| *m > net.mean);
                 // The same bar as any strategy: enough trades where it's picked, and
                 // walking forward — leaving out its losers mustn't leave a lucky few.
-                (picked.n >= MIN_TRADES
-                    && picked.t >= MIN_T
-                    && checked.n >= MIN_CHECKED
-                    && checked.mean > net.mean
-                    && edge.mean > 0.0)
-                    .then_some(
-                    Found {
-                        strategy: f,
-                        picked,
-                        picked_edge: beat(&t, 0, learn),
-                        checked,
-                        steps,
-                        edge,
-                    },
-                )
-            });
+                let Some(score) = score.filter(|_| {
+                    picked.n >= MIN_TRADES
+                        && picked.t >= MIN_T
+                        && checked.n >= MIN_CHECKED
+                        && checked.mean > 0.0
+                        && edge.mean > 0.0
+                }) else {
+                    continue;
+                };
+                if fix.as_ref().is_none_or(|b| score > b.2) {
+                    fix = Some((
+                        Found {
+                            strategy: f,
+                            picked,
+                            picked_edge: beat(&t, 0, learn),
+                            checked,
+                            steps,
+                            edge,
+                        },
+                        what,
+                        score,
+                    ));
+                }
+            }
+            let fix_note = fix.as_ref().map(|f| f.1.clone());
+            let fix = fix.map(|f| f.0);
+            let place = if on_newest.is_some() {
+                "on the newest stretch (where every series has data)"
+            } else {
+                "on the newest data"
+            };
             let why = if closed.len() < 5 {
-                "too few trades on the newest data to tell yet".to_string()
+                format!("too few trades {place} to tell yet")
             } else if net.mean > 0.0 && net.t >= 1.0 {
                 format!(
-                    "working: {:+.2}bp a trade on the newest data, {:+.2}bp before costs",
+                    "working: {:+.2}bp a trade {place}, {:+.2}bp before costs",
                     net.mean, gross.mean
                 )
             } else if gross.mean > 0.0 && edge.mean <= 0.0 {
@@ -2051,13 +2179,13 @@ pub fn search(
                 )
             } else if before.mean > 0.0 {
                 format!(
-                    "the edge faded: {:+.2}bp a trade on the older data, {:+.2}bp before costs on the newest — it fitted the past",
+                    "the edge faded: {:+.2}bp a trade on the older data, {:+.2}bp before costs {place} — it fitted the past",
                     before.mean, gross.mean
                 )
             } else {
                 format!("it doesn't predict here: {:+.2}bp a trade before costs", gross.mean)
             };
-            let why = match &lesson {
+            let mut why = match &lesson {
                 Some(l) => format!(
                     "{why}; it loses when {} ({} trades, {:+.2}bp each; the rest {:+.2}bp)",
                     l.cond.describe(),
@@ -2067,10 +2195,28 @@ pub fn search(
                 ),
                 None => why,
             };
+            // Which side pays, and whether losses run past the stop.
+            if !s.long.is_empty() && !s.short.is_empty() && longs.n + shorts.n >= 5 {
+                why += &format!(
+                    "; longs {:+.2}bp × {}, shorts {:+.2}bp × {}",
+                    longs.mean, longs.n, shorts.mean, shorts.n
+                );
+            }
+            if let Some(stop) = s.exit.stop {
+                let losses: Vec<f64> = closed.iter().map(|t| t.net).filter(|r| *r < 0.0).collect();
+                let avg = losses.iter().sum::<f64>() / losses.len().max(1) as f64;
+                if losses.len() >= 3 && -avg > 1.5 * stop + 0.5 {
+                    why += &format!(
+                        "; its losses average {avg:.1}bp against a {stop:.1}bp stop (checked once a point, and filled after the move)"
+                    );
+                }
+            }
             Review {
                 key: s.key(),
                 why,
                 fix,
+                fix_note,
+                newest: on_newest.as_deref().map(perf),
             }
         })
         .collect();
@@ -2231,6 +2377,87 @@ mod tests {
         assert!(t.iter().all(|t| (t.net + 9.0).abs() < 1e-9), "{t:?}");
         // Back to back: the next starts after the last ends.
         assert_eq!(t[1].entry, t[0].exit.unwrap() + 1);
+    }
+
+    #[test]
+    fn a_strategy_held_back_by_its_exit_is_repaired() {
+        // A real edge (after a sharp drop, a bounce for 5 points), traded with a stop
+        // so tight the noise takes it out of nearly every trade.
+        let s = Strategy::one_way(
+            Side::Long,
+            vec![Cond {
+                feature: crate::formula::parse("pct(price, 5)").unwrap(),
+                above: false,
+                threshold: -12.0,
+            }],
+            Exit {
+                hold: 5,
+                take: None,
+                stop: Some(0.05),
+            },
+        );
+        let feedback = Feedback {
+            review: vec![s.clone()],
+            ..Feedback::default()
+        };
+        let mut b = budget();
+        b.formulas = 50;
+        let report = search(input(bouncy(12_000)), Fees::Flat(0.0), &[], b, &feedback).unwrap();
+        let r = &report.reviews[0];
+        let fix = r.fix.as_ref().expect("a repair");
+        let note = r.fix_note.as_deref().unwrap_or("");
+        assert!(note.starts_with("exit:"), "{note} · {}", r.why);
+        assert!(
+            fix.strategy.exit.stop.is_none_or(|s| s > 0.05),
+            "{:?}",
+            fix.strategy.exit
+        );
+        assert!(fix.checked.mean > 0.0, "{:?}", fix.checked);
+        // The same entries: only how it gets out changed.
+        assert_eq!(fix.strategy.long, s.long);
+    }
+
+    #[test]
+    fn a_strategy_is_judged_on_the_newest_stretch_once_it_has_traded_there() {
+        // Rising for 800 points, then falling: always long did well, until lately.
+        let mut p = 100.0;
+        let prices: Vec<f64> = (0..1000)
+            .map(|i| {
+                let wiggle = if i % 2 == 0 { 1.0002 } else { 0.9999 };
+                p *= if i < 800 { 1.0004 } else { 0.9996 } * wiggle;
+                p
+            })
+            .collect();
+        let s = Strategy::one_way(
+            Side::Long,
+            vec![always()],
+            Exit {
+                hold: 5,
+                take: None,
+                stop: None,
+            },
+        );
+        let review = |newest_from: Option<f64>| {
+            let feedback = Feedback {
+                review: vec![s.clone()],
+                newest_from,
+                ..Feedback::default()
+            };
+            let mut b = budget();
+            b.formulas = 50;
+            search(input(prices.clone()), Fees::Flat(0.0), &[], b, &feedback)
+                .unwrap()
+                .reviews
+                .remove(0)
+        };
+        // Without a newest stretch: the second half, mostly still rising.
+        let old = review(None);
+        assert_eq!(old.newest, None);
+        // With one: judged on what it did there — it loses.
+        let new = review(Some(800.0));
+        let there = new.newest.expect("enough trades there");
+        assert!(there.n >= JUDGE_ON_NEWEST && there.mean < 0.0, "{there:?}");
+        assert!(new.why.contains("newest stretch"), "{}", new.why);
     }
 
     #[test]
