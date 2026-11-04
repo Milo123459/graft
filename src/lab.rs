@@ -652,7 +652,9 @@ mod tests {
         // 10,000 seconds of price; a recorded book that starts later.
         let with_book = |from: usize| {
             let mut ds = prices(0, 10_000);
-            let book = (from..10_000).map(|x| (x as f64, 0.5)).collect();
+            let book = (from..10_000)
+                .map(|x| (x as f64, (x as f64 * 0.37).sin()))
+                .collect();
             ds.series.push(Series {
                 name: "imbalance".into(),
                 unit: Default::default(),
@@ -666,6 +668,24 @@ mod tests {
         assert_eq!(recent_window(&with_book(9_700), &s), None);
         assert_eq!(recent_window(&with_book(500), &s), None);
         assert_eq!(recent_window(&prices(0, 10_000), &s), None);
+        // The lab takes turns: all of it, then the newest stretch, where the book is an
+        // input too.
+        let ds = with_book(8_000);
+        let mut lab = Lab::new(Settings::default());
+        let mut seen = Vec::new();
+        let end = Instant::now() + Duration::from_secs(60);
+        while seen.len() < 2 && Instant::now() < end {
+            let before = lab.report.as_ref().map(|r| r.took);
+            lab.tick(&ds);
+            if let Some(r) = &lab.report
+                && Some(r.took) != before
+            {
+                let book = r.input.others.iter().any(|o| o.name == "imbalance");
+                seen.push((lab.recent, r.input.len(), book));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(seen, [(false, 10_000, false), (true, 2_000, true)]);
     }
 
     #[test]
