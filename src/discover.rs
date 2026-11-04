@@ -42,8 +42,10 @@ use crate::formula::{Expr, Maker, Rng};
 pub const MIN_POINTS: usize = 300;
 /// Trades a strategy needs on the learning half to be considered…
 const MIN_TRADES: usize = 10;
-/// …and the t-statistic of its returns after costs there.
+/// …and the t-statistic of its returns after costs there…
 const MIN_T: f64 = 1.5;
+/// …and of how much better than holding the same way it did.
+const MIN_EDGE_T: f64 = 1.0;
 
 /// What trading costs, besides the spread (buying at the ask, selling at the bid).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -687,7 +689,7 @@ pub enum Side {
 
 /// How a trade ends: after `hold` points at the latest, or sooner at the take-profit or
 /// stop-loss (bp from the entry, after the spread; `None`: none).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Exit {
     pub hold: usize,
     pub take: Option<f64>,
@@ -697,7 +699,7 @@ pub struct Exit {
 /// When to trade: long when all `long` conditions hold, short when all `short` ones do
 /// (either can be empty: a one-way strategy), never when an `except` one holds (a
 /// condition it learned it loses in).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Strategy {
     pub long: Vec<Cond>,
     pub short: Vec<Cond>,
@@ -968,7 +970,7 @@ pub struct Review {
 }
 
 /// A strategy and how it did.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Found {
     pub strategy: Strategy,
     /// On the learning half (where it was picked)…
@@ -976,6 +978,10 @@ pub struct Found {
     /// …and walking forward over the rest: all of it, and each stretch.
     pub checked: Perf,
     pub steps: Vec<Perf>,
+    /// Its edge over holding (each trade's move less what holding the same side for as
+    /// long gave, bp before costs): on the learning half, and walking forward.
+    pub picked_edge: Perf,
+    pub edge: Perf,
 }
 
 impl Found {
@@ -1588,7 +1594,28 @@ pub fn search(
                 .collect::<Vec<_>>(),
         )
     };
-    let run = |s: &Strategy, from: usize, to: usize| perf(&trades_of(s, from, to));
+    // How much better than holding: each trade's move less what the price's drift over
+    // [from, to) gave the same side in the same time. A strategy that only rides the
+    // trend (long while it rises) has no edge here, however much it made.
+    let edges = |t: &[Trade], from: usize, to: usize| -> Vec<f64> {
+        let p = &input.price;
+        let last = to.min(n).saturating_sub(1);
+        let drift = if last > from {
+            (p[last] / p[from] - 1.0) * 1e4 / (last - from) as f64
+        } else {
+            0.0
+        };
+        t.iter()
+            .filter_map(|t| {
+                let held = (t.exit? - t.entry) as f64 * drift;
+                Some(match t.side {
+                    Side::Long => t.gross - held,
+                    Side::Short => t.gross + held,
+                })
+            })
+            .collect()
+    };
+    let beat = |t: &[Trade], from: usize, to: usize| Perf::of(&edges(t, from, to));
     // A strategy with its thresholds re-fitted on [0, to): at the same ranks.
     let refit = |s: &Strategy, to: usize| -> Strategy {
         let vals = vals_of(s);
@@ -1611,15 +1638,18 @@ pub fn search(
     };
     // Walking forward: each stretch traded with the thresholds re-fitted on everything
     // before it. All of it, and each stretch.
-    let walk = |s: &Strategy| -> (Perf, Vec<Perf>) {
+    // Also its edge over holding, each stretch against its own drift.
+    let walk = |s: &Strategy| -> (Perf, Vec<Perf>, Perf) {
         let mut all = Vec::new();
         let mut each = Vec::new();
+        let mut over = Vec::new();
         for (from, to) in layout.stretches() {
             let t = trades_of(&refit(s, from), from, to);
             each.push(perf(&t));
+            over.extend(edges(&t, from, to));
             all.extend(t);
         }
-        (perf(&all), each)
+        (perf(&all), each, Perf::of(&over))
     };
     let mut seeds: Vec<&Theory> = theories.iter().filter(|t| t.found.t.abs() >= 2.0).collect();
     seeds.sort_by(|a, b| b.found.t.abs().total_cmp(&a.found.t.abs()));
@@ -1666,17 +1696,28 @@ pub fn search(
         for exit in exits(typical, h) {
             let s = make(exit);
             tried += 1;
-            let picked = run(&s, 0, learn);
-            // It has to make money after costs where it was picked, and not by a fluke.
+            let t = trades_of(&s, 0, learn);
+            let picked = perf(&t);
+            // It has to make money after costs where it was picked, and not by a fluke…
             if picked.n < MIN_TRADES || picked.t < MIN_T {
                 continue;
             }
-            if best.as_ref().is_none_or(|b| picked.t > b.picked.t) {
+            // …and do better than holding the same way for as long: not just ride the
+            // trend.
+            let edge = beat(&t, 0, learn);
+            if edge.mean <= 0.0 || edge.t < MIN_EDGE_T {
+                continue;
+            }
+            let score = picked.t.min(edge.t);
+            if best
+                .as_ref()
+                .is_none_or(|b| score > b.picked.t.min(b.picked_edge.t))
+            {
                 best = Some(Found {
                     strategy: s,
                     picked,
-                    checked: Perf::default(),
-                    steps: Vec::new(),
+                    picked_edge: edge,
+                    ..Found::default()
                 });
             }
         }
@@ -1730,17 +1771,20 @@ pub fn search(
     for base in candidates.iter().take(15) {
         tried += 1;
         let t = trades_of(&base.strategy, 0, learn);
+        let base_edge = beat(&t, 0, learn);
         let own: Vec<&Expr> = base.strategy.conds().map(|c| &c.feature).collect();
         if let Some(l) = adverse(&t, &features, &values, &own, 0.75) {
             let mut s = base.strategy.clone();
             s.except.push(l.cond.clone());
-            let picked = run(&s, 0, learn);
-            if picked.n >= MIN_TRADES && picked.t > base.picked.t {
+            let t = trades_of(&s, 0, learn);
+            let picked = perf(&t);
+            let edge = beat(&t, 0, learn);
+            if picked.n >= MIN_TRADES && picked.t > base.picked.t && edge.mean >= base_edge.mean {
                 lessons.push(Found {
                     strategy: s,
                     picked,
-                    checked: Perf::default(),
-                    steps: Vec::new(),
+                    picked_edge: edge,
+                    ..Found::default()
                 });
             }
         }
@@ -1752,13 +1796,14 @@ pub fn search(
     candidates.sort_by(|a, b| b.picked.t.total_cmp(&a.picked.t));
     candidates.truncate(40);
     for c in &mut candidates {
-        (c.checked, c.steps) = walk(&c.strategy);
+        (c.checked, c.steps, c.edge) = walk(&c.strategy);
     }
     let rank = |c: &Found| {
         if c.checked.n == 0 {
             return f64::MIN;
         }
-        let base = c.checked.t.min(c.picked.t);
+        // The weakest of: where it was picked, walking forward, and against holding.
+        let base = c.checked.t.min(c.picked.t).min(c.edge.t);
         // Up in fewer than half the stretches it traded in: one lucky stretch.
         if c.consistency()
             .is_some_and(|(up, of)| of >= 2 && up * 2 < of)
@@ -1812,20 +1857,25 @@ pub fn search(
             let gross = Perf::of(&closed.iter().map(|t| t.gross).collect::<Vec<_>>());
             let net = perf(&later);
             let before = perf(&all.iter().filter(|t| t.entry < learn).copied().collect::<Vec<_>>());
+            let edge = beat(&later, learn, n);
             let own: Vec<&Expr> = s.conds().map(|c| &c.feature).collect();
             // A lesson from every trade it made, so there are enough to learn from.
             let lesson = adverse(&all, &features, &values, &own, 0.5);
             let fix = lesson.as_ref().and_then(|l| {
                 let mut f = s.clone();
                 f.except.push(l.cond.clone());
-                let picked = run(&f, 0, learn);
-                let (checked, steps) = walk(&f);
-                (checked.n >= 3 && checked.mean > net.mean).then_some(Found {
-                    strategy: f,
-                    picked,
-                    checked,
-                    steps,
-                })
+                let t = trades_of(&f, 0, learn);
+                let (checked, steps, edge) = walk(&f);
+                (checked.n >= 3 && checked.mean > net.mean && edge.mean > 0.0).then_some(
+                    Found {
+                        strategy: f,
+                        picked: perf(&t),
+                        picked_edge: beat(&t, 0, learn),
+                        checked,
+                        steps,
+                        edge,
+                    },
+                )
             });
             let why = if closed.len() < 5 {
                 "too few trades on the newest data to tell yet".to_string()
@@ -1833,6 +1883,11 @@ pub fn search(
                 format!(
                     "working: {:+.2}bp a trade on the newest data, {:+.2}bp before costs",
                     net.mean, gross.mean
+                )
+            } else if gross.mean > 0.0 && edge.mean <= 0.0 {
+                format!(
+                    "it only rode the trend: {:+.2}bp a trade before costs, but holding the same way as long did {:+.2}bp better",
+                    gross.mean, -edge.mean
                 )
             } else if gross.mean > 0.0 {
                 format!(
@@ -2120,10 +2175,11 @@ mod tests {
             );
             for s in r.strategies.iter().take(5) {
                 eprintln!(
-                    "  {} · {} → {}",
+                    "  {} · {} → {} · beats holding {}",
                     s.strategy.describe(&r.input),
                     s.picked.brief(),
-                    s.checked.brief()
+                    s.checked.brief(),
+                    s.edge.brief()
                 );
             }
             if fees == Fees::Flat(0.0) {
@@ -2281,6 +2337,44 @@ mod tests {
             "{}",
             later.threshold
         );
+    }
+
+    #[test]
+    fn riding_the_trend_is_no_edge() {
+        // A steady rise with noise and nothing else: long-and-hold makes money, but no
+        // formula can time it better than holding.
+        let mut seed = 11u64;
+        let mut p = vec![100.0];
+        for i in 1..8000 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let r = ((seed >> 33) % 1000) as f64 / 1000.0 - 0.5;
+            p.push(p[i - 1] * (1.0 + 0.00005 + r * 0.0004));
+        }
+        let report = search(
+            input(p),
+            Fees::Flat(0.0),
+            &[],
+            budget(),
+            &Feedback::default(),
+        )
+        .unwrap();
+        assert!(report.hold[1] > 50.0, "it rises: {:?}", report.hold);
+        for s in &report.strategies {
+            eprintln!(
+                "{} · {} → {} · edge {}",
+                s.strategy.describe(&report.input),
+                s.picked.brief(),
+                s.checked.brief(),
+                s.edge.brief()
+            );
+            // Nothing that does worse than holding is kept (without this check: 100%
+            // won, +26bp a trade, t 489 — and 1bp a trade worse than just holding)…
+            assert!(s.picked_edge.mean > 0.0, "{s:?}");
+            // …and nothing beats it where it wasn't picked by more than luck.
+            assert!(s.edge.t < 2.0, "{s:?}");
+        }
     }
 
     #[test]

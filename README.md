@@ -530,8 +530,13 @@ usual move (several ways, including small stops with big targets, and with profi
 sharing targets just past the ROI tiers); the best 15 learn one condition they lose in
 (**except when …**: what tells their losing trades from their winners). Every trade
 pays the costs above. A strategy must make money on the learning half (t ≥ 1.5, at
-least 10 trades) to be checked walking forward; it's ranked by the weaker of the two,
-less when it made money in fewer than half the stretches (one lucky stretch). What's
+least 10 trades) **and beat holding**: each trade's move is compared with what holding
+the same way for as long made in that stretch (the price's drift), so a strategy that
+only rides the trend — long for ten minutes while the price rises, winning 100% of the
+time — has no edge and isn't kept. It's checked walking forward and ranked by the
+weakest of the three (where it was picked, walking forward, and against holding), less
+when it made money in fewer than half the stretches (one lucky stretch). The panel
+shows **beats holding by …bp** for each; the review says when one only rode the trend. What's
 then **paper-traded live**, from the moment it's found, has its thresholds re-fitted
 on all the data — the live record is the only one the search never saw, so trust it
 most. The panel shows each one's record where it was picked, walking forward (up in

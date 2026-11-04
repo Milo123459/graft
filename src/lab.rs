@@ -244,10 +244,13 @@ impl Lab {
                 t.found.picked = f.picked;
                 t.found.checked = f.checked;
                 t.found.steps = f.steps.clone();
+                t.found.picked_edge = f.picked_edge;
+                t.found.edge = f.edge;
                 continue;
             }
-            // Only strategies that held up where they weren't picked.
-            if f.checked.n < 3 || f.checked.mean <= 0.0 {
+            // Only strategies that held up where they weren't picked, and did better
+            // than holding there.
+            if f.checked.n < 3 || f.checked.mean <= 0.0 || f.edge.mean <= 0.0 {
                 continue;
             }
             self.tracked.push(new(f.clone(), None, self.runs));

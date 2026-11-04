@@ -8146,9 +8146,17 @@ impl App {
                     .map_or(String::new(), |(up, of)| {
                         format!(", up in {up} of {of} stretches")
                     });
+                let edge = if t.found.edge.n >= 5 {
+                    format!(
+                        " · beats holding by {:+.2}bp (t {:.1})",
+                        t.found.edge.mean, t.found.edge.t
+                    )
+                } else {
+                    String::new()
+                };
                 push(
                     format!(
-                        "↳ picked {} · walking forward {}{steps} · {live}{open}{roi} · found in search {}",
+                        "↳ picked {} · walking forward {}{steps}{edge} · {live}{open}{roi} · found in search {}",
                         t.found.picked.brief(),
                         t.found.checked.brief(),
                         t.run
