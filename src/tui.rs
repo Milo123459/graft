@@ -2187,14 +2187,20 @@ impl App {
             return;
         }
         let (x0, x1) = self.bounds();
-        // Already at the newest data: moving on means back to everything ("live").
         let (_, end) = self.full_bounds();
-        if frac > 0.0 && x1 >= end - (x1 - x0) * 0.01 {
-            self.view = None;
+        let at_end = |x1: f64| x1 >= end - (x1 - x0) * 0.01;
+        if frac > 0.0 && at_end(x1) {
+            // Paged back through "last 1h": the live last hour again.
             if self.paged {
+                self.view = None;
                 self.say("back to the newest", false);
             } else {
-                self.say("showing everything", false);
+                // Zoomed in: it stays zoomed, on the newest data, following it as it
+                // comes in.
+                self.say(
+                    "at the newest — it follows new data (0 shows everything)",
+                    false,
+                );
             }
             return;
         }
@@ -8941,19 +8947,18 @@ pub(crate) mod tests {
             key(&mut app, KeyCode::Left);
         }
         assert_eq!(app.view.unwrap().0, a);
-        // Right stops at the newest data; one more goes back to everything.
-        let mut last_end = None;
+        // Right stops at the newest data, still zoomed in (more → keeps it there).
+        let width = app.view.map(|v| v.1 - v.0).unwrap();
         for _ in 0..50 {
-            if let Some(v) = app.view {
-                last_end = Some(v.1);
-            }
             key(&mut app, KeyCode::Right);
         }
-        assert!((last_end.unwrap() - b).abs() < 1e-6);
-        assert_eq!(app.view, None);
-        key(&mut app, KeyCode::Up);
-        key(&mut app, KeyCode::Down);
-        key(&mut app, KeyCode::Down);
+        let (lo, hi) = app.view.expect("still zoomed in");
+        assert!((hi - b).abs() < 1e-6 && (hi - lo - width).abs() < 1e-6);
+        assert!(app.message.as_ref().unwrap().text.contains("at the newest"));
+        // Zooming all the way out (or 0) shows everything.
+        for _ in 0..5 {
+            key(&mut app, KeyCode::Down);
+        }
         assert_eq!(app.view, None);
         // Panning with everything in view explains itself.
         key(&mut app, KeyCode::Left);
@@ -9731,7 +9736,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn show_all_and_play_forward_back_to_everything() {
+    fn show_all_and_play_forward_to_the_newest() {
         let mut app = app(&["graft", LOG]);
         screen(&app);
         key(&mut app, KeyCode::Up);
@@ -9740,12 +9745,14 @@ pub(crate) mod tests {
         let (x, y) = find(&app, "show all");
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), x + 1, y);
         assert!(app.view.is_none());
-        // ▶ moves right; at the newest data it goes back to everything.
+        // ▶ moves right; at the newest data it stays zoomed in, there ("show all" is
+        // what goes back to everything).
         key(&mut app, KeyCode::Up);
         for _ in 0..20 {
             key(&mut app, KeyCode::Right);
         }
-        assert!(app.view.is_none());
+        let (_, end) = app.full_bounds();
+        assert!(app.view.is_some_and(|v| (v.1 - end).abs() < 1e-6));
     }
 
     #[test]
