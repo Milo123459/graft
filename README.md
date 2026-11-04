@@ -543,7 +543,10 @@ shows **beats holding by …bp** for each; the review says when one only rode th
 then **paper-traded live**, from the moment it's found, has its thresholds re-fitted
 on all the data — the live record is the only one the search never saw, so trust it
 most. The panel shows each one's record where it was picked, walking forward (up in
-how many stretches) and live (and, with leverage, the ROI a trade).
+how many stretches) and live (and, with leverage, the ROI a trade), then what it
+risked walking forward and live: its **max drawdown** (the most its running total fell
+from a high), its **worst** and **best** trade — with leverage, also as a share of the
+margin a trade puts up (a 34bp drawdown at 250x is 85% of it).
 
 **4. Learning from what it trades.** Each search reviews the strategies being
 paper-traded: whether costs eat an edge that's there, whether it faded (it fitted the

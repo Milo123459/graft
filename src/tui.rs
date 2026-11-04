@@ -8285,6 +8285,21 @@ impl App {
                     hit,
                     &mut rows,
                 );
+                // What it risked: walking forward, and live once it has traded.
+                let live_risk = if t.live.n > 0 {
+                    format!(" · live {}", t.live.risk(&report.fees))
+                } else {
+                    String::new()
+                };
+                push(
+                    format!(
+                        "  walking forward {}{live_risk}",
+                        t.found.checked.risk(&report.fees)
+                    ),
+                    Style::default().fg(Color::Gray),
+                    hit,
+                    &mut rows,
+                );
                 if let Some(note) = &t.note {
                     push(
                         format!("  ✎ {note}"),
@@ -10243,6 +10258,12 @@ pub(crate) mod tests {
         }
         assert!(s.contains("discover · fee 0% a side"), "{s}");
         assert!(s.contains("picked") && s.contains("walking forward"), "{s}");
+        // What each risked: max drawdown, worst and best trade.
+        let wide = screen_sized(&app, 140, 60);
+        assert!(
+            wide.contains("max DD") && wide.contains("worst") && wide.contains("best"),
+            "{wide}"
+        );
         assert!(s.contains("keep 1") && s.contains("theories"), "{s}");
         // The other view: theories.
         let (x, y) = find(&app, "theories");

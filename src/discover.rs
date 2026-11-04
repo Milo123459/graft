@@ -500,6 +500,9 @@ pub struct Perf {
     pub total: f64,
     /// Largest fall of the running total from its high (bp).
     pub drawdown: f64,
+    /// The best and the worst one (bp).
+    pub best: f64,
+    pub worst: f64,
 }
 
 impl Perf {
@@ -534,7 +537,35 @@ impl Perf {
             win: r.iter().filter(|v| **v > 0.0).count() as f64 / n as f64,
             total: run,
             drawdown: dd,
+            best: r.iter().copied().fold(f64::MIN, f64::max),
+            worst: r.iter().copied().fold(f64::MAX, f64::min),
         }
+    }
+
+    /// `max DD 12.3bp (31% of margin) · worst −3.2bp (−8%) · best +8.1bp (+20%)`: what
+    /// it risked — with leverage, also as a share of the margin a trade puts up.
+    pub fn risk(&self, fees: &Fees) -> String {
+        if self.n == 0 {
+            return "no trades".into();
+        }
+        let roi = |bp: f64, signed: bool| {
+            fees.roi(bp).map_or(String::new(), |r| {
+                if signed {
+                    format!(" ({r:+.0}%)")
+                } else {
+                    format!(" ({r:.0}% of margin)")
+                }
+            })
+        };
+        format!(
+            "max DD {:.1}bp{} · worst {:+.1}bp{} · best {:+.1}bp{}",
+            self.drawdown,
+            roi(self.drawdown, false),
+            self.worst,
+            roi(self.worst, true),
+            self.best,
+            roi(self.best, true)
+        )
     }
 
     /// `+1.20bp × 23 (t 2.1, 61% won)` (no t for fewer than 5: it means nothing yet).
@@ -2338,6 +2369,24 @@ mod tests {
             "{}",
             later.threshold
         );
+    }
+
+    #[test]
+    fn records_say_what_they_risked() {
+        // +3, −2, −4 (down 6 from the high of 3), +5.
+        let p = Perf::of(&[3.0, -2.0, -4.0, 5.0]);
+        assert_eq!((p.drawdown, p.worst, p.best), (6.0, -4.0, 5.0));
+        assert_eq!(
+            p.risk(&Fees::Flat(0.0)),
+            "max DD 6.0bp · worst -4.0bp · best +5.0bp"
+        );
+        // At 250x: 6bp is 15% of the margin.
+        let up = Fees::parse("upside:250").unwrap();
+        assert_eq!(
+            p.risk(&up),
+            "max DD 6.0bp (15% of margin) · worst -4.0bp (-10%) · best +5.0bp (+12%)"
+        );
+        assert_eq!(Perf::of(&[]).risk(&up), "no trades");
     }
 
     #[test]
