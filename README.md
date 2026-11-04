@@ -550,7 +550,13 @@ when it made money in fewer than half the stretches (one lucky stretch). The pan
 shows **beats holding by …bp** for each; the review says when one only rode the trend. What's
 then **paper-traded live**, from the moment it's found, has its thresholds re-fitted
 on all the data — the live record is the only one the search never saw, so trust it
-most. The panel shows each one's record where it was picked, walking forward (up in
+most. The panel keeps 8, ordered by their record walking forward and live together, as
+a t-statistic with each one's spread blended with the usual spread (worth 30 trades):
+19 wins out of 19 have almost no spread, and that's what luck gives one of the many
+formulas tried, so it doesn't outrank 400 trades that paid. One that's trading live
+keeps its place until it's had 8 live trades — newcomers that only look good on paper
+can't push out the live test; then losing retires it, or it competes like the rest.
+The panel shows each one's record where it was picked, walking forward (up in
 how many stretches) and live (and, with leverage, the ROI a trade), then what it
 risked walking forward and live: its **max drawdown** (the most its running total fell
 from a high), its **worst** and **best** trade — with leverage, also as a share of the

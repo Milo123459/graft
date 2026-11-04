@@ -28,6 +28,9 @@ const BENCH: usize = 24;
 const TRACKED: usize = 8;
 /// Live trades before a losing strategy is retired.
 const RETIRE_AFTER: usize = 8;
+/// How many trades' worth the usual spread counts for in a strategy's score
+/// (`Tracked::score`).
+const PRIOR_TRADES: f64 = 30.0;
 /// Repairs of repairs at most: each one fits the same data a bit closer.
 const MAX_REPAIRS: usize = 3;
 
@@ -76,6 +79,19 @@ pub fn recent_window(ds: &Dataset, s: &Settings) -> Option<usize> {
         .max_by(f64::total_cmp)?;
     let n = total - price.points.partition_point(|p| p.0 < late);
     (n >= 2 * discover::MIN_POINTS && n * 10 < total * 9).then_some(n)
+}
+
+/// What the strategies' trades usually vary by (bp): their walking-forward spread,
+/// weighted by how many trades each had.
+pub fn typical_sd(tracked: &[Tracked]) -> f64 {
+    let (sum, n) = tracked
+        .iter()
+        .map(|t| &t.found.checked)
+        .filter(|c| c.n >= 2)
+        .fold((0.0, 0.0), |(s, n), c| {
+            (s + c.sd.powi(2) * c.n as f64, n + c.n as f64)
+        });
+    if n > 0.0 { (sum / n).sqrt() } else { 0.0 }
 }
 
 /// Where the newest stretch (`recent_window`) starts, as an x.
@@ -143,8 +159,17 @@ pub struct Tracked {
 }
 
 impl Tracked {
-    /// Its record where it wasn't picked (walking forward, then live), as one t-statistic.
-    pub fn score(&self) -> f64 {
+    /// Trading live, and not yet the 8 live trades it's judged on.
+    pub fn proving(&self) -> bool {
+        self.live.n > 0 && self.live.n < RETIRE_AFTER
+    }
+
+    /// Its record where it wasn't picked (walking forward, then live), as one
+    /// t-statistic — with its spread blended with `typical_sd` (what trades usually
+    /// vary by), worth PRIOR_TRADES trades. 19 wins out of 19 have almost no spread, so
+    /// a huge t, but that's what luck gives one of the many formulas tried: it mustn't
+    /// outrank 400 trades that paid, whose own spread is what counts.
+    pub fn score(&self, typical_sd: f64) -> f64 {
         let (c, l) = (&self.found.checked, &self.live);
         let n = (c.n + l.n) as f64;
         if n < 2.0 {
@@ -152,6 +177,7 @@ impl Tracked {
         }
         let mean = (c.total + l.total) / n;
         let var = (c.sd.powi(2) * c.n as f64 + l.sd.powi(2) * l.n as f64) / n;
+        let var = (var * n + typical_sd.powi(2) * PRIOR_TRADES) / (n + PRIOR_TRADES);
         if var <= 0.0 {
             return mean.signum() * 10.0;
         }
@@ -413,8 +439,9 @@ impl Lab {
             let entries = |t: &Tracked| t.trades.iter().map(|p| p.entry).collect::<Vec<_>>();
             let mine = entries(&self.tracked[k]);
             let same = (0..k).any(|j| overlap_x(&entries(&self.tracked[j]), &mine) > 0.7);
-            // (Never the one on the chart — others with the same rules can go.)
-            if same && k != self.selected {
+            // (Never the one on the chart, nor one proving itself live — others with
+            // the same rules can go.)
+            if same && k != self.selected && !self.tracked[k].proving() {
                 self.tracked.remove(k);
                 if self.selected > k {
                     self.selected -= 1;
@@ -424,13 +451,23 @@ impl Lab {
             }
         }
         self.rank(selected_key);
-        // Too many: the worst go (never the one on the chart).
+        self.trim();
+    }
+
+    /// Down to TRACKED strategies.
+    fn trim(&mut self) {
+        // Too many: the worst go — but not one that's trading live and hasn't had
+        // its 8 live trades yet (then losing retires it, or it competes like the rest),
+        // so newcomers that look good on paper can't push out the live test. Never
+        // the one on the chart.
         while self.tracked.len() > TRACKED {
-            let last = self.tracked.len() - 1;
-            let drop = if self.selected == last {
-                last - 1
-            } else {
-                last
+            let worst = |protected: bool| {
+                (0..self.tracked.len())
+                    .rev()
+                    .find(|&k| k != self.selected && self.tracked[k].proving() == protected)
+            };
+            let Some(drop) = worst(false).or_else(|| worst(true)) else {
+                break;
             };
             self.tracked.remove(drop);
             if self.selected > drop {
@@ -441,7 +478,9 @@ impl Lab {
 
     /// Best first; the selection follows its strategy.
     fn rank(&mut self, keep: Option<String>) {
-        self.tracked.sort_by(|a, b| b.score().total_cmp(&a.score()));
+        let sd = typical_sd(&self.tracked);
+        self.tracked
+            .sort_by(|a, b| b.score(sd).total_cmp(&a.score(sd)));
         self.selected = keep
             .and_then(|k| {
                 self.tracked
@@ -713,6 +752,69 @@ mod tests {
             "{:?}",
             lab.lessons
         );
+    }
+
+    fn meh() -> Perf {
+        Perf::of(&[1.0, -1.0, 0.5, -0.4, 0.2, 0.3, -0.2, 0.1, 0.4, -0.3])
+    }
+
+    fn tracked(checked: Perf, live: Perf) -> Tracked {
+        Tracked {
+            found: Found {
+                checked,
+                ..Found::default()
+            },
+            since: 0.0,
+            run: 1,
+            live,
+            open: None,
+            trades: Vec::new(),
+            why: None,
+            note: None,
+            newest: None,
+            repairs: 0,
+        }
+    }
+
+    #[test]
+    fn a_few_lucky_wins_dont_outrank_hundreds_of_trades_that_paid() {
+        // 19 out of 19, with little spread; 404 trades, +0.63bp each, a wide spread.
+        let lucky = Perf::of(&(0..19).map(|i| 1.4 + 0.01 * i as f64).collect::<Vec<_>>());
+        let many = Perf::of(
+            &(0..404)
+                .map(|i| if i % 5 < 2 { 4.0 } else { -1.6 })
+                .collect::<Vec<_>>(),
+        );
+        assert!(lucky.t > many.t, "{} {}", lucky.t, many.t);
+        let (a, b) = (
+            tracked(lucky, Perf::default()),
+            tracked(many, Perf::default()),
+        );
+        let sd = typical_sd(&[a.clone(), b.clone()]);
+        assert!(b.score(sd) > a.score(sd), "{} {}", b.score(sd), a.score(sd));
+        // And among themselves, a better record still ranks first.
+        assert!(b.score(sd) > tracked(meh(), Perf::default()).score(sd));
+    }
+
+    #[test]
+    fn newcomers_dont_push_out_one_proving_itself_live() {
+        let mut lab = Lab::new(Settings::default());
+        let good = Perf::of(&[1.0, 2.0, 1.5, 0.5, 1.2, 2.2, 0.8, 1.1, 1.9, 1.4]);
+        let meh = Perf::of(&[1.0, -1.0, 0.5, -0.4, 0.2, 0.3, -0.2, 0.1, 0.4, -0.3]);
+        // Ranked last, but 3 trades into its live test.
+        let live = tracked(meh, Perf::of(&[0.5, -0.2, 0.7]));
+        lab.tracked = (0..TRACKED)
+            .map(|_| tracked(good, Perf::default()))
+            .collect();
+        lab.tracked.push(live);
+        lab.trim();
+        assert_eq!(lab.tracked.len(), TRACKED);
+        assert!(lab.tracked.iter().any(Tracked::proving));
+        // Once it's had its 8 live trades, it competes like the rest.
+        let done = tracked(meh, Perf::of(&[0.5, -0.2, 0.7, 0.1, -0.3, 0.2, 0.1, -0.1]));
+        lab.tracked.push(done);
+        lab.trim();
+        assert_eq!(lab.tracked.iter().filter(|t| t.live.n == 8).count(), 0);
     }
 
     #[test]
